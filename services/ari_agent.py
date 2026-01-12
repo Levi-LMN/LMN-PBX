@@ -1,7 +1,6 @@
 # services/ari_agent.py
 """
-ARI-based agent service - Optimized for same-machine deployment
-NO SSH NEEDED - Direct file system access
+ARI-based agent service - FIXED AI Client Initialization
 """
 
 import asyncio
@@ -27,10 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 class ARIAgent:
-    """
-    ARI-based AI voice agent - Optimized for same-machine deployment
-    Uses direct file system access instead of SSH
-    """
+    """ARI-based AI voice agent"""
 
     def __init__(self, app_config):
         self.config = app_config
@@ -38,25 +34,29 @@ class ARIAgent:
         self.active_calls = set()
         self.total_calls = 0
 
-        # ARI Configuration (localhost)
+        # ARI Configuration
         self.ari_url = os.getenv('ARI_URL', 'http://localhost:8088/ari')
         self.ari_base = os.getenv('ARI_BASE', 'http://localhost:8088')
         self.ari_username = os.getenv('ARI_USERNAME', 'asterisk')
         self.ari_password = os.getenv('ARI_PASSWORD', 'your_ari_password')
         self.ari_app = os.getenv('ARI_APP', 'ai-agent')
 
-        # Direct file system access (no SSH needed!)
+        # File system
         self.asterisk_sounds_dir = '/var/lib/asterisk/sounds/custom'
 
-        # Azure configuration
-        self.azure_openai_endpoint = app_config.get('AZURE_OPENAI_ENDPOINT')
-        self.azure_openai_key = app_config.get('AZURE_OPENAI_KEY')
-        self.azure_openai_deployment = app_config.get('AZURE_OPENAI_DEPLOYMENT', 'gpt-4o-mini')
-        self.azure_speech_key = app_config.get('AZURE_SPEECH_KEY')
-        self.azure_speech_region = app_config.get('AZURE_SPEECH_REGION', 'eastus')
+        # Azure configuration - FIXED: Get from environment directly
+        self.azure_openai_endpoint = os.getenv('AZURE_OPENAI_ENDPOINT')
+        self.azure_openai_key = os.getenv('AZURE_OPENAI_KEY')
+        self.azure_openai_deployment = os.getenv('AZURE_OPENAI_DEPLOYMENT', 'gpt-4o-mini')
+        self.azure_speech_key = os.getenv('AZURE_SPEECH_KEY')
+        self.azure_speech_region = os.getenv('AZURE_SPEECH_REGION', 'eastus')
+
+        logger.info(f"Azure OpenAI Endpoint: {self.azure_openai_endpoint}")
+        logger.info(f"Azure OpenAI Key length: {len(self.azure_openai_key) if self.azure_openai_key else 0}")
+        logger.info(f"Azure OpenAI Deployment: {self.azure_openai_deployment}")
 
         # System prompt
-        self.system_prompt = app_config.get('DEFAULT_SYSTEM_PROMPT', self._default_prompt())
+        self.system_prompt = os.getenv('DEFAULT_SYSTEM_PROMPT') or self._default_prompt()
 
         # Initialize components
         self.cache_dir = Path.home() / ".asterisk_cache"
@@ -64,31 +64,56 @@ class ARIAgent:
         self.cache_index_file = self.cache_dir / "cache_index.json"
 
         self.sound_cache = SoundCache(self.cache_dir, self.cache_index_file, self.asterisk_sounds_dir)
-        self.transcriber = AzureSpeechTranscriber(self.azure_speech_key, self.azure_speech_region)
 
-        # File system access (replaces SSH)
+        # Initialize transcriber
+        try:
+            self.transcriber = AzureSpeechTranscriber(self.azure_speech_key, self.azure_speech_region)
+            logger.info("✅ Speech transcriber initialized")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize transcriber: {e}")
+            self.transcriber = None
+
+        # File system access
         self.file_access = FileSystemAccess(self.asterisk_sounds_dir)
 
-        # OpenAI client
+        # OpenAI client initialization - FIXED
         self.ai_client = None
         if self.azure_openai_endpoint and self.azure_openai_key:
             try:
+                # Clean endpoint
+                endpoint = self.azure_openai_endpoint.rstrip('/')
+
+                logger.info(f"Initializing Azure OpenAI client...")
+                logger.info(f"  Endpoint: {endpoint}")
+                logger.info(f"  Deployment: {self.azure_openai_deployment}")
+
                 self.ai_client = AsyncAzureOpenAI(
                     api_key=self.azure_openai_key,
-                    azure_endpoint=self.azure_openai_endpoint.rstrip('/'),
+                    azure_endpoint=endpoint,
                     api_version="2024-08-01-preview"
                 )
-                logger.info("✅ OpenAI client initialized")
+                logger.info("✅ OpenAI client object created")
+
+            except TypeError as e:
+                logger.error(f"❌ TypeError initializing OpenAI client: {e}")
+                logger.error("   This usually means incompatible openai package version")
+                logger.error("   Try: pip install --upgrade openai")
+                self.ai_client = None
             except Exception as e:
                 logger.error(f"❌ Failed to initialize OpenAI client: {e}")
+                logger.error(f"   Error type: {type(e).__name__}")
                 self.ai_client = None
         else:
-            logger.warning("⚠️ Azure OpenAI not configured")
+            logger.warning("⚠️ Azure OpenAI not configured:")
+            if not self.azure_openai_endpoint:
+                logger.warning("   - AZURE_OPENAI_ENDPOINT is missing")
+            if not self.azure_openai_key:
+                logger.warning("   - AZURE_OPENAI_KEY is missing")
 
         # ARI client
         self.ari_client = None
 
-        logger.info("ARI Agent initialized (no SSH - direct file access)")
+        logger.info("ARI Agent initialized")
 
     def _default_prompt(self):
         return """You are a professional phone assistant for an insurance company.
@@ -111,8 +136,11 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
 
         # Validate AI configuration
         if not self.ai_client:
-            logger.error("❌ Cannot start - Azure OpenAI not configured")
-            logger.error("   Check AZURE_OPENAI_KEY and AZURE_OPENAI_ENDPOINT in .env")
+            logger.error("❌ Cannot start - Azure OpenAI client failed to initialize")
+            logger.error("   Check:")
+            logger.error("   1. AZURE_OPENAI_KEY is set in .env")
+            logger.error("   2. AZURE_OPENAI_ENDPOINT is set in .env")
+            logger.error("   3. openai package is installed: pip install openai")
             return
 
         # Test AI connection
@@ -125,16 +153,22 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             )
             logger.info("✅ AI connection verified")
         except Exception as e:
-            logger.error(f"❌ AI connection failed: {e}")
+            logger.error(f"❌ AI connection test failed: {e}")
+            logger.error(f"   Error type: {type(e).__name__}")
+            if "404" in str(e):
+                logger.error(f"   Deployment '{self.azure_openai_deployment}' not found")
+                logger.error("   Check AZURE_OPENAI_DEPLOYMENT matches your deployment name")
+            elif "401" in str(e) or "403" in str(e):
+                logger.error("   Authentication failed - check AZURE_OPENAI_KEY")
             return
 
-        # Test file system access (replaces SSH test)
+        # Test file system access
         if self.file_access.test_access():
-            logger.info("✅ File system access verified - direct audio upload enabled")
+            logger.info("✅ File system access verified")
         else:
-            logger.warning("⚠️ File system access limited - may need sudo permissions")
+            logger.warning("⚠️ Limited file system access")
 
-        # Pre-cache common phrases
+        # Pre-cache phrases
         await self._precache_phrases()
 
         # Connect to ARI
@@ -147,17 +181,14 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             )
             logger.info("✅ ARI connected")
 
-            # Register event handler
             self.ari_client.on_event("StasisStart", self._handle_stasis_start)
 
             logger.info("=" * 60)
             logger.info("🎙️ SYSTEM READY - Waiting for calls")
             logger.info(f"   ARI App: {self.ari_app}")
             logger.info(f"   AI Model: {self.azure_openai_deployment}")
-            logger.info(f"   Audio: Direct file system access (no SSH)")
             logger.info("=" * 60)
 
-            # Run ARI event loop
             await self.ari_client.run(apps=self.ari_app)
 
         except Exception as e:
@@ -197,14 +228,10 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
         for phrase in phrases:
             await self.sound_cache.get(phrase, self.file_access)
 
-        logger.info(f"✅ Phrases cached")
-
     def _handle_stasis_start(self, event):
-        """Handle incoming call event"""
         asyncio.create_task(self._process_call(event))
 
     async def _process_call(self, event):
-        """Process an incoming call"""
         channel_id = event.get("channel", {}).get("id")
         if not channel_id:
             return
@@ -216,7 +243,6 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             logger.error(f"❌ Call processing error: {e}")
 
     async def _handle_call(self, channel):
-        """Handle a single call"""
         caller_number = channel.json.get('caller', {}).get('number', 'Unknown')
         logger.info(f"📞 Incoming call from {caller_number}")
 
@@ -248,10 +274,8 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             self.active_calls.discard(call)
             await call.cleanup()
             self._log_call_end(call)
-            logger.info(f"✅ Call completed: {caller_number}")
 
     def _log_call_start(self, call_id, caller_number):
-        """Log call start to database"""
         try:
             from flask import current_app
             with current_app.app_context():
@@ -267,7 +291,6 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             logger.error(f"Failed to log call start: {e}")
 
     def _log_call_error(self, call_id, error_msg):
-        """Log call error"""
         try:
             from flask import current_app
             with current_app.app_context():
@@ -280,7 +303,6 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             logger.error(f"Failed to log error: {e}")
 
     def _log_call_end(self, call_instance):
-        """Log call end"""
         try:
             from flask import current_app
             with current_app.app_context():
@@ -320,12 +342,10 @@ class CallInstance:
         self.conversation = [{"role": "system", "content": system_prompt}]
 
     async def process(self):
-        """Process the call"""
         try:
             await self.channel.answer()
             await asyncio.sleep(0.2)
 
-            # Greeting
             hour = datetime.now().hour
             time_greeting = 'Good morning' if hour < 12 else 'Good afternoon' if hour < 17 else 'Good evening'
             greeting = f"{time_greeting}, thank you for calling. How can I help you today?"
@@ -337,7 +357,6 @@ class CallInstance:
             await self.channel.play(media="sound:beep")
             await asyncio.sleep(0.15)
 
-            # Conversation loop
             no_speech_count = 0
             for turn in range(8):
                 if not await self.is_alive():
@@ -372,7 +391,6 @@ class CallInstance:
 
                 logger.info(f"👤 User: {text}")
 
-                # Check goodbye
                 if len(text.split()) <= 5 and any(w in text.lower() for w in ["bye", "goodbye", "thanks", "done"]):
                     await self.speak("Thank you for calling!")
                     break
@@ -413,7 +431,6 @@ class CallInstance:
             await self.hangup()
 
     async def is_alive(self):
-        """Check if channel is active"""
         if not self.active:
             return False
         try:
@@ -424,7 +441,6 @@ class CallInstance:
             return False
 
     async def speak(self, text):
-        """Speak text to caller"""
         if not await self.is_alive():
             return False
 
@@ -444,7 +460,6 @@ class CallInstance:
             return False
 
     async def record(self, duration=8, silence=2.0):
-        """Record audio from caller"""
         if not await self.is_alive():
             return None
 
@@ -473,7 +488,6 @@ class CallInstance:
             return None
 
     async def _download_recording(self, name):
-        """Download recording from Asterisk"""
         for attempt in range(3):
             try:
                 url = f"{self.ari_url}/recordings/stored/{name}/file"
@@ -496,7 +510,6 @@ class CallInstance:
         return None
 
     async def hangup(self):
-        """Hangup the call"""
         try:
             if self.active:
                 await self.channel.hangup()
@@ -505,7 +518,6 @@ class CallInstance:
         self.active = False
 
     async def cleanup(self):
-        """Cleanup temporary files"""
         for file_path in self.temp_files:
             try:
                 os.unlink(file_path)
@@ -514,7 +526,7 @@ class CallInstance:
 
 
 class SoundCache:
-    """Cache for TTS audio - uses direct file system access"""
+    """Cache for TTS audio"""
 
     def __init__(self, cache_dir, index_file, asterisk_sounds_dir):
         self.cache_dir = cache_dir
@@ -540,21 +552,17 @@ class SoundCache:
         return hashlib.md5(text.encode()).hexdigest()
 
     async def get(self, text, file_access):
-        """Get cached audio or generate new"""
         key = self._cache_key(text)
 
-        # Check if cached
         if key in self.index and self.index[key].get('remote'):
             return self.index[key]['remote'], self.index[key].get('duration')
 
-        # Generate locally
         local_path = await self._generate_tts(text, key)
         if not local_path:
             return None, None
 
         duration = self._get_duration(local_path)
 
-        # Copy to Asterisk directory (no SSH!)
         remote_path = file_access.copy_to_asterisk(local_path, f"c_{key}.wav")
 
         if remote_path:
@@ -565,7 +573,6 @@ class SoundCache:
         return local_path, duration
 
     async def _generate_tts(self, text, key):
-        """Generate TTS audio"""
         try:
             output_file = self.cache_dir / f"{key}.wav"
             if output_file.exists():
@@ -607,7 +614,7 @@ class SoundCache:
 
 
 class FileSystemAccess:
-    """Direct file system access - NO SSH NEEDED!"""
+    """Direct file system access"""
 
     def __init__(self, sounds_dir):
         self.sounds_dir = sounds_dir
@@ -615,18 +622,15 @@ class FileSystemAccess:
         self.use_sudo = False
 
     def test_access(self):
-        """Test if we can write to sounds directory"""
         try:
-            # Try direct write
             test_file = os.path.join(self.sounds_dir, '.test_write')
             with open(test_file, 'w') as f:
                 f.write('test')
             os.unlink(test_file)
             self.can_write = True
-            logger.info("Direct write access to sounds directory")
+            logger.info("Direct write access verified")
             return True
         except PermissionError:
-            # Try with sudo
             try:
                 result = subprocess.run(
                     ['sudo', '-n', 'touch', os.path.join(self.sounds_dir, '.test_write')],
@@ -637,30 +641,26 @@ class FileSystemAccess:
                     subprocess.run(['sudo', 'rm', os.path.join(self.sounds_dir, '.test_write')])
                     self.can_write = True
                     self.use_sudo = True
-                    logger.info("Sudo access available for sounds directory")
+                    logger.info("Sudo access verified")
                     return True
             except:
                 pass
 
-            logger.warning("No write access to sounds directory")
+            logger.warning("No write access - run as asterisk or use sudo")
             return False
 
     def copy_to_asterisk(self, local_path, filename):
-        """Copy file to Asterisk sounds directory"""
         try:
             dest_path = os.path.join(self.sounds_dir, filename)
 
             if self.use_sudo:
-                # Copy with sudo
                 subprocess.run(['sudo', 'cp', local_path, dest_path], check=True)
                 subprocess.run(['sudo', 'chown', 'asterisk:asterisk', dest_path], check=True)
                 subprocess.run(['sudo', 'chmod', '644', dest_path], check=True)
             else:
-                # Direct copy
                 shutil.copy2(local_path, dest_path)
                 os.chmod(dest_path, 0o644)
 
-            # Return path without extension for Asterisk
             return f"custom/{filename.replace('.wav', '')}"
 
         except Exception as e:
@@ -682,7 +682,6 @@ class AzureSpeechTranscriber:
         self.config.speech_recognition_language = "en-US"
 
     async def transcribe(self, audio_file):
-        """Transcribe audio file"""
         try:
             if os.path.getsize(audio_file) < 4000:
                 return "", "low"
@@ -720,7 +719,6 @@ class AzureSpeechTranscriber:
             return "", "low"
 
     async def _preprocess(self, audio_file):
-        """Preprocess audio"""
         try:
             audio = AudioSegment.from_file(audio_file)
             audio = normalize(audio).set_frame_rate(16000).set_channels(1).set_sample_width(2)
