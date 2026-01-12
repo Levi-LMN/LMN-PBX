@@ -1,6 +1,7 @@
 # services/ari_agent.py
 """
-ARI-based agent service - Complete working version with OpenAI fix
+ARI-based agent service - Production version with proper connection validation
+Runs on same machine as FreePBX
 """
 
 import asyncio
@@ -13,13 +14,11 @@ import logging
 import paramiko
 import hashlib
 import json
-import threading
 from pathlib import Path
 from pydub import AudioSegment
 from pydub.effects import normalize
 from openai import AsyncAzureOpenAI
 import azure.cognitiveservices.speech as speechsdk
-from msal import ConfidentialClientApplication
 from datetime import datetime
 from models import db, Call, CallTranscript, CallIntent
 
@@ -38,14 +37,15 @@ class ARIAgent:
         self.total_calls = 0
 
         # ARI Configuration
-        self.ari_url = os.getenv('ARI_URL', 'http://10.200.200.2:8088/ari')
-        self.ari_base = os.getenv('ARI_BASE', 'http://10.200.200.2:8088')
+        self.ari_url = os.getenv('ARI_URL', 'http://localhost:8088/ari')
+        self.ari_base = os.getenv('ARI_BASE', 'http://localhost:8088')
         self.ari_username = os.getenv('ARI_USERNAME', 'asterisk')
         self.ari_password = os.getenv('ARI_PASSWORD', 'your_ari_password')
         self.ari_app = os.getenv('ARI_APP', 'ai-agent')
 
-        # SSH Configuration
-        self.ssh_host = os.getenv('SSH_HOST', '10.200.200.2')
+        # SSH Configuration (localhost since running on same machine)
+        self.ssh_host = os.getenv('SSH_HOST', 'localhost')
+        self.ssh_port = int(os.getenv('SSH_PORT', '22'))
         self.ssh_user = os.getenv('SSH_USER', 'sangoma')
         self.ssh_password = os.getenv('SSH_PASSWORD', 'sangoma')
         self.asterisk_sounds_dir = '/var/lib/asterisk/sounds/custom'
@@ -66,76 +66,30 @@ class ARIAgent:
         self.cache_index_file = self.cache_dir / "cache_index.json"
 
         self.sound_cache = SoundCache(self.cache_dir, self.cache_index_file)
-        self.ssh_client = SSHClient(self.ssh_host, self.ssh_user, self.ssh_password, self.asterisk_sounds_dir)
+        self.ssh_client = SSHClient(
+            self.ssh_host,
+            self.ssh_port,
+            self.ssh_user,
+            self.ssh_password,
+            self.asterisk_sounds_dir
+        )
         self.transcriber = AzureSpeechTranscriber(self.azure_speech_key, self.azure_speech_region)
 
-        # OpenAI client - FIXED VERSION - Multiple initialization methods
+        # OpenAI client initialization
         self.ai_client = None
         if self.azure_openai_endpoint and self.azure_openai_key:
             try:
-                logger.info(f"Initializing OpenAI client with endpoint: {self.azure_openai_endpoint}")
-
-                # Method 1: Try newest SDK version (1.0+) with minimal parameters
-                try:
-                    self.ai_client = AsyncAzureOpenAI(
-                        api_key=self.azure_openai_key,
-                        azure_endpoint=self.azure_openai_endpoint,
-                        api_version="2024-08-01-preview"
-                    )
-                    logger.info("✅ OpenAI client initialized (v1.0+ method)")
-                except TypeError as e:
-                    if "proxies" in str(e) or "unexpected keyword" in str(e):
-                        logger.debug(f"Method 1 failed with TypeError: {e}")
-
-                        # Method 2: Try with environment variables
-                        try:
-                            os.environ['AZURE_OPENAI_API_KEY'] = self.azure_openai_key
-                            os.environ['AZURE_OPENAI_ENDPOINT'] = self.azure_openai_endpoint
-
-                            self.ai_client = AsyncAzureOpenAI(
-                                api_version="2024-08-01-preview"
-                            )
-                            logger.info("✅ OpenAI client initialized (environment variable method)")
-                        except Exception as e2:
-                            logger.debug(f"Method 2 failed: {e2}")
-
-                            # Method 3: Try creating with http_client parameter
-                            try:
-                                import httpx
-                                http_client = httpx.AsyncClient()
-
-                                self.ai_client = AsyncAzureOpenAI(
-                                    api_key=self.azure_openai_key,
-                                    azure_endpoint=self.azure_openai_endpoint,
-                                    api_version="2024-08-01-preview",
-                                    http_client=http_client
-                                )
-                                logger.info("✅ OpenAI client initialized (httpx method)")
-                            except Exception as e3:
-                                logger.error(f"All initialization methods failed. Last error: {e3}")
-                                raise
-                    else:
-                        raise
-
-                # Test the connection if client was created
-                if self.ai_client:
-                    logger.info("✅ OpenAI client object created successfully")
-
+                self.ai_client = AsyncAzureOpenAI(
+                    api_key=self.azure_openai_key,
+                    azure_endpoint=self.azure_openai_endpoint.rstrip('/'),
+                    api_version="2024-08-01-preview"
+                )
+                logger.info("✅ OpenAI client initialized")
             except Exception as e:
                 logger.error(f"❌ Failed to initialize OpenAI client: {e}")
-                logger.error(f"   Endpoint: {self.azure_openai_endpoint}")
-                logger.error(f"   Deployment: {self.azure_openai_deployment}")
-                logger.error(f"   Error type: {type(e).__name__}")
-                logger.error(f"   Error details: {str(e)}")
                 self.ai_client = None
         else:
-            logger.warning("⚠️ Azure OpenAI not configured - missing AZURE_OPENAI_KEY or AZURE_OPENAI_ENDPOINT")
-
-        # Dataverse (optional)
-        self.dataverse_url = os.getenv('DATAVERSE_URL')
-        self.tenant_id = os.getenv('TENANT_ID')
-        self.client_id = os.getenv('CLIENT_ID')
-        self.client_secret = os.getenv('CLIENT_SECRET')
+            logger.warning("⚠️ Azure OpenAI not configured")
 
         # ARI client
         self.ari_client = None
@@ -143,19 +97,21 @@ class ARIAgent:
         logger.info("ARI Agent initialized")
 
     def _default_prompt(self):
-        return """You are a professional phone assistant.
+        return """You are a professional phone assistant for an insurance company.
 
 RULES:
-- Keep responses 15-35 words
-- Be helpful and professional
-- Never say "I'm an AI"
+- Keep responses between 15-35 words for phone conversations
+- Be helpful, professional, and empathetic
+- Never say "I'm an AI" or mention being artificial
+- Use natural, conversational language
+- If you don't know something, be honest
 
-FUNCTIONS:
-- end_call: When conversation is done
-- transfer_to_agent: When human help needed
-- create_ticket: For issues that need follow-up
+CAPABILITIES:
+- Answer questions about policies, claims, and billing
+- Guide callers through common processes
+- Identify when escalation to human agent is needed
 
-After function, respond naturally."""
+When you cannot help or caller seems frustrated, politely recommend speaking with a specialist."""
 
     async def start(self):
         """Start the ARI agent"""
@@ -165,9 +121,10 @@ After function, respond naturally."""
         logger.info("🤖 ARI Agent Starting")
         logger.info("=" * 60)
 
-        # Validate configuration
+        # Validate AI configuration
         if not self.ai_client:
             logger.error("❌ Cannot start - Azure OpenAI not configured")
+            logger.error("   Set AZURE_OPENAI_KEY and AZURE_OPENAI_ENDPOINT in .env")
             return
 
         # Test AI connection
@@ -181,21 +138,24 @@ After function, respond naturally."""
             logger.info("✅ AI connection verified")
         except Exception as e:
             logger.error(f"❌ AI connection failed: {e}")
-            logger.error(f"   Please check your Azure OpenAI configuration")
             logger.error(f"   Endpoint: {self.azure_openai_endpoint}")
             logger.error(f"   Deployment: {self.azure_openai_deployment}")
-            logger.error(f"   Make sure the deployment name matches exactly")
             return
 
-        # Connect SSH
-        if not await self.ssh_client.connect():
-            logger.warning("⚠️ SSH connection failed - will use local audio only")
+        # Test SSH connection (REAL validation now)
+        ssh_connected = await self.ssh_client.connect()
+        if ssh_connected:
+            logger.info("✅ SSH connected - remote audio upload enabled")
+        else:
+            logger.warning("⚠️ SSH connection failed - using local audio only")
+            logger.warning(f"   Tried: {self.ssh_user}@{self.ssh_host}:{self.ssh_port}")
 
         # Pre-cache common phrases
         await self._precache_phrases()
 
         # Connect to ARI
         try:
+            logger.info(f"Connecting to ARI at {self.ari_base}...")
             self.ari_client = await aioari.connect(
                 self.ari_base,
                 self.ari_username,
@@ -208,6 +168,9 @@ After function, respond naturally."""
 
             logger.info("=" * 60)
             logger.info("🎙️ SYSTEM READY - Waiting for calls")
+            logger.info(f"   ARI App: {self.ari_app}")
+            logger.info(f"   AI Model: {self.azure_openai_deployment}")
+            logger.info(f"   SSH: {'Connected' if ssh_connected else 'Disconnected (local only)'}")
             logger.info("=" * 60)
 
             # Run ARI event loop
@@ -215,6 +178,9 @@ After function, respond naturally."""
 
         except Exception as e:
             logger.error(f"❌ ARI connection error: {e}")
+            logger.error(f"   URL: {self.ari_base}")
+            logger.error(f"   Username: {self.ari_username}")
+            logger.error("   Check FreePBX ARI configuration and credentials")
             self.running = False
 
     async def stop(self):
@@ -247,16 +213,20 @@ After function, respond naturally."""
             "Good morning, thank you for calling. How can I help you today?",
             "Good afternoon, thank you for calling. How can I help you today?",
             "Good evening, thank you for calling. How can I help you today?",
-            "Thanks for calling!",
-            "Could you repeat that?",
-            "Having trouble hearing you. Please call back.",
+            "Thank you for calling!",
+            "Could you repeat that please?",
+            "I'm having trouble hearing you. Please try calling back.",
+            "Let me connect you with a specialist who can help.",
         ]
 
         logger.info("Caching common phrases...")
+        cached_count = 0
         for phrase in phrases:
-            await self.sound_cache.get(phrase, self.ssh_client)
+            success = await self.sound_cache.get(phrase, self.ssh_client)
+            if success[0]:
+                cached_count += 1
 
-        logger.info(f"✅ Cached {len(phrases)} phrases")
+        logger.info(f"✅ Cached {cached_count}/{len(phrases)} phrases")
 
     def _handle_stasis_start(self, event):
         """Handle incoming call event"""
@@ -277,6 +247,8 @@ After function, respond naturally."""
     async def _handle_call(self, channel):
         """Handle a single call"""
         caller_number = channel.json.get('caller', {}).get('number', 'Unknown')
+
+        logger.info(f"📞 Incoming call from {caller_number}")
 
         # Create call instance
         call = CallInstance(
@@ -307,9 +279,8 @@ After function, respond naturally."""
         finally:
             self.active_calls.discard(call)
             await call.cleanup()
-
-            # Log call end
             self._log_call_end(call)
+            logger.info(f"✅ Call completed: {caller_number}")
 
     def _log_call_start(self, call_id, caller_number):
         """Log call start to database"""
@@ -358,7 +329,7 @@ After function, respond naturally."""
 
 
 class CallInstance:
-    """Represents a single call"""
+    """Represents a single call with full conversation handling"""
 
     def __init__(self, channel, ari_client, ai_client, sound_cache, ssh_client,
                  transcriber, system_prompt, deployment, ari_url, ari_username, ari_password):
@@ -381,16 +352,14 @@ class CallInstance:
         self.conversation = [{"role": "system", "content": system_prompt}]
 
     async def process(self):
-        """Process the call"""
+        """Process the call with full conversation flow"""
         try:
             # Answer call
             await self.channel.answer()
             await asyncio.sleep(0.2)
 
             # Time-appropriate greeting
-            import datetime
-            hour = datetime.datetime.now().hour
-
+            hour = datetime.now().hour
             if hour < 12:
                 time_greeting = 'Good morning'
             elif hour < 17:
@@ -402,31 +371,35 @@ class CallInstance:
             await self.speak(greeting)
             self.conversation.append({"role": "assistant", "content": greeting})
 
-            # Beep
+            # Beep to signal user can speak
             await asyncio.sleep(0.1)
             await self.channel.play(media="sound:beep")
             await asyncio.sleep(0.15)
 
             # Conversation loop
             no_speech_count = 0
+            max_turns = 8  # Maximum conversation turns
 
-            for turn in range(6):
+            for turn in range(max_turns):
                 if not await self.is_alive():
                     break
 
                 self.turn_count += 1
 
-                # Record
+                # Record user speech
                 audio_file = await self.record()
+
+                # Play beep after recording
                 await self.channel.play(media="sound:beep")
                 await asyncio.sleep(0.1)
 
                 if not audio_file:
                     no_speech_count += 1
                     if no_speech_count >= 2:
-                        await self.speak("Having trouble hearing you. Please call back.")
+                        await self.speak("I'm having trouble hearing you. Please try calling back.")
                         break
-                    await self.speak("Didn't catch that. Go ahead.")
+
+                    await self.speak("I didn't catch that. Please go ahead.")
                     await asyncio.sleep(0.1)
                     await self.channel.play(media="sound:beep")
                     await asyncio.sleep(0.15)
@@ -437,22 +410,24 @@ class CallInstance:
                 no_speech_count = 0
 
                 if not text or len(text) < 3:
-                    await self.speak("Could you repeat that?")
+                    await self.speak("Could you repeat that please?")
                     await asyncio.sleep(0.1)
                     await self.channel.play(media="sound:beep")
                     await asyncio.sleep(0.15)
                     continue
 
-                logger.info(f"User said: {text}")
+                logger.info(f"👤 User: {text}")
 
                 # Check for goodbye
-                if len(text.split()) <= 4 and any(w in text.lower() for w in ["bye", "goodbye", "thanks", "done"]):
-                    await self.speak("Thanks for calling!")
+                goodbye_words = ["bye", "goodbye", "thanks", "thank you", "done", "that's all"]
+                if len(text.split()) <= 5 and any(word in text.lower() for word in goodbye_words):
+                    await self.speak("Thank you for calling!")
                     break
 
-                # AI response
+                # Add to conversation
                 self.conversation.append({"role": "user", "content": text})
 
+                # Get AI response
                 try:
                     response = await self.ai_client.chat.completions.create(
                         model=self.deployment,
@@ -464,7 +439,7 @@ class CallInstance:
                     ai_text = response.choices[0].message.content.strip()
                     self.conversation.append({"role": "assistant", "content": ai_text})
 
-                    logger.info(f"AI responded: {ai_text}")
+                    logger.info(f"🤖 AI: {ai_text}")
 
                     # Speak response
                     if not await self.speak(ai_text):
@@ -477,12 +452,12 @@ class CallInstance:
 
                 except Exception as e:
                     logger.error(f"AI error: {e}")
-                    await self.speak("Technical issue. Let me connect you to someone.")
+                    await self.speak("I'm experiencing a technical issue. Let me connect you to someone who can help.")
                     break
 
-            # Goodbye
+            # Final goodbye
             if self.active:
-                await self.speak("Thanks for calling!")
+                await self.speak("Thank you for calling!")
 
             await self.hangup()
 
@@ -502,17 +477,22 @@ class CallInstance:
             return False
 
     async def speak(self, text):
-        """Speak text to caller"""
+        """Speak text to caller using cached TTS"""
         if not await self.is_alive():
             return False
 
         try:
             sound_path, duration = await self.sound_cache.get(text, self.ssh_client)
             if not sound_path:
+                logger.error("Failed to generate/cache audio")
                 return False
 
             await self.channel.play(media=f"sound:{sound_path}")
-            await asyncio.sleep((duration or len(text.split()) * 0.4) + 0.3)
+
+            # Wait for audio to finish
+            estimated_duration = duration or (len(text.split()) * 0.4)
+            await asyncio.sleep(estimated_duration + 0.3)
+
             return True
         except Exception as e:
             if "404" not in str(e):
@@ -535,6 +515,7 @@ class CallInstance:
                 ifExists="overwrite",
                 terminateOn="none"
             )
+
             await asyncio.sleep(duration + 0.5)
 
             try:
@@ -565,8 +546,9 @@ class CallInstance:
                     temp_file.close()
                     self.temp_files.append(temp_file.name)
                     return temp_file.name
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"Download attempt {attempt + 1} failed: {e}")
+
             await asyncio.sleep(0.15)
 
         return None
@@ -598,7 +580,7 @@ class SoundCache:
         self.index = self._load_index()
 
     def _load_index(self):
-        """Load cache index"""
+        """Load cache index from disk"""
         if self.index_file.exists():
             try:
                 return json.load(open(self.index_file))
@@ -607,11 +589,11 @@ class SoundCache:
         return {}
 
     def _save_index(self):
-        """Save cache index"""
+        """Save cache index to disk"""
         try:
             json.dump(self.index, open(self.index_file, 'w'))
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Failed to save cache index: {e}")
 
     def _cache_key(self, text):
         """Generate cache key for text"""
@@ -621,9 +603,11 @@ class SoundCache:
         """Get cached audio or generate new"""
         key = self._cache_key(text)
 
-        # Check if cached remotely
+        # Check if cached remotely on Asterisk
         if key in self.index and self.index[key].get('remote'):
-            return self.index[key]['remote'], self.index[key].get('duration')
+            remote_path = self.index[key]['remote']
+            duration = self.index[key].get('duration')
+            return remote_path, duration
 
         # Generate locally
         local_path = await self._generate_tts(text, key)
@@ -633,31 +617,37 @@ class SoundCache:
         # Get duration
         duration = self._get_duration(local_path)
 
-        # Upload to Asterisk
+        # Try to upload to Asterisk if SSH is connected
         remote_path = await ssh_client.upload(local_path, f"c_{key}.wav")
+
         if remote_path:
+            # Successfully uploaded - save to index
             self.index[key] = {'remote': remote_path, 'duration': duration}
             self._save_index()
-
-        return (remote_path or local_path), duration
+            return remote_path, duration
+        else:
+            # SSH failed - return local path (won't work for actual calls but good for testing)
+            logger.warning(f"Using local audio path (SSH upload failed): {local_path}")
+            return local_path, duration
 
     async def _generate_tts(self, text, key):
-        """Generate TTS audio"""
+        """Generate TTS audio using gTTS or pyttsx3"""
         try:
             output_file = self.cache_dir / f"{key}.wav"
             if output_file.exists():
                 return str(output_file)
 
-            # Use gTTS
+            # Try gTTS first (better quality)
             try:
                 from gtts import gTTS
                 temp_file = self.cache_dir / f"{key}_temp.mp3"
+
                 await asyncio.get_running_loop().run_in_executor(
                     None,
                     lambda: gTTS(text=text, lang='en', slow=False).save(str(temp_file))
                 )
 
-                # Convert to WAV
+                # Convert to WAV (8kHz mono for telephony)
                 audio = AudioSegment.from_file(str(temp_file))
                 audio = normalize(audio).set_frame_rate(8000).set_channels(1).set_sample_width(2)
                 audio.export(str(output_file), format="wav")
@@ -667,19 +657,24 @@ class SoundCache:
                 except:
                     pass
 
+                logger.debug(f"Generated TTS with gTTS: {key}")
+                return str(output_file)
+
             except Exception as e:
-                logger.error(f"gTTS failed: {e}, trying pyttsx3...")
+                logger.debug(f"gTTS failed: {e}, trying pyttsx3...")
+
                 # Fallback to pyttsx3
                 try:
                     import pyttsx3
                     temp_file = self.cache_dir / f"{key}_temp.wav"
+
                     engine = pyttsx3.init()
                     engine.setProperty('rate', 165)
                     engine.save_to_file(text, str(temp_file))
                     engine.runAndWait()
                     engine.stop()
 
-                    # Normalize
+                    # Normalize for telephony
                     audio = AudioSegment.from_file(str(temp_file))
                     audio = normalize(audio).set_frame_rate(8000).set_channels(1).set_sample_width(2)
                     audio.export(str(output_file), format="wav")
@@ -688,17 +683,20 @@ class SoundCache:
                         temp_file.unlink()
                     except:
                         pass
+
+                    logger.debug(f"Generated TTS with pyttsx3: {key}")
+                    return str(output_file)
+
                 except Exception as e2:
                     logger.error(f"pyttsx3 also failed: {e2}")
                     return None
 
-            return str(output_file)
         except Exception as e:
             logger.error(f"TTS generation failed: {e}")
             return None
 
     def _get_duration(self, file_path):
-        """Get audio duration"""
+        """Get audio file duration in seconds"""
         try:
             audio = AudioSegment.from_file(file_path)
             return len(audio) / 1000.0
@@ -707,60 +705,100 @@ class SoundCache:
 
 
 class SSHClient:
-    """SSH client for uploading audio to Asterisk"""
+    """SSH client for uploading audio files to Asterisk sounds directory"""
 
-    def __init__(self, host, user, password, sounds_dir):
+    def __init__(self, host, port, user, password, sounds_dir):
         self.host = host
+        self.port = port
         self.user = user
         self.password = password
         self.sounds_dir = sounds_dir
         self.client = None
         self.sftp = None
         self.lock = asyncio.Lock()
+        self.connected = False
 
     async def connect(self):
-        """Connect to SSH server"""
+        """Connect to SSH server - REAL validation"""
         try:
+            logger.info(f"Attempting SSH connection to {self.user}@{self.host}:{self.port}...")
+
             self.client = paramiko.SSHClient()
             self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
+            # Run connection in thread pool
             await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: self.client.connect(
                     self.host,
+                    port=self.port,
                     username=self.user,
                     password=self.password,
                     timeout=10,
-                    look_for_keys=False
+                    look_for_keys=False,
+                    allow_agent=False
                 )
             )
 
+            # Test SFTP
             self.sftp = self.client.open_sftp()
-            logger.info("✅ SSH connected")
+
+            # Test directory access
+            try:
+                self.sftp.stat(self.sounds_dir)
+            except FileNotFoundError:
+                logger.warning(f"Sounds directory doesn't exist: {self.sounds_dir}")
+                # Try to create it
+                await self._exec_cmd(f"sudo mkdir -p {self.sounds_dir}")
+                await self._exec_cmd(f"sudo chown asterisk:asterisk {self.sounds_dir}")
+                await self._exec_cmd(f"sudo chmod 755 {self.sounds_dir}")
+
+            self.connected = True
+            logger.info(f"✅ SSH connected to {self.host}")
             return True
+
+        except paramiko.AuthenticationException:
+            logger.error(f"❌ SSH authentication failed for {self.user}@{self.host}")
+            logger.error("   Check SSH_USER and SSH_PASSWORD in .env")
+            self.connected = False
+            return False
+        except paramiko.SSHException as e:
+            logger.error(f"❌ SSH connection error: {e}")
+            self.connected = False
+            return False
         except Exception as e:
-            logger.error(f"SSH connection error: {e}")
+            logger.error(f"❌ SSH connection failed: {e}")
+            self.connected = False
             return False
 
     async def upload(self, local_path, filename):
-        """Upload file to Asterisk"""
+        """Upload file to Asterisk sounds directory"""
+        if not self.connected:
+            logger.debug("SSH not connected - cannot upload")
+            return None
+
         async with self.lock:
             try:
-                if not self.sftp and not await self.connect():
+                if not self.sftp:
+                    logger.error("SFTP not initialized")
                     return None
 
                 # Upload to /tmp first
+                tmp_path = f"/tmp/{filename}"
                 await asyncio.get_running_loop().run_in_executor(
                     None,
-                    lambda: self.sftp.put(local_path, f"/tmp/{filename}")
+                    lambda: self.sftp.put(local_path, tmp_path)
                 )
 
                 # Move to sounds directory with sudo
-                await self._exec_cmd(f"sudo mv /tmp/{filename} {self.sounds_dir}/{filename}")
-                await self._exec_cmd(f"sudo chown asterisk:asterisk {self.sounds_dir}/{filename}")
-                await self._exec_cmd(f"sudo chmod 644 {self.sounds_dir}/{filename}")
+                final_path = f"{self.sounds_dir}/{filename}"
+                await self._exec_cmd(f"sudo mv {tmp_path} {final_path}")
+                await self._exec_cmd(f"sudo chown asterisk:asterisk {final_path}")
+                await self._exec_cmd(f"sudo chmod 644 {final_path}")
 
+                # Return path without extension for Asterisk
                 return f"custom/{filename.replace('.wav', '')}"
+
             except Exception as e:
                 logger.error(f"Upload error: {e}")
                 return None
@@ -768,12 +806,20 @@ class SSHClient:
     async def _exec_cmd(self, command):
         """Execute SSH command"""
         try:
-            _, stdout, _ = await asyncio.get_running_loop().run_in_executor(
+            _, stdout, stderr = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: self.client.exec_command(command)
             )
-            return stdout.channel.recv_exit_status() == 0
-        except:
+            exit_status = stdout.channel.recv_exit_status()
+
+            if exit_status != 0:
+                error = stderr.read().decode()
+                logger.debug(f"Command failed: {command} - {error}")
+                return False
+
+            return True
+        except Exception as e:
+            logger.debug(f"Command error: {e}")
             return False
 
     def close(self):
@@ -783,14 +829,18 @@ class SSHClient:
                 self.sftp.close()
             if self.client:
                 self.client.close()
+            self.connected = False
         except:
             pass
 
 
 class AzureSpeechTranscriber:
-    """Azure Speech transcription"""
+    """Azure Speech Services transcription"""
 
     def __init__(self, speech_key, speech_region):
+        if not speech_key or not speech_region:
+            raise ValueError("Azure Speech key and region required")
+
         self.config = speechsdk.SpeechConfig(
             subscription=speech_key,
             region=speech_region
@@ -798,15 +848,16 @@ class AzureSpeechTranscriber:
         self.config.speech_recognition_language = "en-US"
 
     async def transcribe(self, audio_file):
-        """Transcribe audio file"""
+        """Transcribe audio file to text"""
         try:
+            # Check file size
             if os.path.getsize(audio_file) < 4000:
                 return "", "low"
 
-            # Preprocess audio
+            # Preprocess audio for better recognition
             processed = await self._preprocess(audio_file)
 
-            # Transcribe
+            # Transcribe using Azure
             audio_config = speechsdk.audio.AudioConfig(filename=processed)
             recognizer = speechsdk.SpeechRecognizer(
                 speech_config=self.config,
@@ -818,10 +869,14 @@ class AzureSpeechTranscriber:
                 recognizer.recognize_once
             )
 
-            text = result.text.strip() if result.reason == speechsdk.ResultReason.RecognizedSpeech else ""
-            confidence = "high" if text else "low"
+            if result.reason == speechsdk.ResultReason.RecognizedSpeech:
+                text = result.text.strip()
+                confidence = "high"
+            else:
+                text = ""
+                confidence = "low"
 
-            # Cleanup
+            # Cleanup processed file
             if processed != audio_file:
                 try:
                     os.unlink(processed)
@@ -829,6 +884,7 @@ class AzureSpeechTranscriber:
                     pass
 
             return text, confidence
+
         except Exception as e:
             logger.error(f"Transcription error: {e}")
             return "", "low"
@@ -838,6 +894,7 @@ class AzureSpeechTranscriber:
         try:
             audio = AudioSegment.from_file(audio_file)
             audio = normalize(audio).set_frame_rate(16000).set_channels(1).set_sample_width(2)
+
             processed = audio_file.replace('.wav', '_proc.wav')
             audio.export(processed, format="wav")
             return processed

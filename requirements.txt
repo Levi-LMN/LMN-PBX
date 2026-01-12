@@ -14,7 +14,8 @@ aioari==0.10.2
 aiohttp==3.9.5
 
 # SSH for file upload
-paramiko==3.4.0
+paramiko==4.0.0
+cryptography==46.0.3
 
 # Audio Processing
 pydub==0.25.1
@@ -28,7 +29,7 @@ azure-cognitiveservices-speech==1.40.0
 openai==1.54.4
 
 # Microsoft Authentication (for Dataverse - optional)
-msal==1.31.0
+msal==1.34.0
 
 # HTTP Requests
 requests==2.32.3
