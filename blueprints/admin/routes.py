@@ -88,7 +88,7 @@ def dashboard():
 @login_required
 def system_status():
     """
-    API endpoint to check REAL system status with actual connection validation
+    API endpoint for real system status - NO SSH CHECK
     """
     status = {
         'timestamp': datetime.utcnow().isoformat(),
@@ -126,7 +126,7 @@ def system_status():
             'details': {
                 'provider': 'Azure OpenAI',
                 'model': ari_agent.azure_openai_deployment,
-                'endpoint': ari_agent.azure_openai_endpoint
+                'endpoint': ari_agent.azure_openai_endpoint[:50] + '...' if len(ari_agent.azure_openai_endpoint) > 50 else ari_agent.azure_openai_endpoint
             },
             'icon': 'fa-brain',
             'color': 'success'
@@ -135,9 +135,9 @@ def system_status():
         status['services']['ai'] = {
             'name': 'AI Assistant',
             'status': 'not_configured',
-            'details': {'message': 'Azure OpenAI not configured - check AZURE_OPENAI_KEY'},
+            'details': {'message': 'Check AZURE_OPENAI_KEY and AZURE_OPENAI_ENDPOINT in .env'},
             'icon': 'fa-brain',
-            'color': 'warning'
+            'color': 'danger'
         }
 
     # Check Speech Service
@@ -156,42 +156,41 @@ def system_status():
         status['services']['speech'] = {
             'name': 'Speech Services',
             'status': 'not_configured',
-            'details': {'message': 'Azure Speech not configured - check AZURE_SPEECH_KEY'},
+            'details': {'message': 'Check AZURE_SPEECH_KEY in .env'},
             'icon': 'fa-microphone',
-            'color': 'warning'
+            'color': 'danger'
         }
 
-    # Check SSH Connection - REAL validation now
-    if ari_agent and ari_agent.ssh_client:
-        if ari_agent.ssh_client.connected:
-            status['services']['ssh'] = {
-                'name': 'SSH/Audio Upload',
+    # Check File System Access (replaces SSH)
+    if ari_agent and ari_agent.file_access:
+        if ari_agent.file_access.can_write:
+            status['services']['filesystem'] = {
+                'name': 'Audio File System',
                 'status': 'connected',
                 'details': {
-                    'host': ari_agent.ssh_host,
-                    'port': ari_agent.ssh_port,
-                    'user': ari_agent.ssh_user
+                    'directory': ari_agent.asterisk_sounds_dir,
+                    'access': 'sudo' if ari_agent.file_access.use_sudo else 'direct'
                 },
-                'icon': 'fa-server',
+                'icon': 'fa-folder',
                 'color': 'success'
             }
         else:
-            status['services']['ssh'] = {
-                'name': 'SSH/Audio Upload',
-                'status': 'disconnected',
+            status['services']['filesystem'] = {
+                'name': 'Audio File System',
+                'status': 'read_only',
                 'details': {
-                    'message': 'SSH authentication failed - check SSH_USER and SSH_PASSWORD',
-                    'host': ari_agent.ssh_host
+                    'message': 'No write permission to /var/lib/asterisk/sounds/custom',
+                    'directory': ari_agent.asterisk_sounds_dir
                 },
-                'icon': 'fa-server',
-                'color': 'danger'
+                'icon': 'fa-folder',
+                'color': 'warning'
             }
     else:
-        status['services']['ssh'] = {
-            'name': 'SSH/Audio Upload',
+        status['services']['filesystem'] = {
+            'name': 'Audio File System',
             'status': 'not_configured',
-            'details': {'message': 'SSH client not initialized'},
-            'icon': 'fa-server',
+            'details': {'message': 'File system access not initialized'},
+            'icon': 'fa-folder',
             'color': 'warning'
         }
 
@@ -208,7 +207,6 @@ def system_status():
     }
 
     return jsonify(status)
-
 
 @admin_bp.route('/api/active-calls')
 @login_required
