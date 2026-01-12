@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+
+{% block title %}Departments - FreePBX AI Assistant{% endblock %}
+
+{% block content %}
+<div class="page-header d-flex justify-content-between align-items-center">
+    <div>
+        <h1 class="page-title">Departments</h1>
+        <p class="page-subtitle">Manage call routing and department extensions</p>
+    </div>
+    <a href="{{ url_for('admin.create_department') }}" class="btn btn-primary">
+        <i class="fas fa-plus"></i> Add Department
+    </a>
+</div>
+
+{% if departments %}
+<div class="row g-3">
+    {% for dept in departments %}
+    <div class="col-md-6">
+        <div class="card" style="border-left: 4px solid {% if dept.is_active %}var(--primary-color){% else %}#9ca3af{% endif %};">
+            <div class="card-body">
+                <div class="d-flex justify-content-between align-items-start mb-3">
+                    <div>
+                        <h5 style="font-weight: 700; margin-bottom: 0.5rem; color: var(--text-primary);">
+                            {{ dept.name }}
+                        </h5>
+                        {% if dept.description %}
+                        <p style="color: var(--text-secondary); font-size: 0.9rem; margin: 0;">
+                            {{ dept.description }}
+                        </p>
+                        {% endif %}
+                    </div>
+                    {% if dept.is_active %}
+                        <span class="badge bg-success">Active</span>
+                    {% else %}
+                        <span class="badge bg-secondary">Inactive</span>
+                    {% endif %}
+                </div>
+
+                <div class="row g-3 mb-3">
+                    <div class="col-6">
+                        <div style="background: #f9fafb; padding: 1rem; border-radius: 12px;">
+                            <div style="font-size: 0.75rem; color: var(--text-secondary); margin-bottom: 0.25rem; font-weight: 600;">Extension</div>
+                            <div style="font-size: 1.25rem; font-weight: 700; color: var(--text-primary);">
+                                {{ dept.extension }}
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-6">
+                        <div style="background: #f9fafb; padding: 1rem; border-radius: 12px;">
+                            <div style="font-size: 0.75rem; color: var(--text-secondary); margin-bottom: 0.25rem; font-weight: 600;">Priority</div>
+                            <div style="font-size: 1.25rem; font-weight: 700; color: var(--text-primary);">
+                                {{ dept.priority }}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="d-flex justify-content-between align-items-center" style="padding-top: 1rem; border-top: 1px solid #f3f4f6;">
+                    <div style="font-size: 0.85rem; color: var(--text-secondary);">
+                        <i class="fas fa-phone-alt"></i> {{ dept.escalated_calls|length }} escalated calls
+                    </div>
+                    <div class="d-flex gap-2">
+                        <a href="{{ url_for('admin.edit_department', dept_id=dept.id) }}"
+                           class="btn btn-sm btn-outline-primary">
+                            <i class="fas fa-edit"></i> Edit
+                        </a>
+                        <form method="POST" action="{{ url_for('admin.delete_department', dept_id=dept.id) }}"
+                              class="d-inline" onsubmit="return confirm('Are you sure you want to delete this department?');">
+                            <button type="submit" class="btn btn-sm btn-outline-danger">
+                                <i class="fas fa-trash"></i>
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<div class="card">
+    <div class="card-body text-center py-5">
+        <div style="width: 100px; height: 100px; background: linear-gradient(135deg, var(--primary-color), var(--primary-light)); border-radius: 24px; display: flex; align-items: center; justify-content: center; margin: 0 auto 1.5rem;">
+            <i class="fas fa-building fa-3x text-white"></i>
+        </div>
+        <h3 style="font-weight: 700; margin-bottom: 0.5rem;">No Departments Yet</h3>
+        <p style="color: var(--text-secondary); margin-bottom: 1.5rem;">Get started by creating your first department</p>
+        <a href="{{ url_for('admin.create_department') }}" class="btn btn-primary">
+            <i class="fas fa-plus"></i> Add Department
+        </a>
+    </div>
+</div>
+{% endif %}
+{% endblock %}

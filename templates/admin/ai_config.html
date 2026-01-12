@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+
+{% block title %}AI Configuration - FreePBX AI Assistant{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1 class="page-title">AI Configuration</h1>
+    <p class="page-subtitle">Customize your AI assistant's behavior and performance</p>
+</div>
+
+<div class="row g-3">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <i class="fas fa-brain"></i> System Prompt Configuration
+            </div>
+            <div class="card-body">
+                <form method="POST" action="{{ url_for('admin.ai_config') }}">
+                    <div class="mb-4">
+                        <label for="system_prompt" class="form-label" style="font-weight: 600; color: var(--text-primary);">
+                            AI System Prompt
+                            <i class="fas fa-info-circle text-muted"
+                               data-bs-toggle="tooltip"
+                               title="This prompt defines the AI assistant's behavior and personality"></i>
+                        </label>
+                        <textarea class="form-control" id="system_prompt" name="system_prompt"
+                                  rows="12" required style="border-radius: 12px; border: 2px solid #e5e7eb; font-family: 'Courier New', monospace; font-size: 0.9rem;">{{ system_prompt }}</textarea>
+                        <div class="form-text" style="margin-top: 0.75rem;">
+                            Define how the AI assistant should behave, what information it has access to,
+                            and when it should escalate to a human agent.
+                        </div>
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="escalation_threshold" class="form-label" style="font-weight: 600; color: var(--text-primary);">
+                            Escalation Threshold
+                            <i class="fas fa-info-circle text-muted"
+                               data-bs-toggle="tooltip"
+                               title="Number of failed interactions before escalating to human"></i>
+                        </label>
+                        <input type="number" class="form-control" id="escalation_threshold"
+                               name="escalation_threshold" value="{{ escalation_threshold }}"
+                               min="1" max="10" required style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                        <div class="form-text" style="margin-top: 0.75rem;">
+                            The AI will escalate to a human after this many unsuccessful interactions.
+                        </div>
+                    </div>
+
+                    <button type="submit" class="btn btn-primary btn-lg">
+                        <i class="fas fa-save"></i> Save Configuration
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-4">
+        <!-- Configuration Tips -->
+        <div class="card mb-3" style="background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%); border: none;">
+            <div class="card-body">
+                <h5 style="font-weight: 700; margin-bottom: 1rem; color: #78350f;">
+                    <i class="fas fa-lightbulb"></i> Configuration Tips
+                </h5>
+                <ul style="font-size: 0.9rem; color: #92400e; line-height: 1.8; padding-left: 1.25rem;">
+                    <li>Be specific about the AI's role and capabilities</li>
+                    <li>Include examples of good responses</li>
+                    <li>Define clear escalation criteria</li>
+                    <li>Specify tone and communication style</li>
+                    <li>List topics the AI should avoid</li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- Best Practices -->
+        <div class="card mb-3" style="background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%); border: none;">
+            <div class="card-body">
+                <h5 style="font-weight: 700; margin-bottom: 1rem; color: #065f46;">
+                    <i class="fas fa-shield-alt"></i> Best Practices
+                </h5>
+                <ul style="font-size: 0.9rem; color: #047857; line-height: 1.8; padding-left: 1.25rem;">
+                    <li>Keep responses concise and clear</li>
+                    <li>Always verify caller identity for sensitive info</li>
+                    <li>Escalate when in doubt</li>
+                    <li>Use empathetic language</li>
+                    <li>Regularly review and update based on call logs</li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- Current Model Info -->
+        <div class="card">
+            <div class="card-header">
+                <i class="fas fa-microchip"></i> Current Model
+            </div>
+            <div class="card-body">
+                <div class="mb-3">
+                    <div style="font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 0.25rem; font-weight: 600;">Model</div>
+                    <div style="font-weight: 600; color: var(--text-primary);">GPT-4o Mini</div>
+                </div>
+                <div class="mb-3">
+                    <div style="font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 0.25rem; font-weight: 600;">Provider</div>
+                    <div style="font-weight: 600; color: var(--text-primary);">Azure OpenAI</div>
+                </div>
+                <div class="mb-3">
+                    <div style="font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 0.25rem; font-weight: 600;">Max Tokens</div>
+                    <div style="font-weight: 600; color: var(--text-primary);">500</div>
+                </div>
+                <div>
+                    <div style="font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 0.25rem; font-weight: 600;">Temperature</div>
+                    <div style="font-weight: 600; color: var(--text-primary);">0.7</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+// Initialize Bootstrap tooltips
+var tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'))
+var tooltipList = tooltipTriggerList.map(function (tooltipTriggerEl) {
+    return new bootstrap.Tooltip(tooltipTriggerEl)
+})
+</script>
+{% endblock %}

@@ -1,0 +1,119 @@
+{% extends "base.html" %}
+
+{% block title %}{{ 'Edit' if entry else 'Create' }} Knowledge Entry - FreePBX AI Assistant{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1 class="page-title">{{ 'Edit' if entry else 'Create' }} Knowledge Entry</h1>
+    <p class="page-subtitle">{{ 'Update knowledge base content' if entry else 'Add information for the AI assistant' }}</p>
+</div>
+
+<div class="row">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <i class="fas fa-book"></i> Knowledge Content
+            </div>
+            <div class="card-body">
+                <form method="POST">
+                    <div class="mb-3">
+                        <label for="title" class="form-label" style="font-weight: 600;">Title</label>
+                        <input type="text" class="form-control" id="title" name="title" 
+                               value="{{ entry.title if entry else '' }}" required
+                               style="border-radius: 10px; border: 2px solid #e5e7eb;">
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="category" class="form-label" style="font-weight: 600;">Category</label>
+                        <select class="form-select" id="category" name="category" required
+                                style="border-radius: 10px; border: 2px solid #e5e7eb;">
+                            {% for cat in categories %}
+                            <option value="{{ cat }}" {% if entry and entry.category == cat %}selected{% endif %}>
+                                {{ cat|title }}
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="content" class="form-label" style="font-weight: 600;">Content</label>
+                        <textarea class="form-control" id="content" name="content" rows="8" required
+                                  style="border-radius: 10px; border: 2px solid #e5e7eb;">{{ entry.content if entry else '' }}</textarea>
+                        <div class="form-text">The information the AI will reference when answering questions</div>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="keywords" class="form-label" style="font-weight: 600;">Keywords (JSON Array)</label>
+                        <input type="text" class="form-control" id="keywords" name="keywords" 
+                               value='{{ entry.keywords if entry else "[]" }}'
+                               style="border-radius: 10px; border: 2px solid #e5e7eb;">
+                        <div class="form-text">Example: ["insurance", "deductible", "coverage"]</div>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="priority" class="form-label" style="font-weight: 600;">Priority</label>
+                        <input type="number" class="form-control" id="priority" name="priority" 
+                               value="{{ entry.priority if entry else 0 }}" min="0" max="100"
+                               style="border-radius: 10px; border: 2px solid #e5e7eb;">
+                        <div class="form-text">Higher priority content is more likely to be included (0-100)</div>
+                    </div>
+                    
+                    {% if entry %}
+                    <div class="mb-3">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="is_active" name="is_active" 
+                                   {% if entry.is_active %}checked{% endif %}>
+                            <label class="form-check-label" for="is_active">
+                                Active knowledge entry
+                            </label>
+                        </div>
+                    </div>
+                    {% endif %}
+                    
+                    <div class="d-flex gap-2">
+                        <button type="submit" class="btn btn-primary">
+                            <i class="fas fa-save"></i> {{ 'Update' if entry else 'Create' }} Entry
+                        </button>
+                        <a href="{{ url_for('admin.knowledge_base') }}" class="btn btn-outline-secondary">
+                            <i class="fas fa-times"></i> Cancel
+                        </a>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-4">
+        <div class="card" style="background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%); border: none;">
+            <div class="card-body">
+                <h5 style="font-weight: 700; margin-bottom: 1rem; color: #065f46; font-size: 0.9rem;">
+                    <i class="fas fa-lightbulb"></i> Tips
+                </h5>
+                
+                <div style="font-size: 0.8rem; color: #047857; line-height: 1.8;">
+                    <p><strong>Be Specific:</strong> Include exact details, numbers, and policies</p>
+                    <p><strong>Use Keywords:</strong> Add relevant search terms to help the AI find this content</p>
+                    <p><strong>Keep Updated:</strong> Regular review ensures accuracy</p>
+                    <p style="margin-bottom: 0;"><strong>Priority Matters:</strong> Critical information should have higher priority</p>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card mt-3">
+            <div class="card-header">
+                Categories
+            </div>
+            <div class="card-body" style="font-size: 0.75rem;">
+                <ul style="margin: 0; padding-left: 1.25rem; line-height: 1.8;">
+                    <li><strong>Policies:</strong> Insurance policies and terms</li>
+                    <li><strong>Claims:</strong> Claim procedures and info</li>
+                    <li><strong>Billing:</strong> Payment and billing details</li>
+                    <li><strong>Coverage:</strong> Coverage types and limits</li>
+                    <li><strong>FAQ:</strong> Frequently asked questions</li>
+                    <li><strong>Procedures:</strong> Step-by-step guides</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

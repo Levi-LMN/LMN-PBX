@@ -1,0 +1,401 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - FreePBX AI Assistant{% endblock %}
+
+{% block content %}
+<div class="page-header d-flex justify-content-between align-items-center">
+    <div>
+        <h1 class="page-title">Dashboard</h1>
+        <p class="page-subtitle">Monitor and manage your AI-powered call system with ease.</p>
+    </div>
+    <div class="d-flex gap-2">
+        <button class="btn btn-outline-primary" onclick="location.reload()">
+            <i class="fas fa-sync-alt"></i> Refresh
+        </button>
+        <button class="btn btn-primary">
+            <i class="fas fa-plus"></i> New Project
+        </button>
+    </div>
+</div>
+
+<!-- Statistics Cards -->
+<div class="row g-3 mb-4">
+    <div class="col-md-3">
+        <div class="card stat-card primary">
+            <div class="stat-icon">
+                <i class="fas fa-arrow-trend-up"></i>
+            </div>
+            <div class="stat-label">Total Calls</div>
+            <div class="stat-value">{{ total_calls }}</div>
+            <div class="stat-change">
+                <i class="fas fa-arrow-up"></i>
+                <span>Increased from last month</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-3">
+        <div class="card stat-card">
+            <div class="stat-icon">
+                <i class="fas fa-arrow-trend-up"></i>
+            </div>
+            <div class="stat-label">Ended Projects</div>
+            <div class="stat-value">{{ total_calls - active_calls }}</div>
+            <div class="stat-change text-success">
+                <i class="fas fa-arrow-up"></i>
+                <span>Increased from last month</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-3">
+        <div class="card stat-card">
+            <div class="stat-icon">
+                <i class="fas fa-arrow-trend-up"></i>
+            </div>
+            <div class="stat-label">Running Projects</div>
+            <div class="stat-value">{{ active_calls }}</div>
+            <div class="stat-change text-success">
+                <i class="fas fa-plus"></i>
+                <span>Increased from last month</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-3">
+        <div class="card stat-card">
+            <div class="stat-icon">
+                <i class="fas fa-arrow-trend-up"></i>
+            </div>
+            <div class="stat-label">Pending Projects</div>
+            <div class="stat-value">{{ escalated_calls }}</div>
+            <div class="stat-change text-warning">
+                <span>On Discuss</span>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row g-3">
+    <!-- Project Analytics -->
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <i class="fas fa-chart-bar"></i> Call Analytics
+            </div>
+            <div class="card-body">
+                <canvas id="callAnalyticsChart" height="80"></canvas>
+            </div>
+        </div>
+
+        <!-- Recent Calls -->
+        <div class="card mt-3">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <div>
+                    <i class="fas fa-phone"></i> Recent Calls
+                </div>
+                <a href="{{ url_for('admin.call_logs') }}" class="btn btn-sm btn-outline-primary">
+                    View All <i class="fas fa-arrow-right"></i>
+                </a>
+            </div>
+            <div class="card-body p-0">
+                {% if recent_call_list %}
+                <div class="table-responsive">
+                    <table class="table mb-0">
+                        <thead>
+                            <tr>
+                                <th>Call ID</th>
+                                <th>Caller</th>
+                                <th>Started</th>
+                                <th>Duration</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for call in recent_call_list[:5] %}
+                            <tr>
+                                <td><code style="font-size: 0.85rem;">{{ call.call_id[:12] }}</code></td>
+                                <td>{{ call.caller_number }}</td>
+                                <td>{{ call.started_at.strftime('%H:%M') }}</td>
+                                <td>
+                                    {% if call.duration_seconds %}
+                                        {{ call.duration_seconds // 60 }}m {{ call.duration_seconds % 60 }}s
+                                    {% else %}
+                                        -
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    <span class="badge bg-{{ 'success' if call.status == 'completed' else 'warning' if call.status == 'active' else 'secondary' }}">
+                                        {{ call.status }}
+                                    </span>
+                                </td>
+                                <td>
+                                    <a href="{{ url_for('admin.call_detail', call_id=call.id) }}"
+                                       class="btn btn-sm btn-outline-primary">
+                                        <i class="fas fa-eye"></i>
+                                    </a>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% else %}
+                <div class="text-center py-5">
+                    <i class="fas fa-phone-slash fa-3x text-muted mb-3"></i>
+                    <p class="text-muted">No calls recorded yet</p>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <!-- Right Column -->
+    <div class="col-md-4">
+        <!-- System Status with Live Updates -->
+        <div class="card mb-3">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <div>
+                    <i class="far fa-circle-dot"></i> System Status
+                </div>
+                <span class="badge bg-secondary" id="statusLastUpdate" style="font-size: 0.65rem;">
+                    <i class="fas fa-circle-notch fa-spin"></i> Loading...
+                </span>
+            </div>
+            <div class="card-body" id="systemStatusContainer">
+                <!-- Loading state -->
+                <div class="text-center py-4">
+                    <div class="spinner-border text-primary" role="status">
+                        <span class="visually-hidden">Loading...</span>
+                    </div>
+                    <p class="text-muted mt-2 mb-0" style="font-size: 0.8rem;">Checking system status...</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Active Calls (Live) -->
+        <div class="card mb-3">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <div>
+                    <i class="fas fa-phone-volume"></i> Active Calls
+                </div>
+                <span class="badge bg-success" id="activeCallCount">0</span>
+            </div>
+            <div class="card-body" id="activeCallsContainer">
+                <div class="text-center py-3">
+                    <i class="fas fa-phone-slash fa-2x text-muted mb-2"></i>
+                    <p class="text-muted mb-0" style="font-size: 0.8rem;">No active calls</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- AI Performance -->
+        <div class="card">
+            <div class="card-header">
+                <i class="fas fa-tasks"></i> AI Performance
+            </div>
+            <div class="card-body text-center">
+                <div style="position: relative; width: 200px; height: 200px; margin: 0 auto;">
+                    <svg viewBox="0 0 100 100">
+                        <circle cx="50" cy="50" r="40" fill="none" stroke="#f3f4f6" stroke-width="8"/>
+                        <circle cx="50" cy="50" r="40" fill="none" stroke="var(--primary-color)" stroke-width="8"
+                                stroke-dasharray="251.2" stroke-dashoffset="{{ 251.2 - (251.2 * ((total_calls - escalated_calls) / total_calls if total_calls > 0 else 0)) }}"
+                                transform="rotate(-90 50 50)" stroke-linecap="round"/>
+                    </svg>
+                    <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);">
+                        <div style="font-size: 2rem; font-weight: 700; color: var(--text-primary);">
+                            {{ ((total_calls - escalated_calls) / total_calls * 100)|round(0)|int if total_calls > 0 else 0 }}%
+                        </div>
+                        <div style="font-size: 0.75rem; color: var(--text-secondary);">Resolution Rate</div>
+                    </div>
+                </div>
+
+                <div class="mt-4 d-flex justify-content-around" style="font-size: 0.85rem;">
+                    <div>
+                        <div style="width: 12px; height: 12px; border-radius: 50%; background: var(--primary-color); display: inline-block; margin-right: 0.5rem;"></div>
+                        <span class="text-muted">Resolved</span>
+                    </div>
+                    <div>
+                        <div style="width: 12px; height: 12px; border-radius: 50%; background: #fbbf24; display: inline-block; margin-right: 0.5rem;"></div>
+                        <span class="text-muted">Escalated</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script>
+    // Call Analytics Chart with real data
+    const ctx = document.getElementById('callAnalyticsChart');
+    new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: {{ chart_labels|tojson }},
+            datasets: [{
+                label: 'Calls',
+                data: {{ chart_data|tojson }},
+                backgroundColor: 'rgba(26, 95, 78, 0.8)',
+                borderRadius: 8,
+                borderSkipped: false,
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            plugins: {
+                legend: {
+                    display: false
+                }
+            },
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    grid: {
+                        display: true,
+                        color: 'rgba(0, 0, 0, 0.05)'
+                    },
+                    ticks: {
+                        stepSize: 1
+                    }
+                },
+                x: {
+                    grid: {
+                        display: false
+                    }
+                }
+            }
+        }
+    });
+
+    // Live System Status Updates
+    function updateSystemStatus() {
+        fetch('/admin/api/system-status')
+            .then(response => response.json())
+            .then(data => {
+                const container = document.getElementById('systemStatusContainer');
+                const lastUpdate = document.getElementById('statusLastUpdate');
+
+                // Update last update time
+                const now = new Date();
+                lastUpdate.innerHTML = `<i class="fas fa-check-circle"></i> ${now.toLocaleTimeString()}`;
+                lastUpdate.className = `badge bg-${data.overall.health === 'healthy' ? 'success' : 'warning'}`;
+
+                // Build status HTML
+                let html = '';
+
+                for (const [key, service] of Object.entries(data.services)) {
+                    const statusColor = service.color;
+                    const statusText = service.status.replace('_', ' ').toUpperCase();
+
+                    html += `
+                        <div class="d-flex align-items-center justify-content-between mb-3 pb-3" style="border-bottom: 1px solid #f3f4f6;">
+                            <div class="d-flex align-items-center gap-2">
+                                <div style="width: 40px; height: 40px; border-radius: 10px; background: ${getServiceBgColor(statusColor)}; display: flex; align-items: center; justify-content: center;">
+                                    <i class="fas ${service.icon} text-${statusColor}"></i>
+                                </div>
+                                <div>
+                                    <div style="font-weight: 600; font-size: 0.9rem;">${service.name}</div>
+                                    <div style="font-size: 0.75rem; color: var(--text-secondary);">
+                                        ${service.details.provider || service.details.server || service.details.message || ''}
+                                    </div>
+                                </div>
+                            </div>
+                            <span class="badge bg-${statusColor}">${statusText}</span>
+                        </div>
+                    `;
+                }
+
+                // Remove last border
+                html = html.replace(/style="border-bottom: 1px solid #f3f4f6;">(?![\s\S]*style="border-bottom: 1px solid #f3f4f6;">)/, '>');
+
+                container.innerHTML = html;
+            })
+            .catch(error => {
+                console.error('Error fetching system status:', error);
+                const container = document.getElementById('systemStatusContainer');
+                container.innerHTML = `
+                    <div class="text-center py-3">
+                        <i class="fas fa-exclamation-triangle fa-2x text-warning mb-2"></i>
+                        <p class="text-muted mb-0" style="font-size: 0.8rem;">Unable to fetch status</p>
+                    </div>
+                `;
+            });
+    }
+
+    function getServiceBgColor(color) {
+        const colors = {
+            'success': '#d1fae5',
+            'warning': '#fef3c7',
+            'danger': '#fee2e2',
+            'info': '#dbeafe',
+            'secondary': '#f3f4f6'
+        };
+        return colors[color] || colors['secondary'];
+    }
+
+    // Update Active Calls
+    function updateActiveCalls() {
+        fetch('/admin/api/active-calls')
+            .then(response => response.json())
+            .then(data => {
+                const container = document.getElementById('activeCallsContainer');
+                const countBadge = document.getElementById('activeCallCount');
+
+                countBadge.textContent = data.count;
+
+                if (data.count === 0) {
+                    container.innerHTML = `
+                        <div class="text-center py-3">
+                            <i class="fas fa-phone-slash fa-2x text-muted mb-2"></i>
+                            <p class="text-muted mb-0" style="font-size: 0.8rem;">No active calls</p>
+                        </div>
+                    `;
+                } else {
+                    let html = '<div class="list-group list-group-flush">';
+
+                    data.active_calls.forEach(call => {
+                        const minutes = Math.floor(call.duration / 60);
+                        const seconds = call.duration % 60;
+
+                        html += `
+                            <div class="list-group-item px-0 py-2" style="border: none; border-bottom: 1px solid #f3f4f6;">
+                                <div class="d-flex justify-content-between align-items-center">
+                                    <div>
+                                        <div style="font-weight: 600; font-size: 0.85rem;">
+                                            <i class="fas fa-phone text-success"></i> ${call.caller_number}
+                                        </div>
+                                        <div style="font-size: 0.7rem; color: var(--text-secondary);">
+                                            ${call.interactions} interactions • ${minutes}m ${seconds}s
+                                        </div>
+                                    </div>
+                                    <span class="badge bg-success">
+                                        <i class="fas fa-circle-notch fa-spin"></i> Live
+                                    </span>
+                                </div>
+                            </div>
+                        `;
+                    });
+
+                    html += '</div>';
+                    container.innerHTML = html;
+                }
+            })
+            .catch(error => {
+                console.error('Error fetching active calls:', error);
+            });
+    }
+
+    // Initial load
+    updateSystemStatus();
+    updateActiveCalls();
+
+    // Refresh every 5 seconds
+    setInterval(updateSystemStatus, 5000);
+    setInterval(updateActiveCalls, 3000);
+</script>
+{% endblock %}

@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+
+{% block title %}Create Routing Rule - FreePBX AI Assistant{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1 class="page-title">Create Routing Rule</h1>
+    <p class="page-subtitle">Configure intent-based call routing</p>
+</div>
+
+<div class="row">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <i class="fas fa-route"></i> Rule Configuration
+            </div>
+            <div class="card-body">
+                <form method="POST">
+                    <div class="mb-4">
+                        <label for="department_id" class="form-label" style="font-weight: 600;">Department</label>
+                        <select class="form-select" id="department_id" name="department_id" required
+                                style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                            <option value="">Select Department</option>
+                            {% for dept in departments %}
+                            <option value="{{ dept.id }}">{{ dept.name }} (Ext {{ dept.extension }})</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    
+                    <div class="mb-4">
+                        <label for="intent_type" class="form-label" style="font-weight: 600;">Intent Type</label>
+                        <select class="form-select" id="intent_type" name="intent_type" required
+                                style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                            {% for intent in intent_types %}
+                            <option value="{{ intent }}">{{ intent|title }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    
+                    <div class="mb-4">
+                        <label for="keywords" class="form-label" style="font-weight: 600;">Keywords (JSON Array)</label>
+                        <input type="text" class="form-control" id="keywords" name="keywords" 
+                               value='[""]'
+                               style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                        <div class="form-text">Example: ["claim", "accident", "damage"]</div>
+                    </div>
+                    
+                    <div class="mb-4">
+                        <label for="priority" class="form-label" style="font-weight: 600;">Priority</label>
+                        <input type="number" class="form-control" id="priority" name="priority" 
+                               value="0" min="0" max="100"
+                               style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                        <div class="form-text">Higher priority rules are checked first (0-100)</div>
+                    </div>
+                    
+                    <div class="d-flex gap-2">
+                        <button type="submit" class="btn btn-primary">
+                            <i class="fas fa-save"></i> Create Rule
+                        </button>
+                        <a href="{{ url_for('admin.routing_rules') }}" class="btn btn-outline-secondary">
+                            <i class="fas fa-times"></i> Cancel
+                        </a>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-4">
+        <div class="card" style="background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%); border: none;">
+            <div class="card-body">
+                <h5 style="font-weight: 700; margin-bottom: 1rem; color: #1e40af;">
+                    <i class="fas fa-info-circle"></i> How Routing Works
+                </h5>
+                
+                <div style="font-size: 0.9rem; color: #1e40af; line-height: 1.8;">
+                    <p>When the AI detects an intent during a call, it checks routing rules to determine which department should handle the call.</p>
+                    <p><strong>Priority:</strong> Higher priority rules are checked first</p>
+                    <p><strong>Keywords:</strong> Optional keywords can further refine matching</p>
+                    <p style="margin-bottom: 0;"><strong>Escalation:</strong> Calls are automatically transferred to the matching department</p>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card mt-3">
+            <div class="card-header">
+                Intent Types
+            </div>
+            <div class="card-body" style="font-size: 0.85rem;">
+                <ul style="margin: 0; padding-left: 1.25rem; line-height: 1.8;">
+                    <li><strong>Sales:</strong> New customer inquiries</li>
+                    <li><strong>Support:</strong> Technical assistance</li>
+                    <li><strong>Claims:</strong> Insurance claims</li>
+                    <li><strong>Billing:</strong> Payment questions</li>
+                    <li><strong>Escalation:</strong> Request for human</li>
+                    <li><strong>General:</strong> Other inquiries</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

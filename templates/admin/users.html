@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+
+{% block title %}Users - FreePBX AI Assistant{% endblock %}
+
+{% block content %}
+<div class="page-header d-flex justify-content-between align-items-center">
+    <div>
+        <h1 class="page-title">User Management</h1>
+        <p class="page-subtitle">Manage user accounts and access permissions</p>
+    </div>
+    <a href="{{ url_for('auth.create_user') }}" class="btn btn-primary">
+        <i class="fas fa-plus"></i> Add User
+    </a>
+</div>
+
+{% if users %}
+<div class="row g-3">
+    {% for user in users %}
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-body">
+                <div class="d-flex align-items-start gap-3">
+                    <div style="width: 60px; height: 60px; border-radius: 14px; background: linear-gradient(135deg, var(--primary-color), var(--primary-light)); display: flex; align-items: center; justify-content: center; color: white; font-weight: 700; font-size: 1.5rem;">
+                        {{ user.username[0].upper() }}
+                    </div>
+                    
+                    <div style="flex: 1;">
+                        <div class="d-flex justify-content-between align-items-start mb-2">
+                            <div>
+                                <h5 style="font-weight: 700; margin-bottom: 0.25rem; color: var(--text-primary);">
+                                    {{ user.username }}
+                                </h5>
+                                {% if user.email %}
+                                <p style="color: var(--text-secondary); font-size: 0.85rem; margin: 0;">
+                                    {{ user.email }}
+                                </p>
+                                {% endif %}
+                            </div>
+                            {% if user.is_active %}
+                                <span class="badge bg-success">Active</span>
+                            {% else %}
+                                <span class="badge bg-secondary">Inactive</span>
+                            {% endif %}
+                        </div>
+                        
+                        <div class="d-flex gap-2 mb-3">
+                            <span class="badge" style="background: #dbeafe; color: #1e40af; text-transform: capitalize;">
+                                <i class="fas fa-shield-alt"></i> {{ user.role }}
+                            </span>
+                        </div>
+                        
+                        <div style="font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 1rem;">
+                            <div class="mb-1">
+                                <i class="fas fa-calendar-plus"></i> Created: {{ user.created_at.strftime('%Y-%m-%d') }}
+                            </div>
+                            {% if user.last_login %}
+                            <div>
+                                <i class="fas fa-clock"></i> Last login: {{ user.last_login.strftime('%Y-%m-%d %H:%M') }}
+                            </div>
+                            {% endif %}
+                        </div>
+                        
+                        <div class="d-flex gap-2">
+                            <a href="{{ url_for('auth.edit_user', user_id=user.id) }}" 
+                               class="btn btn-sm btn-outline-primary">
+                                <i class="fas fa-edit"></i> Edit
+                            </a>
+                            {% if user.id != current_user.id %}
+                            <form method="POST" action="{{ url_for('auth.delete_user', user_id=user.id) }}" 
+                                  class="d-inline" onsubmit="return confirm('Are you sure you want to delete this user?');">
+                                <button type="submit" class="btn btn-sm btn-outline-danger">
+                                    <i class="fas fa-trash"></i> Delete
+                                </button>
+                            </form>
+                            {% endif %}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<div class="card">
+    <div class="card-body text-center py-5">
+        <div style="width: 100px; height: 100px; background: linear-gradient(135deg, var(--primary-color), var(--primary-light)); border-radius: 24px; display: flex; align-items: center; justify-content: center; margin: 0 auto 1.5rem;">
+            <i class="fas fa-users fa-3x text-white"></i>
+        </div>
+        <h3 style="font-weight: 700; margin-bottom: 0.5rem;">No Users Yet</h3>
+        <p style="color: var(--text-secondary); margin-bottom: 1.5rem;">Create user accounts to manage access to the system</p>
+        <a href="{{ url_for('auth.create_user') }}" class="btn btn-primary">
+            <i class="fas fa-plus"></i> Add First User
+        </a>
+    </div>
+</div>
+{% endif %}
+{% endblock %}

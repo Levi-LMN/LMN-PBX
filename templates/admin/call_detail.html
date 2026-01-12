@@ -1,0 +1,201 @@
+{% extends "base.html" %}
+
+{% block title %}Call Details - {{ call.call_id }}{% endblock %}
+
+{% block content %}
+<div class="page-header d-flex justify-content-between align-items-center">
+    <div>
+        <h1 class="page-title">Call Details</h1>
+        <p class="page-subtitle">Complete conversation transcript and analytics</p>
+    </div>
+    <div class="d-flex gap-2">
+        <a href="{{ url_for('admin.call_transcript_json', call_id=call.id) }}"
+           class="btn btn-outline-primary" target="_blank">
+            <i class="fas fa-download"></i> Export JSON
+        </a>
+        <a href="{{ url_for('admin.call_logs') }}" class="btn btn-primary">
+            <i class="fas fa-arrow-left"></i> Back
+        </a>
+    </div>
+</div>
+
+<div class="row g-3 mb-3">
+    <!-- Call Information -->
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <i class="fas fa-info-circle"></i> Call Information
+            </div>
+            <div class="card-body">
+                <table class="table table-sm mb-0" style="font-size: 0.9rem;">
+                    <tr>
+                        <th width="40%" style="font-weight: 600; color: var(--text-secondary); border: none; padding: 0.75rem 0;">Call ID:</th>
+                        <td style="border: none; padding: 0.75rem 0;">
+                            <code style="padding: 0.35rem 0.65rem; background: #f3f4f6; border-radius: 6px; font-size: 0.8rem;">
+                                {{ call.call_id }}
+                            </code>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th style="font-weight: 600; color: var(--text-secondary); border-top: 1px solid #f3f4f6; padding: 0.75rem 0;">Caller Number:</th>
+                        <td style="border-top: 1px solid #f3f4f6; padding: 0.75rem 0; font-weight: 600;">{{ call.caller_number }}</td>
+                    </tr>
+                    <tr>
+                        <th style="font-weight: 600; color: var(--text-secondary); border-top: 1px solid #f3f4f6; padding: 0.75rem 0;">Status:</th>
+                        <td style="border-top: 1px solid #f3f4f6; padding: 0.75rem 0;">
+                            <span class="badge bg-{{ 'success' if call.status == 'completed' else 'warning' if call.status == 'active' else 'danger' }}">
+                                {{ call.status }}
+                            </span>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th style="font-weight: 600; color: var(--text-secondary); border-top: 1px solid #f3f4f6; padding: 0.75rem 0;">Started:</th>
+                        <td style="border-top: 1px solid #f3f4f6; padding: 0.75rem 0;">{{ call.started_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+                    </tr>
+                    <tr>
+                        <th style="font-weight: 600; color: var(--text-secondary); border-top: 1px solid #f3f4f6; padding: 0.75rem 0;">Duration:</th>
+                        <td style="border-top: 1px solid #f3f4f6; padding: 0.75rem 0;">
+                            {% if call.duration_seconds %}
+                                {{ call.duration_seconds // 60 }}m {{ call.duration_seconds % 60 }}s
+                            {% else %}
+                                -
+                            {% endif %}
+                        </td>
+                    </tr>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Call Metrics -->
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <i class="fas fa-chart-bar"></i> Call Metrics
+            </div>
+            <div class="card-body">
+                <table class="table table-sm mb-0" style="font-size: 0.9rem;">
+                    <tr>
+                        <th width="50%" style="font-weight: 600; color: var(--text-secondary); border: none; padding: 0.75rem 0;">Total Interactions:</th>
+                        <td style="border: none; padding: 0.75rem 0;">
+                            <span class="badge" style="background: #dbeafe; color: #1e40af; font-size: 0.85rem;">
+                                {{ call.total_interactions }}
+                            </span>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th style="font-weight: 600; color: var(--text-secondary); border-top: 1px solid #f3f4f6; padding: 0.75rem 0;">Failed Interactions:</th>
+                        <td style="border-top: 1px solid #f3f4f6; padding: 0.75rem 0;">
+                            <span class="badge" style="background: #fef3c7; color: #92400e; font-size: 0.85rem;">
+                                {{ call.failed_interactions }}
+                            </span>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th style="font-weight: 600; color: var(--text-secondary); border-top: 1px solid #f3f4f6; padding: 0.75rem 0;">Escalated:</th>
+                        <td style="border-top: 1px solid #f3f4f6; padding: 0.75rem 0;">
+                            {% if call.escalated %}
+                                <i class="fas fa-check-circle" style="color: #f59e0b;"></i>
+                                <span style="font-weight: 600; color: #f59e0b;">Yes</span>
+                            {% else %}
+                                <i class="fas fa-times-circle" style="color: #10b981;"></i>
+                                <span style="font-weight: 600; color: #10b981;">No</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% if call.escalated %}
+                    <tr>
+                        <th style="font-weight: 600; color: var(--text-secondary); border-top: 1px solid #f3f4f6; padding: 0.75rem 0;">Escalated To:</th>
+                        <td style="border-top: 1px solid #f3f4f6; padding: 0.75rem 0; font-weight: 600;">
+                            {% if call.escalated_to_department %}
+                                {{ call.escalated_to_department.name }} (Ext {{ call.escalated_to_department.extension }})
+                            {% else %}
+                                -
+                            {% endif %}
+                        </td>
+                    </tr>
+                    <tr>
+                        <th style="font-weight: 600; color: var(--text-secondary); border-top: 1px solid #f3f4f6; padding: 0.75rem 0;">Reason:</th>
+                        <td style="border-top: 1px solid #f3f4f6; padding: 0.75rem 0;">{{ call.escalation_reason or '-' }}</td>
+                    </tr>
+                    {% endif %}
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Detected Intents -->
+{% if intents %}
+<div class="card mb-3">
+    <div class="card-header">
+        <i class="fas fa-tags"></i> Detected Intents
+    </div>
+    <div class="card-body">
+        <div class="d-flex flex-wrap gap-2">
+            {% for intent in intents %}
+            <span class="badge" style="background: linear-gradient(135deg, var(--primary-color), var(--primary-light)); font-size: 0.85rem; padding: 0.5rem 1rem;">
+                {{ intent.intent_type }}
+                <small style="opacity: 0.8;">({{ (intent.confidence * 100)|round(0) }}%)</small>
+            </span>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+{% endif %}
+
+<!-- Conversation Transcript -->
+<div class="card">
+    <div class="card-header">
+        <i class="fas fa-comments"></i> Conversation Transcript
+    </div>
+    <div class="card-body" style="padding: 1.5rem;">
+        {% if transcripts %}
+            {% for transcript in transcripts %}
+            <div style="margin-bottom: 1.5rem; {% if transcript.speaker == 'caller' %}margin-left: 2rem;{% else %}margin-right: 2rem;{% endif %}">
+                <div style="background: {% if transcript.speaker == 'caller' %}linear-gradient(135deg, #e0f2fe 0%, #bae6fd 100%){% else %}linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%){% endif %}; padding: 1.25rem; border-radius: 16px; position: relative;">
+                    <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 0.75rem;">
+                        <div style="display: flex; align-items: center; gap: 0.75rem;">
+                            <div style="width: 36px; height: 36px; border-radius: 10px; background: {% if transcript.speaker == 'caller' %}#0284c7{% else %}#16a34a{% endif %}; display: flex; align-items: center; justify-content: center; color: white;">
+                                <i class="fas fa-{% if transcript.speaker == 'caller' %}user{% else %}robot{% endif %}"></i>
+                            </div>
+                            <strong style="font-size: 0.95rem; color: var(--text-primary);">
+                                {% if transcript.speaker == 'caller' %}Caller{% else %}AI Assistant{% endif %}
+                            </strong>
+                        </div>
+                        <small style="color: var(--text-secondary); font-size: 0.8rem;">
+                            {{ transcript.timestamp.strftime('%H:%M:%S') }}
+                            {% if transcript.confidence %}
+                                · {{ (transcript.confidence * 100)|round(1) }}% confidence
+                            {% endif %}
+                        </small>
+                    </div>
+                    <p style="margin: 0; line-height: 1.6; color: var(--text-primary);">{{ transcript.text }}</p>
+
+                    {% if transcript.speaker == 'assistant' and transcript.ai_model %}
+                    <div style="margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid rgba(0, 0, 0, 0.1);">
+                        <small style="color: var(--text-secondary); font-size: 0.75rem;">
+                            <i class="fas fa-microchip"></i> {{ transcript.ai_model }}
+                            {% if transcript.ai_tokens_used %}
+                                · {{ transcript.ai_tokens_used }} tokens
+                            {% endif %}
+                            {% if transcript.ai_response_time_ms %}
+                                · {{ transcript.ai_response_time_ms }}ms
+                            {% endif %}
+                        </small>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        {% else %}
+        <div class="text-center py-5">
+            <div style="width: 80px; height: 80px; background: #f3f4f6; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 1rem;">
+                <i class="fas fa-comment-slash fa-2x" style="color: var(--text-secondary);"></i>
+            </div>
+            <p style="color: var(--text-secondary); font-size: 1.1rem; font-weight: 500;">No transcript available</p>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

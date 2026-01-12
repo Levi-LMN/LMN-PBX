@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+
+{% block title %}Knowledge Base - FreePBX AI Assistant{% endblock %}
+
+{% block content %}
+<div class="page-header d-flex justify-content-between align-items-center">
+    <div>
+        <h1 class="page-title">Knowledge Base</h1>
+        <p class="page-subtitle">Manage information that powers your AI assistant</p>
+    </div>
+    <a href="{{ url_for('admin.create_knowledge') }}" class="btn btn-primary">
+        <i class="fas fa-plus"></i> Add Knowledge
+    </a>
+</div>
+
+<!-- Category Filter -->
+<div class="card mb-3" style="background: linear-gradient(135deg, #f8f9fa 0%, #ffffff 100%);">
+    <div class="card-body">
+        <form method="GET" action="{{ url_for('admin.knowledge_base') }}" class="row g-3 align-items-end">
+            <div class="col-md-4">
+                <label for="category" class="form-label" style="font-size: 0.85rem; font-weight: 600; color: var(--text-secondary);">Filter by Category</label>
+                <select class="form-select" id="category" name="category" onchange="this.form.submit()" style="border-radius: 10px; border: 2px solid #e5e7eb;">
+                    <option value="">All Categories</option>
+                    {% for cat in categories %}
+                    <option value="{{ cat }}" {% if category_filter == cat %}selected{% endif %}>
+                        {{ cat|title }}
+                    </option>
+                    {% endfor %}
+                </select>
+            </div>
+            {% if category_filter %}
+            <div class="col-md-2">
+                <a href="{{ url_for('admin.knowledge_base') }}" class="btn btn-outline-secondary w-100">
+                    <i class="fas fa-times"></i> Clear
+                </a>
+            </div>
+            {% endif %}
+        </form>
+    </div>
+</div>
+
+<!-- Knowledge Entries -->
+{% if entries %}
+<div class="row g-3">
+    {% for entry in entries %}
+    <div class="col-md-6">
+        <div class="card h-100" style="{% if not entry.is_active %}opacity: 0.6;{% endif %}">
+            <div class="card-body">
+                <div class="d-flex justify-content-between align-items-start mb-3">
+                    <div style="flex: 1;">
+                        <h5 style="font-weight: 700; margin-bottom: 0.75rem; color: var(--text-primary);">
+                            {{ entry.title }}
+                        </h5>
+                        <div class="d-flex gap-2 mb-2">
+                            <span class="badge" style="background: linear-gradient(135deg, var(--primary-color), var(--primary-light)); color: white;">
+                                {{ entry.category }}
+                            </span>
+                            <span class="badge" style="background: #dbeafe; color: #1e40af;">
+                                Priority: {{ entry.priority }}
+                            </span>
+                            {% if not entry.is_active %}
+                            <span class="badge bg-secondary">Inactive</span>
+                            {% endif %}
+                        </div>
+                    </div>
+                </div>
+
+                <p style="color: var(--text-secondary); font-size: 0.9rem; line-height: 1.6; margin-bottom: 1rem;">
+                    {{ entry.content[:200] }}{% if entry.content|length > 200 %}...{% endif %}
+                </p>
+
+                {% if entry.keywords %}
+                <div class="mb-3">
+                    <div style="font-size: 0.75rem; color: var(--text-secondary); margin-bottom: 0.5rem; font-weight: 600;">
+                        <i class="fas fa-tags"></i> Keywords
+                    </div>
+                    <div class="d-flex flex-wrap gap-2">
+                        {% set keywords = entry.keywords|from_json %}
+                        {% for keyword in keywords[:5] %}
+                        <span class="badge" style="background: #f3f4f6; color: var(--text-primary); font-weight: 500;">
+                            {{ keyword }}
+                        </span>
+                        {% endfor %}
+                    </div>
+                </div>
+                {% endif %}
+
+                <div class="d-flex justify-content-between align-items-center" style="padding-top: 1rem; border-top: 1px solid #f3f4f6;">
+                    <small style="color: var(--text-secondary); font-size: 0.8rem;">
+                        <i class="fas fa-eye"></i> Used {{ entry.usage_count }} times
+                        {% if entry.last_used %}
+                            · {{ entry.last_used.strftime('%b %d') }}
+                        {% endif %}
+                    </small>
+                    <div class="d-flex gap-2">
+                        <a href="{{ url_for('admin.edit_knowledge', entry_id=entry.id) }}"
+                           class="btn btn-sm btn-outline-primary">
+                            <i class="fas fa-edit"></i>
+                        </a>
+                        <form method="POST" action="{{ url_for('admin.delete_knowledge', entry_id=entry.id) }}"
+                              class="d-inline" onsubmit="return confirm('Are you sure you want to delete this entry?');">
+                            <button type="submit" class="btn btn-sm btn-outline-danger">
+                                <i class="fas fa-trash"></i>
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<div class="card">
+    <div class="card-body text-center py-5">
+        <div style="width: 100px; height: 100px; background: linear-gradient(135deg, var(--primary-color), var(--primary-light)); border-radius: 24px; display: flex; align-items: center; justify-content: center; margin: 0 auto 1.5rem;">
+            <i class="fas fa-book-open fa-3x text-white"></i>
+        </div>
+        <h3 style="font-weight: 700; margin-bottom: 0.5rem;">
+            {% if category_filter %}
+                No entries in "{{ category_filter }}"
+            {% else %}
+                No Knowledge Entries Yet
+            {% endif %}
+        </h3>
+        <p style="color: var(--text-secondary); margin-bottom: 1.5rem;">
+            {% if category_filter %}
+                Try selecting a different category
+            {% else %}
+                Start building your AI's knowledge base
+            {% endif %}
+        </p>
+        <a href="{{ url_for('admin.create_knowledge') }}" class="btn btn-primary">
+            <i class="fas fa-plus"></i> Add Knowledge Entry
+        </a>
+    </div>
+</div>
+{% endif %}
+{% endblock %}

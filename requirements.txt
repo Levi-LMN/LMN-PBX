@@ -1,0 +1,43 @@
+# Flask and Web Framework
+Flask==3.0.0
+Flask-SQLAlchemy==3.1.1
+Flask-Login==0.6.3
+
+# Database
+SQLAlchemy==2.0.23
+
+# Environment Management
+python-dotenv==1.0.0
+
+# Asterisk Integration (ARI)
+aioari==0.10.2
+aiohttp==3.9.5
+
+# SSH for file upload
+paramiko==3.4.0
+
+# Audio Processing
+pydub==0.25.1
+
+# Text-to-Speech (choose one or both)
+gTTS==2.5.1
+pyttsx3==2.90
+
+# Azure Services
+azure-cognitiveservices-speech==1.40.0
+openai==1.54.4
+
+# Microsoft Authentication (for Dataverse - optional)
+msal==1.31.0
+
+# HTTP Requests
+requests==2.32.3
+
+# Async Support (comes with Python 3.7+, but explicit for clarity)
+aiofiles==24.1.0
+
+# Optional: Better production server
+gunicorn==23.0.0
+
+# Optional: Better logging
+colorlog==6.9.0
