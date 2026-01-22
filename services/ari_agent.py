@@ -1,6 +1,6 @@
 # services/ari_agent.py
 """
-ARI-based agent service - FIXED Application Context Issues
+ARI-based agent service - FIXED with Proper Hangup Detection
 """
 
 import asyncio
@@ -30,9 +30,9 @@ class ARIAgent:
 
     def __init__(self, app_config, flask_app=None):
         self.config = app_config
-        self.flask_app = flask_app  # Store Flask app reference
+        self.flask_app = flask_app
         self.running = False
-        self.active_calls = set()
+        self.active_calls = {}  # Changed to dict to track by channel_id
         self.total_calls = 0
 
         # ARI Configuration
@@ -161,7 +161,10 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             )
             logger.info("✅ ARI connected")
 
+            # Register event handlers
             self.ari_client.on_event("StasisStart", self._handle_stasis_start)
+            self.ari_client.on_event("StasisEnd", self._handle_stasis_end)
+            self.ari_client.on_event("ChannelHangupRequest", self._handle_hangup_request)
 
             logger.info("=" * 60)
             logger.info("🎙️ SYSTEM READY - Waiting for calls")
@@ -180,7 +183,7 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
         logger.info("Stopping ARI agent...")
         self.running = False
 
-        for call in list(self.active_calls):
+        for call in list(self.active_calls.values()):
             try:
                 await call.hangup()
             except:
@@ -211,6 +214,24 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
     def _handle_stasis_start(self, event):
         asyncio.create_task(self._process_call(event))
 
+    def _handle_stasis_end(self, event):
+        """Handle when a channel leaves the Stasis application"""
+        channel_id = event.get("channel", {}).get("id")
+        if channel_id and channel_id in self.active_calls:
+            logger.info(f"📴 Channel {channel_id[:12]} left Stasis (user hung up)")
+            call = self.active_calls[channel_id]
+            call.user_hung_up = True
+            call.active = False
+
+    def _handle_hangup_request(self, event):
+        """Handle hangup request event"""
+        channel_id = event.get("channel", {}).get("id")
+        if channel_id and channel_id in self.active_calls:
+            logger.info(f"📴 Hangup requested for {channel_id[:12]}")
+            call = self.active_calls[channel_id]
+            call.user_hung_up = True
+            call.active = False
+
     async def _process_call(self, event):
         channel_id = event.get("channel", {}).get("id")
         if not channel_id:
@@ -227,10 +248,6 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
         channel_state = channel.json.get('state', 'Unknown')
         logger.info(f"📞 Incoming call from {caller_number} (State: {channel_state})")
 
-        # Debug channel info
-        logger.debug(f"Channel ID: {channel.id}")
-        logger.debug(f"Channel JSON: {channel.json}")
-
         call = CallInstance(
             channel=channel,
             ari_client=self.ari_client,
@@ -243,10 +260,10 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             ari_url=self.ari_url,
             ari_username=self.ari_username,
             ari_password=self.ari_password,
-            flask_app=self.flask_app  # Pass Flask app to call instance
+            flask_app=self.flask_app
         )
 
-        self.active_calls.add(call)
+        self.active_calls[channel.id] = call
         self.total_calls += 1
 
         self._log_call_start(call.id, caller_number)
@@ -260,7 +277,8 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             logger.error(f"Traceback: {traceback.format_exc()}")
             self._log_call_error(call.id, str(e))
         finally:
-            self.active_calls.discard(call)
+            if channel.id in self.active_calls:
+                del self.active_calls[channel.id]
             await call.cleanup()
             self._log_call_end(call)
 
@@ -311,7 +329,13 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
                 from models import db, Call
                 call = Call.query.filter_by(call_id=call_instance.id).first()
                 if call:
-                    call.status = 'completed'
+                    # Determine status based on how call ended
+                    if call_instance.user_hung_up:
+                        call.status = 'completed'
+                        logger.info(f"📴 User hung up - call completed normally")
+                    else:
+                        call.status = 'completed'
+
                     call.ended_at = datetime.utcnow()
                     if call.started_at:
                         call.duration_seconds = int((call.ended_at - call.started_at).total_seconds())
@@ -343,6 +367,7 @@ class CallInstance:
 
         self.id = channel.id
         self.active = True
+        self.user_hung_up = False  # NEW: Track if user hung up
         self.temp_files = []
         self.turn_count = 0
         self.conversation = [{"role": "system", "content": system_prompt}]
@@ -353,17 +378,13 @@ class CallInstance:
             channel_state = self.channel.json.get('state', 'Unknown')
             logger.info(f"Channel state before answer: {channel_state}")
 
-            # Only answer if the channel is ringing/ring
-            if channel_state.lower() not in ['ring', 'ringing', 'down']:
-                logger.warning(f"Channel state is {channel_state}, attempting to answer anyway")
-
             # Try to answer the call
             try:
                 await self.channel.answer()
                 logger.info("✅ Call answered successfully")
             except Exception as e:
                 logger.error(f"Failed to answer call: {e}")
-                # If we can't answer, check if it's already up
+                # Check if already up
                 try:
                     current_channel = await self.ari_client.channels.get(channelId=self.id)
                     current_state = current_channel.json.get('state', 'Unknown')
@@ -384,21 +405,35 @@ class CallInstance:
             time_greeting = 'Good morning' if hour < 12 else 'Good afternoon' if hour < 17 else 'Good evening'
             greeting = f"{time_greeting}, thank you for calling. How can I help you today?"
 
-            await self.speak(greeting)
+            if not await self.speak(greeting):
+                return
+
             self.conversation.append({"role": "assistant", "content": greeting})
 
             await asyncio.sleep(0.1)
+
+            if not await self.is_alive():
+                return
+
             await self.channel.play(media="sound:beep")
             await asyncio.sleep(0.15)
 
             no_speech_count = 0
             for turn in range(8):
-                if not await self.is_alive():
+                # Check if user hung up
+                if self.user_hung_up or not await self.is_alive():
+                    logger.info("🔚 Call ended by user")
                     break
 
                 self.turn_count += 1
 
                 audio_file = await self.record()
+
+                # Check again after recording
+                if self.user_hung_up or not await self.is_alive():
+                    logger.info("🔚 User hung up during recording")
+                    break
+
                 await self.channel.play(media="sound:beep")
                 await asyncio.sleep(0.1)
 
@@ -407,8 +442,15 @@ class CallInstance:
                     if no_speech_count >= 2:
                         await self.speak("I'm having trouble hearing you. Please try calling back.")
                         break
-                    await self.speak("I didn't catch that. Please go ahead.")
+
+                    if not await self.speak("I didn't catch that. Please go ahead."):
+                        break
+
                     await asyncio.sleep(0.1)
+
+                    if not await self.is_alive():
+                        break
+
                     await self.channel.play(media="sound:beep")
                     await asyncio.sleep(0.15)
                     continue
@@ -417,15 +459,19 @@ class CallInstance:
                 no_speech_count = 0
 
                 if not text or len(text) < 3:
-                    await self.speak("Could you repeat that please?")
+                    if not await self.speak("Could you repeat that please?"):
+                        break
+
                     await asyncio.sleep(0.1)
+
+                    if not await self.is_alive():
+                        break
+
                     await self.channel.play(media="sound:beep")
                     await asyncio.sleep(0.15)
                     continue
 
                 logger.info(f"👤 User: {text}")
-
-                # Log transcript to database
                 self._log_transcript('caller', text, confidence)
 
                 if len(text.split()) <= 5 and any(w in text.lower() for w in ["bye", "goodbye", "thanks", "done"]):
@@ -448,13 +494,16 @@ class CallInstance:
                     self.conversation.append({"role": "assistant", "content": ai_text})
                     logger.info(f"🤖 AI: {ai_text}")
 
-                    # Log AI response to database
                     self._log_transcript('assistant', ai_text, 1.0)
 
                     if not await self.speak(ai_text):
                         break
 
                     await asyncio.sleep(0.1)
+
+                    if not await self.is_alive():
+                        break
+
                     await self.channel.play(media="sound:beep")
                     await asyncio.sleep(0.15)
 
@@ -465,7 +514,8 @@ class CallInstance:
                     self._log_transcript('assistant', error_msg, 1.0)
                     break
 
-            if self.active:
+            # Only say goodbye if user didn't hang up and call is still active
+            if self.active and not self.user_hung_up and await self.is_alive():
                 final_msg = "Thank you for calling!"
                 await self.speak(final_msg)
                 self._log_transcript('assistant', final_msg, 1.0)
@@ -473,7 +523,11 @@ class CallInstance:
             await self.hangup()
 
         except Exception as e:
-            logger.error(f"Call processing error: {e}")
+            if "Not Found" in str(e):
+                logger.info("🔚 User hung up (channel not found)")
+                self.user_hung_up = True
+            else:
+                logger.error(f"Call processing error: {e}")
             await self.hangup()
 
     def _log_transcript(self, speaker, text, confidence):
@@ -485,13 +539,11 @@ class CallInstance:
             with self.flask_app.app_context():
                 from models import db, Call, CallTranscript
 
-                # Find the call record
                 call = Call.query.filter_by(call_id=self.id).first()
                 if not call:
                     logger.warning(f"Call {self.id} not found in database")
                     return
 
-                # Create transcript entry
                 transcript = CallTranscript(
                     call_id=call.id,
                     speaker=speaker,
@@ -506,16 +558,20 @@ class CallInstance:
             logger.error(f"Failed to log transcript: {e}")
 
     async def is_alive(self):
-        if not self.active:
+        """Check if channel is still active"""
+        if not self.active or self.user_hung_up:
             return False
         try:
             await self.ari_client.channels.get(channelId=self.id)
             return True
-        except:
+        except Exception as e:
+            if "Not Found" in str(e):
+                self.user_hung_up = True
             self.active = False
             return False
 
     async def speak(self, text):
+        """Speak text to user, return False if call ended"""
         if not await self.is_alive():
             return False
 
@@ -529,12 +585,16 @@ class CallInstance:
             await asyncio.sleep(estimated_duration + 0.3)
             return True
         except Exception as e:
-            if "404" not in str(e):
+            if "Not Found" in str(e):
+                self.user_hung_up = True
+                logger.info("🔚 User hung up during speech")
+            elif "404" not in str(e):
                 logger.error(f"Speak error: {e}")
             self.active = False
             return False
 
     async def record(self, duration=8, silence=2.0):
+        """Record audio from user"""
         if not await self.is_alive():
             return None
 
@@ -559,10 +619,15 @@ class CallInstance:
             await asyncio.sleep(0.2)
             return await self._download_recording(name)
         except Exception as e:
-            logger.error(f"Record error: {e}")
+            if "Not Found" in str(e):
+                self.user_hung_up = True
+                logger.info("🔚 User hung up during recording")
+            else:
+                logger.error(f"Record error: {e}")
             return None
 
     async def _download_recording(self, name):
+        """Download recorded audio file"""
         for attempt in range(3):
             try:
                 url = f"{self.ari_url}/recordings/stored/{name}/file"
@@ -585,14 +650,17 @@ class CallInstance:
         return None
 
     async def hangup(self):
+        """Hang up the call gracefully"""
         try:
-            if self.active:
+            if self.active and not self.user_hung_up:
                 await self.channel.hangup()
-        except:
-            pass
+        except Exception as e:
+            if "Not Found" not in str(e):
+                logger.debug(f"Hangup error: {e}")
         self.active = False
 
     async def cleanup(self):
+        """Clean up temporary files"""
         for file_path in self.temp_files:
             try:
                 os.unlink(file_path)
@@ -600,7 +668,7 @@ class CallInstance:
                 pass
 
 
-# Keep all the other classes unchanged (SoundCache, FileSystemAccess, AzureSpeechTranscriber)
+# Keep SoundCache, FileSystemAccess, and AzureSpeechTranscriber classes unchanged
 class SoundCache:
     """Cache for TTS audio"""
 
