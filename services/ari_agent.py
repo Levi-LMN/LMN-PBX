@@ -1,6 +1,6 @@
 # services/ari_agent.py
 """
-ARI-based agent service - FIXED OpenAI Client Initialization
+ARI-based agent service - FIXED with Proper Hangup Detection
 """
 
 import asyncio
@@ -32,7 +32,7 @@ class ARIAgent:
         self.config = app_config
         self.flask_app = flask_app
         self.running = False
-        self.active_calls = {}
+        self.active_calls = {}  # Changed to dict to track by channel_id
         self.total_calls = 0
 
         # ARI Configuration
@@ -69,15 +69,15 @@ class ARIAgent:
         # Initialize transcriber
         try:
             self.transcriber = AzureSpeechTranscriber(self.azure_speech_key, self.azure_speech_region)
-            logger.info("✅ Speech transcriber initialized")
+            logger.info("âœ… Speech transcriber initialized")
         except Exception as e:
-            logger.error(f"❌ Failed to initialize transcriber: {e}")
+            logger.error(f"âŒ Failed to initialize transcriber: {e}")
             self.transcriber = None
 
         # File system access
         self.file_access = FileSystemAccess(self.asterisk_sounds_dir)
 
-        # OpenAI client initialization - FIXED
+        # OpenAI client initialization
         self.ai_client = None
         if self.azure_openai_endpoint and self.azure_openai_key:
             try:
@@ -86,36 +86,19 @@ class ARIAgent:
                 logger.info(f"  Endpoint: {endpoint}")
                 logger.info(f"  Deployment: {self.azure_openai_deployment}")
 
-                # Try initialization with minimal parameters first
-                try:
-                    self.ai_client = AsyncAzureOpenAI(
-                        api_key=self.azure_openai_key,
-                        azure_endpoint=endpoint,
-                        api_version="2024-08-01-preview"
-                    )
-                    logger.info("✅ OpenAI client initialized (standard method)")
-                except TypeError as e:
-                    logger.warning(f"Standard initialization failed: {e}")
-                    logger.info("Trying alternative initialization method...")
-
-                    # Alternative: use keyword arguments that definitely exist
-                    self.ai_client = AsyncAzureOpenAI(
-                        api_key=self.azure_openai_key,
-                        azure_endpoint=endpoint,
-                        api_version="2024-08-01-preview",
-                        max_retries=3,
-                        timeout=60.0
-                    )
-                    logger.info("✅ OpenAI client initialized (alternative method)")
+                self.ai_client = AsyncAzureOpenAI(
+                    api_key=self.azure_openai_key,
+                    azure_endpoint=endpoint,
+                    api_version="2024-08-01-preview"
+                )
+                logger.info("âœ… OpenAI client object created")
 
             except Exception as e:
-                logger.error(f"❌ Failed to initialize OpenAI client: {e}")
+                logger.error(f"âŒ Failed to initialize OpenAI client: {e}")
                 logger.error(f"   Error type: {type(e).__name__}")
-                logger.error(f"   Please check your openai package version")
-                logger.error(f"   Try: pip install --upgrade openai")
                 self.ai_client = None
         else:
-            logger.warning("⚠️ Azure OpenAI not configured")
+            logger.warning("âš ï¸ Azure OpenAI not configured")
 
         # ARI client
         self.ari_client = None
@@ -138,16 +121,12 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
         self.running = True
 
         logger.info("=" * 60)
-        logger.info("🤖 ARI Agent Starting")
+        logger.info("ðŸ¤– ARI Agent Starting")
         logger.info("=" * 60)
 
         # Validate AI configuration
         if not self.ai_client:
-            logger.error("❌ Cannot start - Azure OpenAI client failed to initialize")
-            logger.error("   Please check:")
-            logger.error("   1. AZURE_OPENAI_KEY is set correctly")
-            logger.error("   2. AZURE_OPENAI_ENDPOINT is set correctly")
-            logger.error("   3. openai package is installed: pip install openai")
+            logger.error("âŒ Cannot start - Azure OpenAI client failed to initialize")
             return
 
         # Test AI connection
@@ -158,17 +137,16 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
                 messages=[{"role": "user", "content": "Hi"}],
                 max_tokens=5
             )
-            logger.info("✅ AI connection verified")
+            logger.info("âœ… AI connection verified")
         except Exception as e:
-            logger.error(f"❌ AI connection test failed: {e}")
-            logger.error(f"   Error details: {str(e)}")
+            logger.error(f"âŒ AI connection test failed: {e}")
             return
 
         # Test file system access
         if self.file_access.test_access():
-            logger.info("✅ File system access verified")
+            logger.info("âœ… File system access verified")
         else:
-            logger.warning("⚠️ Limited file system access")
+            logger.warning("âš ï¸ Limited file system access")
 
         # Pre-cache phrases
         await self._precache_phrases()
@@ -181,7 +159,7 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
                 self.ari_username,
                 self.ari_password
             )
-            logger.info("✅ ARI connected")
+            logger.info("âœ… ARI connected")
 
             # Register event handlers
             self.ari_client.on_event("StasisStart", self._handle_stasis_start)
@@ -189,7 +167,7 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             self.ari_client.on_event("ChannelHangupRequest", self._handle_hangup_request)
 
             logger.info("=" * 60)
-            logger.info("🎙️ SYSTEM READY - Waiting for calls")
+            logger.info("ðŸŽ™ï¸ SYSTEM READY - Waiting for calls")
             logger.info(f"   ARI App: {self.ari_app}")
             logger.info(f"   AI Model: {self.azure_openai_deployment}")
             logger.info("=" * 60)
@@ -197,7 +175,7 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             await self.ari_client.run(apps=self.ari_app)
 
         except Exception as e:
-            logger.error(f"❌ ARI connection error: {e}")
+            logger.error(f"âŒ ARI connection error: {e}")
             self.running = False
 
     async def stop(self):
@@ -240,7 +218,7 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
         """Handle when a channel leaves the Stasis application"""
         channel_id = event.get("channel", {}).get("id")
         if channel_id and channel_id in self.active_calls:
-            logger.info(f"🔴 Channel {channel_id[:12]} left Stasis (user hung up)")
+            logger.info(f"ðŸ“´ Channel {channel_id[:12]} left Stasis (user hung up)")
             call = self.active_calls[channel_id]
             call.user_hung_up = True
             call.active = False
@@ -249,7 +227,7 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
         """Handle hangup request event"""
         channel_id = event.get("channel", {}).get("id")
         if channel_id and channel_id in self.active_calls:
-            logger.info(f"🔴 Hangup requested for {channel_id[:12]}")
+            logger.info(f"ðŸ“´ Hangup requested for {channel_id[:12]}")
             call = self.active_calls[channel_id]
             call.user_hung_up = True
             call.active = False
@@ -263,12 +241,12 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             channel = await self.ari_client.channels.get(channelId=channel_id)
             await self._handle_call(channel)
         except Exception as e:
-            logger.error(f"❌ Call processing error: {e}")
+            logger.error(f"âŒ Call processing error: {e}")
 
     async def _handle_call(self, channel):
         caller_number = channel.json.get('caller', {}).get('number', 'Unknown')
         channel_state = channel.json.get('state', 'Unknown')
-        logger.info(f"📞 Incoming call from {caller_number} (State: {channel_state})")
+        logger.info(f"ðŸ“ž Incoming call from {caller_number} (State: {channel_state})")
 
         call = CallInstance(
             channel=channel,
@@ -293,7 +271,7 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
         try:
             await call.process()
         except Exception as e:
-            logger.error(f"❌ Call error: {e}")
+            logger.error(f"âŒ Call error: {e}")
             logger.error(f"Error type: {type(e).__name__}")
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
@@ -321,7 +299,7 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
                 )
                 db.session.add(call)
                 db.session.commit()
-                logger.info(f"✅ Call {call_id} logged to database")
+                logger.info(f"âœ… Call {call_id} logged to database")
         except Exception as e:
             logger.error(f"Failed to log call start: {e}")
 
@@ -351,9 +329,10 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
                 from models import db, Call
                 call = Call.query.filter_by(call_id=call_instance.id).first()
                 if call:
+                    # Determine status based on how call ended
                     if call_instance.user_hung_up:
                         call.status = 'completed'
-                        logger.info(f"🔴 User hung up - call completed normally")
+                        logger.info(f"ðŸ“´ User hung up - call completed normally")
                     else:
                         call.status = 'completed'
 
@@ -362,7 +341,7 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
                         call.duration_seconds = int((call.ended_at - call.started_at).total_seconds())
                     call.total_interactions = call_instance.turn_count
                     db.session.commit()
-                    logger.info(f"✅ Call {call_instance.id} completed - logged to database")
+                    logger.info(f"âœ… Call {call_instance.id} completed - logged to database")
         except Exception as e:
             logger.error(f"Failed to log call end: {e}")
 
@@ -388,21 +367,24 @@ class CallInstance:
 
         self.id = channel.id
         self.active = True
-        self.user_hung_up = False
+        self.user_hung_up = False  # NEW: Track if user hung up
         self.temp_files = []
         self.turn_count = 0
         self.conversation = [{"role": "system", "content": system_prompt}]
 
     async def process(self):
         try:
+            # Check if channel is in a state where we can answer
             channel_state = self.channel.json.get('state', 'Unknown')
             logger.info(f"Channel state before answer: {channel_state}")
 
+            # Try to answer the call
             try:
                 await self.channel.answer()
-                logger.info("✅ Call answered successfully")
+                logger.info("âœ… Call answered successfully")
             except Exception as e:
                 logger.error(f"Failed to answer call: {e}")
+                # Check if already up
                 try:
                     current_channel = await self.ari_client.channels.get(channelId=self.id)
                     current_state = current_channel.json.get('state', 'Unknown')
@@ -438,16 +420,18 @@ class CallInstance:
 
             no_speech_count = 0
             for turn in range(8):
+                # Check if user hung up
                 if self.user_hung_up or not await self.is_alive():
-                    logger.info("📕 Call ended by user")
+                    logger.info("ðŸ”š Call ended by user")
                     break
 
                 self.turn_count += 1
 
                 audio_file = await self.record()
 
+                # Check again after recording
                 if self.user_hung_up or not await self.is_alive():
-                    logger.info("📕 User hung up during recording")
+                    logger.info("ðŸ”š User hung up during recording")
                     break
 
                 await self.channel.play(media="sound:beep")
@@ -487,7 +471,7 @@ class CallInstance:
                     await asyncio.sleep(0.15)
                     continue
 
-                logger.info(f"👤 User: {text}")
+                logger.info(f"ðŸ‘¤ User: {text}")
                 self._log_transcript('caller', text, confidence)
 
                 if len(text.split()) <= 5 and any(w in text.lower() for w in ["bye", "goodbye", "thanks", "done"]):
@@ -508,7 +492,7 @@ class CallInstance:
 
                     ai_text = response.choices[0].message.content.strip()
                     self.conversation.append({"role": "assistant", "content": ai_text})
-                    logger.info(f"🤖 AI: {ai_text}")
+                    logger.info(f"ðŸ¤– AI: {ai_text}")
 
                     self._log_transcript('assistant', ai_text, 1.0)
 
@@ -530,6 +514,7 @@ class CallInstance:
                     self._log_transcript('assistant', error_msg, 1.0)
                     break
 
+            # Only say goodbye if user didn't hang up and call is still active
             if self.active and not self.user_hung_up and await self.is_alive():
                 final_msg = "Thank you for calling!"
                 await self.speak(final_msg)
@@ -539,7 +524,7 @@ class CallInstance:
 
         except Exception as e:
             if "Not Found" in str(e):
-                logger.info("📕 User hung up (channel not found)")
+                logger.info("ðŸ”š User hung up (channel not found)")
                 self.user_hung_up = True
             else:
                 logger.error(f"Call processing error: {e}")
@@ -602,7 +587,7 @@ class CallInstance:
         except Exception as e:
             if "Not Found" in str(e):
                 self.user_hung_up = True
-                logger.info("📕 User hung up during speech")
+                logger.info("ðŸ”š User hung up during speech")
             elif "404" not in str(e):
                 logger.error(f"Speak error: {e}")
             self.active = False
@@ -636,7 +621,7 @@ class CallInstance:
         except Exception as e:
             if "Not Found" in str(e):
                 self.user_hung_up = True
-                logger.info("📕 User hung up during recording")
+                logger.info("ðŸ”š User hung up during recording")
             else:
                 logger.error(f"Record error: {e}")
             return None
@@ -683,6 +668,7 @@ class CallInstance:
                 pass
 
 
+# Keep SoundCache, FileSystemAccess, and AzureSpeechTranscriber classes unchanged
 class SoundCache:
     """Cache for TTS audio"""
 
@@ -769,7 +755,6 @@ class SoundCache:
             return len(audio) / 1000.0
         except:
             return None
-
 
 
 class FileSystemAccess:
