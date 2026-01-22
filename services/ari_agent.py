@@ -1,6 +1,6 @@
 # services/ari_agent.py
 """
-ARI-based agent service - FIXED AI Client Initialization
+ARI-based agent service - FIXED Application Context Issues
 """
 
 import asyncio
@@ -20,7 +20,7 @@ from pydub.effects import normalize
 from openai import AsyncAzureOpenAI
 import azure.cognitiveservices.speech as speechsdk
 from datetime import datetime
-from models import db, Call, CallTranscript, CallIntent
+from flask import Flask
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +28,9 @@ logger = logging.getLogger(__name__)
 class ARIAgent:
     """ARI-based AI voice agent"""
 
-    def __init__(self, app_config):
+    def __init__(self, app_config, flask_app=None):
         self.config = app_config
+        self.flask_app = flask_app  # Store Flask app reference
         self.running = False
         self.active_calls = set()
         self.total_calls = 0
@@ -44,7 +45,7 @@ class ARIAgent:
         # File system
         self.asterisk_sounds_dir = '/var/lib/asterisk/sounds/custom'
 
-        # Azure configuration - FIXED: Get from environment directly
+        # Azure configuration
         self.azure_openai_endpoint = os.getenv('AZURE_OPENAI_ENDPOINT')
         self.azure_openai_key = os.getenv('AZURE_OPENAI_KEY')
         self.azure_openai_deployment = os.getenv('AZURE_OPENAI_DEPLOYMENT', 'gpt-4o-mini')
@@ -76,13 +77,11 @@ class ARIAgent:
         # File system access
         self.file_access = FileSystemAccess(self.asterisk_sounds_dir)
 
-        # OpenAI client initialization - FIXED
+        # OpenAI client initialization
         self.ai_client = None
         if self.azure_openai_endpoint and self.azure_openai_key:
             try:
-                # Clean endpoint
                 endpoint = self.azure_openai_endpoint.rstrip('/')
-
                 logger.info(f"Initializing Azure OpenAI client...")
                 logger.info(f"  Endpoint: {endpoint}")
                 logger.info(f"  Deployment: {self.azure_openai_deployment}")
@@ -94,21 +93,12 @@ class ARIAgent:
                 )
                 logger.info("✅ OpenAI client object created")
 
-            except TypeError as e:
-                logger.error(f"❌ TypeError initializing OpenAI client: {e}")
-                logger.error("   This usually means incompatible openai package version")
-                logger.error("   Try: pip install --upgrade openai")
-                self.ai_client = None
             except Exception as e:
                 logger.error(f"❌ Failed to initialize OpenAI client: {e}")
                 logger.error(f"   Error type: {type(e).__name__}")
                 self.ai_client = None
         else:
-            logger.warning("⚠️ Azure OpenAI not configured:")
-            if not self.azure_openai_endpoint:
-                logger.warning("   - AZURE_OPENAI_ENDPOINT is missing")
-            if not self.azure_openai_key:
-                logger.warning("   - AZURE_OPENAI_KEY is missing")
+            logger.warning("⚠️ Azure OpenAI not configured")
 
         # ARI client
         self.ari_client = None
@@ -137,10 +127,6 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
         # Validate AI configuration
         if not self.ai_client:
             logger.error("❌ Cannot start - Azure OpenAI client failed to initialize")
-            logger.error("   Check:")
-            logger.error("   1. AZURE_OPENAI_KEY is set in .env")
-            logger.error("   2. AZURE_OPENAI_ENDPOINT is set in .env")
-            logger.error("   3. openai package is installed: pip install openai")
             return
 
         # Test AI connection
@@ -154,12 +140,6 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             logger.info("✅ AI connection verified")
         except Exception as e:
             logger.error(f"❌ AI connection test failed: {e}")
-            logger.error(f"   Error type: {type(e).__name__}")
-            if "404" in str(e):
-                logger.error(f"   Deployment '{self.azure_openai_deployment}' not found")
-                logger.error("   Check AZURE_OPENAI_DEPLOYMENT matches your deployment name")
-            elif "401" in str(e) or "403" in str(e):
-                logger.error("   Authentication failed - check AZURE_OPENAI_KEY")
             return
 
         # Test file system access
@@ -257,7 +237,8 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             deployment=self.azure_openai_deployment,
             ari_url=self.ari_url,
             ari_username=self.ari_username,
-            ari_password=self.ari_password
+            ari_password=self.ari_password,
+            flask_app=self.flask_app  # Pass Flask app to call instance
         )
 
         self.active_calls.add(call)
@@ -276,9 +257,14 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             self._log_call_end(call)
 
     def _log_call_start(self, call_id, caller_number):
+        """Log call start to database with proper application context"""
+        if not self.flask_app:
+            logger.warning("Flask app not available - skipping database logging")
+            return
+
         try:
-            from flask import current_app
-            with current_app.app_context():
+            with self.flask_app.app_context():
+                from models import db, Call
                 call = Call(
                     call_id=call_id,
                     caller_number=caller_number,
@@ -287,13 +273,18 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
                 )
                 db.session.add(call)
                 db.session.commit()
+                logger.info(f"✅ Call {call_id} logged to database")
         except Exception as e:
             logger.error(f"Failed to log call start: {e}")
 
     def _log_call_error(self, call_id, error_msg):
+        """Log call error to database with proper application context"""
+        if not self.flask_app:
+            return
+
         try:
-            from flask import current_app
-            with current_app.app_context():
+            with self.flask_app.app_context():
+                from models import db, Call
                 call = Call.query.filter_by(call_id=call_id).first()
                 if call:
                     call.status = 'error'
@@ -303,9 +294,13 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             logger.error(f"Failed to log error: {e}")
 
     def _log_call_end(self, call_instance):
+        """Log call end to database with proper application context"""
+        if not self.flask_app:
+            return
+
         try:
-            from flask import current_app
-            with current_app.app_context():
+            with self.flask_app.app_context():
+                from models import db, Call
                 call = Call.query.filter_by(call_id=call_instance.id).first()
                 if call:
                     call.status = 'completed'
@@ -314,6 +309,7 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
                         call.duration_seconds = int((call.ended_at - call.started_at).total_seconds())
                     call.total_interactions = call_instance.turn_count
                     db.session.commit()
+                    logger.info(f"✅ Call {call_instance.id} completed - logged to database")
         except Exception as e:
             logger.error(f"Failed to log call end: {e}")
 
@@ -322,7 +318,8 @@ class CallInstance:
     """Represents a single call"""
 
     def __init__(self, channel, ari_client, ai_client, sound_cache, file_access,
-                 transcriber, system_prompt, deployment, ari_url, ari_username, ari_password):
+                 transcriber, system_prompt, deployment, ari_url, ari_username, ari_password,
+                 flask_app=None):
         self.channel = channel
         self.ari_client = ari_client
         self.ai_client = ai_client
@@ -334,6 +331,7 @@ class CallInstance:
         self.ari_url = ari_url
         self.ari_username = ari_username
         self.ari_password = ari_password
+        self.flask_app = flask_app
 
         self.id = channel.id
         self.active = True
@@ -391,8 +389,13 @@ class CallInstance:
 
                 logger.info(f"👤 User: {text}")
 
+                # Log transcript to database
+                self._log_transcript('caller', text, confidence)
+
                 if len(text.split()) <= 5 and any(w in text.lower() for w in ["bye", "goodbye", "thanks", "done"]):
-                    await self.speak("Thank you for calling!")
+                    goodbye = "Thank you for calling!"
+                    await self.speak(goodbye)
+                    self._log_transcript('assistant', goodbye, 1.0)
                     break
 
                 self.conversation.append({"role": "user", "content": text})
@@ -409,6 +412,9 @@ class CallInstance:
                     self.conversation.append({"role": "assistant", "content": ai_text})
                     logger.info(f"🤖 AI: {ai_text}")
 
+                    # Log AI response to database
+                    self._log_transcript('assistant', ai_text, 1.0)
+
                     if not await self.speak(ai_text):
                         break
 
@@ -418,17 +424,50 @@ class CallInstance:
 
                 except Exception as e:
                     logger.error(f"AI error: {e}")
-                    await self.speak("Technical issue. Let me connect you to someone.")
+                    error_msg = "Technical issue. Let me connect you to someone."
+                    await self.speak(error_msg)
+                    self._log_transcript('assistant', error_msg, 1.0)
                     break
 
             if self.active:
-                await self.speak("Thank you for calling!")
+                final_msg = "Thank you for calling!"
+                await self.speak(final_msg)
+                self._log_transcript('assistant', final_msg, 1.0)
 
             await self.hangup()
 
         except Exception as e:
             logger.error(f"Call processing error: {e}")
             await self.hangup()
+
+    def _log_transcript(self, speaker, text, confidence):
+        """Log transcript to database with proper application context"""
+        if not self.flask_app:
+            return
+
+        try:
+            with self.flask_app.app_context():
+                from models import db, Call, CallTranscript
+
+                # Find the call record
+                call = Call.query.filter_by(call_id=self.id).first()
+                if not call:
+                    logger.warning(f"Call {self.id} not found in database")
+                    return
+
+                # Create transcript entry
+                transcript = CallTranscript(
+                    call_id=call.id,
+                    speaker=speaker,
+                    text=text,
+                    confidence=confidence if isinstance(confidence, float) else 0.0,
+                    timestamp=datetime.utcnow()
+                )
+                db.session.add(transcript)
+                db.session.commit()
+
+        except Exception as e:
+            logger.error(f"Failed to log transcript: {e}")
 
     async def is_alive(self):
         if not self.active:
@@ -525,6 +564,7 @@ class CallInstance:
                 pass
 
 
+# Keep all the other classes unchanged (SoundCache, FileSystemAccess, AzureSpeechTranscriber)
 class SoundCache:
     """Cache for TTS audio"""
 

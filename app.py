@@ -1,6 +1,6 @@
 # app.py
 """
-Main application with integrated ARI agent
+Main application with integrated ARI agent - FIXED Application Context
 """
 
 import os
@@ -148,7 +148,7 @@ def create_app(config_name='default'):
 
 
 def start_ari_agent(app):
-    """Start the ARI agent in a background thread"""
+    """Start the ARI agent in a background thread - FIXED with Flask app reference"""
     global _ari_agent, _agent_thread
 
     logger.info("=" * 60)
@@ -156,8 +156,8 @@ def start_ari_agent(app):
     logger.info("=" * 60)
 
     try:
-        # Create agent with app config
-        _ari_agent = ARIAgent(app.config)
+        # Create agent with app config AND Flask app reference
+        _ari_agent = ARIAgent(app.config, flask_app=app)
 
         # Run agent in separate thread with its own event loop
         def run_agent():
