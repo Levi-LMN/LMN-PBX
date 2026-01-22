@@ -224,7 +224,12 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
 
     async def _handle_call(self, channel):
         caller_number = channel.json.get('caller', {}).get('number', 'Unknown')
-        logger.info(f"📞 Incoming call from {caller_number}")
+        channel_state = channel.json.get('state', 'Unknown')
+        logger.info(f"📞 Incoming call from {caller_number} (State: {channel_state})")
+
+        # Debug channel info
+        logger.debug(f"Channel ID: {channel.id}")
+        logger.debug(f"Channel JSON: {channel.json}")
 
         call = CallInstance(
             channel=channel,
@@ -250,6 +255,9 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             await call.process()
         except Exception as e:
             logger.error(f"❌ Call error: {e}")
+            logger.error(f"Error type: {type(e).__name__}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             self._log_call_error(call.id, str(e))
         finally:
             self.active_calls.discard(call)
@@ -341,7 +349,35 @@ class CallInstance:
 
     async def process(self):
         try:
-            await self.channel.answer()
+            # Check if channel is in a state where we can answer
+            channel_state = self.channel.json.get('state', 'Unknown')
+            logger.info(f"Channel state before answer: {channel_state}")
+
+            # Only answer if the channel is ringing/ring
+            if channel_state.lower() not in ['ring', 'ringing', 'down']:
+                logger.warning(f"Channel state is {channel_state}, attempting to answer anyway")
+
+            # Try to answer the call
+            try:
+                await self.channel.answer()
+                logger.info("✅ Call answered successfully")
+            except Exception as e:
+                logger.error(f"Failed to answer call: {e}")
+                # If we can't answer, check if it's already up
+                try:
+                    current_channel = await self.ari_client.channels.get(channelId=self.id)
+                    current_state = current_channel.json.get('state', 'Unknown')
+                    logger.info(f"Current channel state: {current_state}")
+
+                    if current_state.lower() != 'up':
+                        logger.error(f"Cannot proceed - channel state is {current_state}")
+                        raise
+                    else:
+                        logger.info("Channel is already up, continuing...")
+                except Exception as check_error:
+                    logger.error(f"Channel check failed: {check_error}")
+                    raise e
+
             await asyncio.sleep(0.2)
 
             hour = datetime.now().hour
