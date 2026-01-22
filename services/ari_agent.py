@@ -1,6 +1,9 @@
 # services/ari_agent.py
 """
-ARI-based agent service - FIXED with Proper Hangup Detection
+Enhanced ARI-based agent service with:
+- Actual call transfers to human agents
+- Knowledge base integration
+- Intent-based routing
 """
 
 import asyncio
@@ -26,13 +29,13 @@ logger = logging.getLogger(__name__)
 
 
 class ARIAgent:
-    """ARI-based AI voice agent"""
+    """ARI-based AI voice agent with call transfer and knowledge base"""
 
     def __init__(self, app_config, flask_app=None):
         self.config = app_config
         self.flask_app = flask_app
         self.running = False
-        self.active_calls = {}  # Changed to dict to track by channel_id
+        self.active_calls = {}
         self.total_calls = 0
 
         # ARI Configuration
@@ -52,10 +55,6 @@ class ARIAgent:
         self.azure_speech_key = os.getenv('AZURE_SPEECH_KEY')
         self.azure_speech_region = os.getenv('AZURE_SPEECH_REGION', 'eastus')
 
-        logger.info(f"Azure OpenAI Endpoint: {self.azure_openai_endpoint}")
-        logger.info(f"Azure OpenAI Key length: {len(self.azure_openai_key) if self.azure_openai_key else 0}")
-        logger.info(f"Azure OpenAI Deployment: {self.azure_openai_deployment}")
-
         # System prompt
         self.system_prompt = os.getenv('DEFAULT_SYSTEM_PROMPT') or self._default_prompt()
 
@@ -69,9 +68,9 @@ class ARIAgent:
         # Initialize transcriber
         try:
             self.transcriber = AzureSpeechTranscriber(self.azure_speech_key, self.azure_speech_region)
-            logger.info("âœ… Speech transcriber initialized")
+            logger.info("✅ Speech transcriber initialized")
         except Exception as e:
-            logger.error(f"âŒ Failed to initialize transcriber: {e}")
+            logger.error(f"❌ Failed to initialize transcriber: {e}")
             self.transcriber = None
 
         # File system access
@@ -82,23 +81,17 @@ class ARIAgent:
         if self.azure_openai_endpoint and self.azure_openai_key:
             try:
                 endpoint = self.azure_openai_endpoint.rstrip('/')
-                logger.info(f"Initializing Azure OpenAI client...")
-                logger.info(f"  Endpoint: {endpoint}")
-                logger.info(f"  Deployment: {self.azure_openai_deployment}")
-
                 self.ai_client = AsyncAzureOpenAI(
                     api_key=self.azure_openai_key,
                     azure_endpoint=endpoint,
                     api_version="2024-08-01-preview"
                 )
-                logger.info("âœ… OpenAI client object created")
-
+                logger.info("✅ OpenAI client object created")
             except Exception as e:
-                logger.error(f"âŒ Failed to initialize OpenAI client: {e}")
-                logger.error(f"   Error type: {type(e).__name__}")
+                logger.error(f"❌ Failed to initialize OpenAI client: {e}")
                 self.ai_client = None
         else:
-            logger.warning("âš ï¸ Azure OpenAI not configured")
+            logger.warning("⚠️ Azure OpenAI not configured")
 
         # ARI client
         self.ari_client = None
@@ -114,19 +107,18 @@ RULES:
 - Never say "I'm an AI" or mention being artificial
 - Use natural, conversational language
 
-When you cannot help or caller seems frustrated, politely recommend speaking with a specialist."""
+When you cannot help or caller requests a human, acknowledge their request and confirm you'll transfer them."""
 
     async def start(self):
         """Start the ARI agent"""
         self.running = True
 
         logger.info("=" * 60)
-        logger.info("ðŸ¤– ARI Agent Starting")
+        logger.info("🤖 ARI Agent Starting")
         logger.info("=" * 60)
 
-        # Validate AI configuration
         if not self.ai_client:
-            logger.error("âŒ Cannot start - Azure OpenAI client failed to initialize")
+            logger.error("❌ Cannot start - Azure OpenAI client failed to initialize")
             return
 
         # Test AI connection
@@ -137,16 +129,16 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
                 messages=[{"role": "user", "content": "Hi"}],
                 max_tokens=5
             )
-            logger.info("âœ… AI connection verified")
+            logger.info("✅ AI connection verified")
         except Exception as e:
-            logger.error(f"âŒ AI connection test failed: {e}")
+            logger.error(f"❌ AI connection test failed: {e}")
             return
 
         # Test file system access
         if self.file_access.test_access():
-            logger.info("âœ… File system access verified")
+            logger.info("✅ File system access verified")
         else:
-            logger.warning("âš ï¸ Limited file system access")
+            logger.warning("⚠️ Limited file system access")
 
         # Pre-cache phrases
         await self._precache_phrases()
@@ -159,7 +151,7 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
                 self.ari_username,
                 self.ari_password
             )
-            logger.info("âœ… ARI connected")
+            logger.info("✅ ARI connected")
 
             # Register event handlers
             self.ari_client.on_event("StasisStart", self._handle_stasis_start)
@@ -167,7 +159,7 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             self.ari_client.on_event("ChannelHangupRequest", self._handle_hangup_request)
 
             logger.info("=" * 60)
-            logger.info("ðŸŽ™ï¸ SYSTEM READY - Waiting for calls")
+            logger.info("🎙️ SYSTEM READY - Waiting for calls")
             logger.info(f"   ARI App: {self.ari_app}")
             logger.info(f"   AI Model: {self.azure_openai_deployment}")
             logger.info("=" * 60)
@@ -175,7 +167,7 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             await self.ari_client.run(apps=self.ari_app)
 
         except Exception as e:
-            logger.error(f"âŒ ARI connection error: {e}")
+            logger.error(f"❌ ARI connection error: {e}")
             self.running = False
 
     async def stop(self):
@@ -205,6 +197,7 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             "Good evening, thank you for calling. How can I help you today?",
             "Thank you for calling!",
             "Could you repeat that please?",
+            "Let me transfer you to a specialist who can help. Please hold.",
         ]
 
         logger.info("Caching common phrases...")
@@ -218,7 +211,7 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
         """Handle when a channel leaves the Stasis application"""
         channel_id = event.get("channel", {}).get("id")
         if channel_id and channel_id in self.active_calls:
-            logger.info(f"ðŸ“´ Channel {channel_id[:12]} left Stasis (user hung up)")
+            logger.info(f"📴 Channel {channel_id[:12]} left Stasis (user hung up)")
             call = self.active_calls[channel_id]
             call.user_hung_up = True
             call.active = False
@@ -227,7 +220,7 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
         """Handle hangup request event"""
         channel_id = event.get("channel", {}).get("id")
         if channel_id and channel_id in self.active_calls:
-            logger.info(f"ðŸ“´ Hangup requested for {channel_id[:12]}")
+            logger.info(f"📴 Hangup requested for {channel_id[:12]}")
             call = self.active_calls[channel_id]
             call.user_hung_up = True
             call.active = False
@@ -241,12 +234,12 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
             channel = await self.ari_client.channels.get(channelId=channel_id)
             await self._handle_call(channel)
         except Exception as e:
-            logger.error(f"âŒ Call processing error: {e}")
+            logger.error(f"❌ Call processing error: {e}")
 
     async def _handle_call(self, channel):
         caller_number = channel.json.get('caller', {}).get('number', 'Unknown')
         channel_state = channel.json.get('state', 'Unknown')
-        logger.info(f"ðŸ“ž Incoming call from {caller_number} (State: {channel_state})")
+        logger.info(f"📞 Incoming call from {caller_number} (State: {channel_state})")
 
         call = CallInstance(
             channel=channel,
@@ -271,10 +264,7 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
         try:
             await call.process()
         except Exception as e:
-            logger.error(f"âŒ Call error: {e}")
-            logger.error(f"Error type: {type(e).__name__}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.error(f"❌ Call error: {e}")
             self._log_call_error(call.id, str(e))
         finally:
             if channel.id in self.active_calls:
@@ -299,7 +289,7 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
                 )
                 db.session.add(call)
                 db.session.commit()
-                logger.info(f"âœ… Call {call_id} logged to database")
+                logger.info(f"✅ Call {call_id} logged to database")
         except Exception as e:
             logger.error(f"Failed to log call start: {e}")
 
@@ -329,10 +319,13 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
                 from models import db, Call
                 call = Call.query.filter_by(call_id=call_instance.id).first()
                 if call:
-                    # Determine status based on how call ended
-                    if call_instance.user_hung_up:
+                    if call_instance.escalated:
+                        call.status = 'escalated'
+                        call.escalated = True
+                        call.escalated_to_department_id = call_instance.escalated_to_dept_id
+                        call.escalation_reason = call_instance.escalation_reason
+                    elif call_instance.user_hung_up:
                         call.status = 'completed'
-                        logger.info(f"ðŸ“´ User hung up - call completed normally")
                     else:
                         call.status = 'completed'
 
@@ -341,13 +334,13 @@ When you cannot help or caller seems frustrated, politely recommend speaking wit
                         call.duration_seconds = int((call.ended_at - call.started_at).total_seconds())
                     call.total_interactions = call_instance.turn_count
                     db.session.commit()
-                    logger.info(f"âœ… Call {call_instance.id} completed - logged to database")
+                    logger.info(f"✅ Call {call_instance.id} completed - logged to database")
         except Exception as e:
             logger.error(f"Failed to log call end: {e}")
 
 
 class CallInstance:
-    """Represents a single call"""
+    """Represents a single call with knowledge base and transfer capability"""
 
     def __init__(self, channel, ari_client, ai_client, sound_cache, file_access,
                  transcriber, system_prompt, deployment, ari_url, ari_username, ari_password,
@@ -367,40 +360,194 @@ class CallInstance:
 
         self.id = channel.id
         self.active = True
-        self.user_hung_up = False  # NEW: Track if user hung up
+        self.user_hung_up = False
+        self.escalated = False
+        self.escalated_to_dept_id = None
+        self.escalation_reason = None
         self.temp_files = []
         self.turn_count = 0
         self.conversation = [{"role": "system", "content": system_prompt}]
 
+    def _get_knowledge_context(self, user_text):
+        """Get relevant knowledge base entries for the user's query"""
+        if not self.flask_app:
+            return ""
+
+        try:
+            with self.flask_app.app_context():
+                from models import KnowledgeBase
+
+                # Search for relevant knowledge entries
+                user_lower = user_text.lower()
+                all_entries = KnowledgeBase.query.filter_by(is_active=True).all()
+
+                scored_entries = []
+                for entry in all_entries:
+                    score = 0
+                    keywords = json.loads(entry.keywords) if entry.keywords else []
+
+                    # Score based on keyword matches
+                    for keyword in keywords:
+                        if keyword.lower() in user_lower:
+                            score += 2
+
+                    # Score based on title match
+                    if any(word in user_lower for word in entry.title.lower().split()):
+                        score += 1
+
+                    if score > 0:
+                        scored_entries.append((score, entry))
+
+                # Sort by score and take top 2
+                scored_entries.sort(reverse=True, key=lambda x: x[0])
+                top_entries = scored_entries[:2]
+
+                if not top_entries:
+                    return ""
+
+                # Format knowledge context
+                context_parts = ["\n\nRELEVANT COMPANY INFORMATION:"]
+                for _, entry in top_entries:
+                    context_parts.append(f"\n{entry.title}: {entry.content}")
+
+                    # Track usage
+                    entry.increment_usage()
+                    from models import db
+                    db.session.commit()
+
+                return "".join(context_parts)
+
+        except Exception as e:
+            logger.error(f"Error getting knowledge context: {e}")
+            return ""
+
+    def _detect_transfer_intent(self, user_text):
+        """Detect if user wants to speak with a human agent"""
+        transfer_keywords = [
+            'speak', 'talk', 'human', 'person', 'agent',
+            'representative', 'manager', 'supervisor', 'someone',
+            'transfer', 'escalate', 'real person'
+        ]
+
+        user_lower = user_text.lower()
+        return any(keyword in user_lower for keyword in transfer_keywords)
+
+    def _classify_intent(self, user_text):
+        """Simple intent classification based on keywords"""
+        user_lower = user_text.lower()
+
+        intent_keywords = {
+            'sales': ['buy', 'purchase', 'new policy', 'quote', 'coverage', 'insurance'],
+            'claims': ['claim', 'accident', 'damage', 'file', 'incident'],
+            'billing': ['bill', 'payment', 'pay', 'invoice', 'charge', 'cost'],
+            'support': ['help', 'question', 'how', 'what', 'when', 'status']
+        }
+
+        for intent_type, keywords in intent_keywords.items():
+            if any(keyword in user_lower for keyword in keywords):
+                return intent_type
+
+        return 'general'
+
+    def _get_department_for_intent(self, intent_type):
+        """Get the appropriate department based on intent"""
+        if not self.flask_app:
+            return None
+
+        try:
+            with self.flask_app.app_context():
+                from models import Department, RoutingRule
+
+                # Try to find a routing rule for this intent
+                rule = RoutingRule.query.filter_by(
+                    intent_type=intent_type,
+                    is_active=True
+                ).order_by(RoutingRule.priority.desc()).first()
+
+                if rule and rule.department:
+                    return rule.department
+
+                # Fallback: find department by name matching intent
+                dept_name_map = {
+                    'sales': 'Sales',
+                    'claims': 'Claims',
+                    'billing': 'Billing',
+                    'support': 'Support'
+                }
+
+                if intent_type in dept_name_map:
+                    dept = Department.query.filter_by(
+                        name=dept_name_map[intent_type],
+                        is_active=True
+                    ).first()
+                    if dept:
+                        return dept
+
+                # Ultimate fallback: highest priority department
+                return Department.query.filter_by(is_active=True).order_by(
+                    Department.priority.desc()
+                ).first()
+
+        except Exception as e:
+            logger.error(f"Error getting department: {e}")
+            return None
+
+    async def transfer_to_department(self, department):
+        """Actually transfer the call to a department extension"""
+        try:
+            logger.info(f"🔀 Transferring call to {department.name} (ext {department.extension})")
+
+            # Inform the caller
+            transfer_msg = f"Transferring you to {department.name} now. Please hold."
+            await self.speak(transfer_msg)
+            self._log_transcript('assistant', transfer_msg, 1.0)
+
+            await asyncio.sleep(0.5)
+
+            # Perform the transfer using ARI
+            # This continues the call to the specified extension in the dialplan
+            await self.channel.continueInDialplan(
+                context='from-internal',  # FreePBX default context
+                extension=department.extension,
+                priority=1
+            )
+
+            logger.info(f"✅ Call transferred to extension {department.extension}")
+            self.escalated = True
+            self.escalated_to_dept_id = department.id
+            self.escalation_reason = f"User requested transfer to {department.name}"
+
+            # Log the intent
+            self._log_intent('escalation', 1.0, f"Transferred to {department.name}")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Transfer failed: {e}")
+            await self.speak(
+                "I apologize, but I'm having trouble transferring your call. Please hold while I try again.")
+            return False
+
     async def process(self):
         try:
-            # Check if channel is in a state where we can answer
+            # Answer the call
             channel_state = self.channel.json.get('state', 'Unknown')
             logger.info(f"Channel state before answer: {channel_state}")
 
-            # Try to answer the call
             try:
                 await self.channel.answer()
-                logger.info("âœ… Call answered successfully")
+                logger.info("✅ Call answered successfully")
             except Exception as e:
                 logger.error(f"Failed to answer call: {e}")
-                # Check if already up
-                try:
-                    current_channel = await self.ari_client.channels.get(channelId=self.id)
-                    current_state = current_channel.json.get('state', 'Unknown')
-                    logger.info(f"Current channel state: {current_state}")
-
-                    if current_state.lower() != 'up':
-                        logger.error(f"Cannot proceed - channel state is {current_state}")
-                        raise
-                    else:
-                        logger.info("Channel is already up, continuing...")
-                except Exception as check_error:
-                    logger.error(f"Channel check failed: {check_error}")
-                    raise e
+                current_channel = await self.ari_client.channels.get(channelId=self.id)
+                current_state = current_channel.json.get('state', 'Unknown')
+                if current_state.lower() != 'up':
+                    raise
+                logger.info("Channel is already up, continuing...")
 
             await asyncio.sleep(0.2)
 
+            # Greeting
             hour = datetime.now().hour
             time_greeting = 'Good morning' if hour < 12 else 'Good afternoon' if hour < 17 else 'Good evening'
             greeting = f"{time_greeting}, thank you for calling. How can I help you today?"
@@ -409,7 +556,6 @@ class CallInstance:
                 return
 
             self.conversation.append({"role": "assistant", "content": greeting})
-
             await asyncio.sleep(0.1)
 
             if not await self.is_alive():
@@ -420,18 +566,16 @@ class CallInstance:
 
             no_speech_count = 0
             for turn in range(8):
-                # Check if user hung up
                 if self.user_hung_up or not await self.is_alive():
-                    logger.info("ðŸ”š Call ended by user")
+                    logger.info("📡 Call ended by user")
                     break
 
                 self.turn_count += 1
 
                 audio_file = await self.record()
 
-                # Check again after recording
                 if self.user_hung_up or not await self.is_alive():
-                    logger.info("ðŸ”š User hung up during recording")
+                    logger.info("📡 User hung up during recording")
                     break
 
                 await self.channel.play(media="sound:beep")
@@ -447,7 +591,6 @@ class CallInstance:
                         break
 
                     await asyncio.sleep(0.1)
-
                     if not await self.is_alive():
                         break
 
@@ -463,7 +606,6 @@ class CallInstance:
                         break
 
                     await asyncio.sleep(0.1)
-
                     if not await self.is_alive():
                         break
 
@@ -471,16 +613,57 @@ class CallInstance:
                     await asyncio.sleep(0.15)
                     continue
 
-                logger.info(f"ðŸ‘¤ User: {text}")
+                logger.info(f"👤 User: {text}")
                 self._log_transcript('caller', text, confidence)
 
+                # Check for goodbye
                 if len(text.split()) <= 5 and any(w in text.lower() for w in ["bye", "goodbye", "thanks", "done"]):
                     goodbye = "Thank you for calling!"
                     await self.speak(goodbye)
                     self._log_transcript('assistant', goodbye, 1.0)
                     break
 
-                self.conversation.append({"role": "user", "content": text})
+                # Check if user wants to be transferred
+                if self._detect_transfer_intent(text):
+                    logger.info("🔀 Transfer intent detected")
+
+                    # Classify the intent to determine department
+                    intent_type = self._classify_intent(text)
+                    logger.info(f"📊 Intent classified as: {intent_type}")
+                    self._log_intent(intent_type, 0.8, text)
+
+                    # Get the appropriate department
+                    department = self._get_department_for_intent(intent_type)
+
+                    if department:
+                        # Perform the transfer
+                        success = await self.transfer_to_department(department)
+                        if success:
+                            # Call will continue in dialplan, exit our loop
+                            return
+                        else:
+                            # Transfer failed, continue conversation
+                            error_msg = "I apologize for the difficulty. Let me try to help you another way. What can I assist you with?"
+                            await self.speak(error_msg)
+                            self._log_transcript('assistant', error_msg, 1.0)
+                            continue
+                    else:
+                        # No department found
+                        logger.warning("⚠️ No department found for transfer")
+                        fallback_msg = "I'd like to connect you with someone, but I'm having trouble right now. Can I help you with something else?"
+                        await self.speak(fallback_msg)
+                        self._log_transcript('assistant', fallback_msg, 1.0)
+                        continue
+
+                # Get knowledge base context for this query
+                knowledge_context = self._get_knowledge_context(text)
+
+                # Build AI message with knowledge
+                user_message_with_context = text
+                if knowledge_context:
+                    user_message_with_context = f"{text}{knowledge_context}"
+
+                self.conversation.append({"role": "user", "content": user_message_with_context})
 
                 try:
                     response = await self.ai_client.chat.completions.create(
@@ -491,8 +674,10 @@ class CallInstance:
                     )
 
                     ai_text = response.choices[0].message.content.strip()
+
+                    # Store only the response without knowledge context
                     self.conversation.append({"role": "assistant", "content": ai_text})
-                    logger.info(f"ðŸ¤– AI: {ai_text}")
+                    logger.info(f"🤖 AI: {ai_text}")
 
                     self._log_transcript('assistant', ai_text, 1.0)
 
@@ -500,7 +685,6 @@ class CallInstance:
                         break
 
                     await asyncio.sleep(0.1)
-
                     if not await self.is_alive():
                         break
 
@@ -512,10 +696,16 @@ class CallInstance:
                     error_msg = "Technical issue. Let me connect you to someone."
                     await self.speak(error_msg)
                     self._log_transcript('assistant', error_msg, 1.0)
+
+                    # Try to transfer to support
+                    dept = self._get_department_for_intent('support')
+                    if dept:
+                        await self.transfer_to_department(dept)
+                        return
                     break
 
-            # Only say goodbye if user didn't hang up and call is still active
-            if self.active and not self.user_hung_up and await self.is_alive():
+            # Only say goodbye if user didn't hang up and we're not transferring
+            if self.active and not self.user_hung_up and not self.escalated and await self.is_alive():
                 final_msg = "Thank you for calling!"
                 await self.speak(final_msg)
                 self._log_transcript('assistant', final_msg, 1.0)
@@ -524,7 +714,7 @@ class CallInstance:
 
         except Exception as e:
             if "Not Found" in str(e):
-                logger.info("ðŸ”š User hung up (channel not found)")
+                logger.info("📡 User hung up (channel not found)")
                 self.user_hung_up = True
             else:
                 logger.error(f"Call processing error: {e}")
@@ -541,7 +731,6 @@ class CallInstance:
 
                 call = Call.query.filter_by(call_id=self.id).first()
                 if not call:
-                    logger.warning(f"Call {self.id} not found in database")
                     return
 
                 transcript = CallTranscript(
@@ -556,6 +745,32 @@ class CallInstance:
 
         except Exception as e:
             logger.error(f"Failed to log transcript: {e}")
+
+    def _log_intent(self, intent_type, confidence, context):
+        """Log detected intent to database"""
+        if not self.flask_app:
+            return
+
+        try:
+            with self.flask_app.app_context():
+                from models import db, Call, CallIntent
+
+                call = Call.query.filter_by(call_id=self.id).first()
+                if not call:
+                    return
+
+                intent = CallIntent(
+                    call_id=call.id,
+                    intent_type=intent_type,
+                    confidence=confidence,
+                    context=context,
+                    detected_at=datetime.utcnow()
+                )
+                db.session.add(intent)
+                db.session.commit()
+
+        except Exception as e:
+            logger.error(f"Failed to log intent: {e}")
 
     async def is_alive(self):
         """Check if channel is still active"""
@@ -587,7 +802,7 @@ class CallInstance:
         except Exception as e:
             if "Not Found" in str(e):
                 self.user_hung_up = True
-                logger.info("ðŸ”š User hung up during speech")
+                logger.info("📡 User hung up during speech")
             elif "404" not in str(e):
                 logger.error(f"Speak error: {e}")
             self.active = False
@@ -621,7 +836,7 @@ class CallInstance:
         except Exception as e:
             if "Not Found" in str(e):
                 self.user_hung_up = True
-                logger.info("ðŸ”š User hung up during recording")
+                logger.info("📡 User hung up during recording")
             else:
                 logger.error(f"Record error: {e}")
             return None
@@ -652,7 +867,7 @@ class CallInstance:
     async def hangup(self):
         """Hang up the call gracefully"""
         try:
-            if self.active and not self.user_hung_up:
+            if self.active and not self.user_hung_up and not self.escalated:
                 await self.channel.hangup()
         except Exception as e:
             if "Not Found" not in str(e):
@@ -668,7 +883,6 @@ class CallInstance:
                 pass
 
 
-# Keep SoundCache, FileSystemAccess, and AzureSpeechTranscriber classes unchanged
 class SoundCache:
     """Cache for TTS audio"""
 
