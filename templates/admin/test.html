@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>APHF Africa – Sign In</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet"/>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --green-deep:   #0d3d20;
+    --green-mid:    #1a6b3c;
+    --green-bright: #2a8c52;
+    --green-light:  #3dab68;
+    --orange:       #e87c1a;
+    --orange-light: #f59332;
+    --white:        #ffffff;
+    --gray-bg:      #f3f7f4;
+    --gray-text:    #8da898;
+    --dark:         #0d2016;
+  }
+
+  body {
+    font-family: 'Outfit', sans-serif;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: radial-gradient(ellipse at 30% 50%, #2a8c52 0%, #0d3d20 60%, #061509 100%);
+    padding: 20px;
+  }
+
+  /* ═══════════════════════════════════════
+     CARD
+  ═══════════════════════════════════════ */
+  .card {
+    position: relative;
+    width: 860px;
+    height: 500px;
+    border-radius: 28px;
+    overflow: hidden;
+    background: var(--green-mid);
+    box-shadow:
+      0 2px 0 rgba(255,255,255,.1) inset,
+      0 40px 100px rgba(0,0,0,.5),
+      0 0 0 1px rgba(255,255,255,.06);
+    animation: floatIn .6s cubic-bezier(.16,1,.3,1) both;
+  }
+
+  @keyframes floatIn {
+    from { opacity:0; transform: scale(.96) translateY(24px); }
+    to   { opacity:1; transform: scale(1)  translateY(0); }
+  }
+
+  /* LEFT PANEL — z1 */
+  .left-panel {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    background: linear-gradient(145deg, #2a8c52 0%, #0d3d20 100%);
+  }
+  .left-panel::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+    opacity: .4;
+    pointer-events: none;
+  }
+
+  /* SPHERES — z5 & z15 */
+  .sphere-lg {
+    position: absolute;
+    width: 150px; height: 150px;
+    border-radius: 50%;
+    z-index: 15;
+    left: 200px; top: 300px;
+    background: radial-gradient(circle at 35% 28%, #3dab68 0%, #1a6b3c 35%, #0d3d20 65%, #061509 100%);
+    box-shadow: inset -12px -12px 28px rgba(0,0,0,.5), inset 4px 4px 12px rgba(80,200,120,.15), 8px 16px 40px rgba(0,0,0,.4), 0 0 0 1px rgba(255,255,255,.04);
+  }
+  .sphere-lg::before {
+    content: '';
+    position: absolute;
+    top:18%; left:20%; width:38%; height:25%;
+    border-radius: 50%;
+    background: radial-gradient(ellipse, rgba(255,255,255,.2) 0%, transparent 70%);
+    transform: rotate(-30deg);
+  }
+
+  .sphere-sm {
+    position: absolute;
+    width: 180px; height: 180px;
+    border-radius: 50%;
+    z-index: 15;
+    left: -45px; top: 360px;
+    background: radial-gradient(circle at 36% 30%, #3dab68 0%, #1a6b3c 40%, #0d3d20 72%, #061509 100%);
+    box-shadow: inset -7px -7px 18px rgba(0,0,0,.5), inset 3px 3px 8px rgba(80,200,120,.15), 5px 10px 24px rgba(0,0,0,.35), 0 0 0 1px rgba(255,255,255,.03);
+  }
+  .sphere-sm::before {
+    content: '';
+    position: absolute;
+    top:15%; left:18%; width:36%; height:22%;
+    border-radius: 50%;
+    background: radial-gradient(ellipse, rgba(255,255,255,.18) 0%, transparent 70%);
+    transform: rotate(-28deg);
+  }
+
+  /* WHITE RIGHT PANEL — z10 */
+  .right-panel {
+    position: absolute;
+    inset: 0;
+    z-index: 10;
+    background: var(--white);
+    clip-path: path('M 380,0 C 400,80 455,170 430,270 C 408,360 300,388 200,438 C 140,468 80,492 40,500 L 860,500 L 860,0 Z');
+  }
+
+  /* Corner accent */
+  .deco-br {
+    position: absolute;
+    width: 96px; height: 96px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #2a8c52, #0d3d20);
+    bottom: -28px; right: -28px;
+    z-index: 26;
+    box-shadow: -4px -4px 20px rgba(0,0,0,.25);
+  }
+
+  /* LEFT CONTENT — z20 */
+  .left-content {
+    position: absolute;
+    top: 0; left: 0;
+    width: 340px; height: 100%;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-start;
+    padding: 36px 40px 40px;
+    z-index: 20;
+    color: var(--white);
+  }
+
+  .badge { display: none; }
+  .logo-mark { display: none; }
+
+  .left-content .org-sub {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: rgba(255,255,255,.9);
+    margin-bottom: 6px;
+  }
+
+  .left-content .org-name {
+    font-size: 18px;
+    font-weight: 800;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--orange-light);
+    margin-bottom: 6px;
+    line-height: 1;
+  }
+
+  .left-content h1 {
+    font-size: 38px;
+    font-weight: 800;
+    line-height: 1.05;
+    letter-spacing: -.5px;
+    margin-bottom: 10px;
+    color: #fff;
+  }
+
+  .accent-line {
+    width: 36px; height: 3px;
+    background: linear-gradient(90deg, var(--orange), var(--orange-light));
+    border-radius: 2px;
+    margin-bottom: 14px;
+  }
+
+  .left-content p {
+    font-size: 13px;
+    line-height: 1.75;
+    color: rgba(255,255,255,.9);
+    font-weight: 500;
+    max-width: 230px;
+  }
+
+  /* RIGHT CONTENT — z30 */
+  .right-content {
+    position: absolute;
+    top: 0; right: 0;
+    width: 510px; height: 100%;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    padding: 44px 52px 44px 90px;
+    z-index: 30;
+  }
+
+  .right-content h2 {
+    font-size: 28px; font-weight: 800;
+    color: var(--dark); letter-spacing: -.4px;
+    margin-bottom: 3px;
+  }
+  .right-content .sub-text {
+    font-size: 12px; color: var(--gray-text);
+    margin-bottom: 22px; font-weight: 400;
+  }
+
+  .input-group {
+    position: relative;
+    margin-bottom: 12px;
+  }
+  .input-group input {
+    width: 100%;
+    background: var(--gray-bg);
+    border: 1.5px solid transparent;
+    border-radius: 12px;
+    padding: 12px 16px 12px 42px;
+    font-size: 13px;
+    font-family: 'Outfit', sans-serif;
+    font-weight: 400;
+    color: var(--dark);
+    transition: all .2s ease;
+  }
+  .input-group input::placeholder { color: var(--gray-text); }
+  .input-group input:focus {
+    outline: none;
+    border-color: var(--green-bright);
+    background: #fff;
+    box-shadow: 0 0 0 4px rgba(42,140,82,.1);
+  }
+
+  .input-icon {
+    position: absolute; left: 14px;
+    top: 50%; transform: translateY(-50%);
+    color: #b0c8b8; display: flex; align-items: center;
+  }
+
+  .show-btn {
+    position: absolute; right: 14px;
+    top: 50%; transform: translateY(-50%);
+    font-size: 10.5px; font-weight: 700; letter-spacing: .06em;
+    color: var(--green-bright); background: none; border: none;
+    cursor: pointer; font-family: 'Outfit', sans-serif; transition: color .15s;
+  }
+  .show-btn:hover { color: var(--green-deep); }
+
+  .row-options {
+    display: flex; align-items: center;
+    justify-content: space-between; margin-bottom: 18px;
+  }
+  .remember {
+    display: flex; align-items: center; gap: 7px;
+    font-size: 12px; color: #64748b;
+    cursor: pointer; user-select: none;
+  }
+  .remember input[type=checkbox] {
+    appearance: none; width: 15px; height: 15px;
+    border: 1.5px solid #c0d4c8; border-radius: 4px;
+    cursor: pointer; position: relative; transition: all .15s;
+  }
+  .remember input[type=checkbox]:checked {
+    background: var(--green-bright); border-color: var(--green-bright);
+  }
+  .remember input[type=checkbox]:checked::after {
+    content: ''; position: absolute;
+    left: 3px; top: 1px; width: 5px; height: 8px;
+    border: 2px solid #fff; border-top: none; border-left: none;
+    transform: rotate(40deg);
+  }
+
+  .forgot-link {
+    font-size: 12px; color: var(--green-bright);
+    text-decoration: none; font-weight: 500; transition: color .15s;
+  }
+  .forgot-link:hover { color: var(--green-deep); }
+
+  .btn-signin {
+    width: 100%; padding: 13px; border-radius: 12px;
+    background: linear-gradient(110deg, var(--green-bright) 0%, var(--green-deep) 100%);
+    color: #fff; font-family: 'Outfit', sans-serif;
+    font-weight: 700; font-size: 14px; border: none;
+    cursor: pointer; letter-spacing: .03em;
+    position: relative; overflow: hidden;
+    transition: transform .15s, box-shadow .15s;
+    box-shadow: 0 4px 20px rgba(42,140,82,.35);
+  }
+  .btn-signin::before {
+    content: ''; position: absolute; top: 0; left: -100%;
+    width: 60%; height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,.15), transparent);
+    transition: left .4s ease;
+  }
+  .btn-signin:hover { transform: translateY(-2px); box-shadow: 0 8px 28px rgba(42,140,82,.45); }
+  .btn-signin:hover::before { left: 160%; }
+  .btn-signin:active { transform: translateY(0); }
+
+  .divider {
+    display: flex; align-items: center; gap: 12px; margin: 10px 0;
+  }
+  .divider span { font-size: 11px; color: #c5d4cc; font-weight: 500; }
+  .divider-line { flex: 1; height: 1px; background: linear-gradient(90deg, transparent, #dde8e2, transparent); }
+
+  .btn-other {
+    width: 100%; padding: 11px; border-radius: 12px;
+    background: #fff; color: var(--dark);
+    font-family: 'Outfit', sans-serif; font-weight: 600;
+    font-size: 13px; border: 1.5px solid #dde8e2;
+    cursor: pointer; transition: all .15s;
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+  }
+  .btn-other:hover { background: #f3f9f5; border-color: #b5d4c0; box-shadow: 0 2px 12px rgba(42,140,82,.08); }
+
+  .signup-row {
+    text-align: center; margin-top: 12px;
+    font-size: 12px; color: var(--gray-text);
+  }
+  .signup-row a {
+    color: var(--orange); font-weight: 600;
+    text-decoration: none; margin-left: 4px; transition: color .15s;
+  }
+  .signup-row a:hover { color: var(--orange-light); }
+
+  /* ═══════════════════════════════════════
+     RESPONSIVE
+  ═══════════════════════════════════════ */
+  .mobile-brand { display: none; }
+
+  @media (max-width: 880px) {
+    .card {
+      width: 100%; max-width: 480px;
+      height: auto; border-radius: 24px;
+    }
+    .left-panel, .left-content, .sphere-lg, .sphere-sm, .deco-br { display: none; }
+    .right-panel { clip-path: none; position: relative; border-radius: 24px; }
+    .right-content {
+      position: relative; width: 100%;
+      padding: 44px 36px 40px;
+    }
+    .mobile-brand {
+      display: flex; align-items: center; gap: 12px; margin-bottom: 28px;
+    }
+    .mobile-brand .logo-wrap {
+      width: 46px; height: 46px; border-radius: 12px;
+      background: linear-gradient(135deg, var(--green-bright), var(--green-deep));
+      display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+    }
+    .mobile-brand .logo-initials {
+      font-size: 10px; font-weight: 800; color: #fff;
+      letter-spacing: .05em; text-align: center; line-height: 1.2;
+      font-family: 'Outfit', sans-serif;
+    }
+    .mobile-brand .brand-name {
+      font-size: 12px; font-weight: 800;
+      color: var(--green-deep); letter-spacing: .03em;
+      text-transform: uppercase; line-height: 1.2;
+    }
+    .mobile-brand .brand-sub {
+      font-size: 10px; font-weight: 600;
+      color: var(--orange); letter-spacing: .04em;
+      text-transform: uppercase; margin-top: 3px;
+    }
+  }
+
+  @media (max-width: 520px) {
+    body { padding: 12px; }
+    .right-content { padding: 38px 22px 34px; }
+    .right-content h2 { font-size: 24px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="card">
+
+  <div class="left-panel"></div>
+  <div class="sphere-lg"></div>
+  <div class="sphere-sm"></div>
+  <div class="right-panel"></div>
+  <div class="deco-br"></div>
+
+  <!-- LEFT CONTENT -->
+  <div class="left-content">
+    <span class="org-sub">Africa Public Health Foundation</span>
+    <span class="org-name">APHF</span>
+    <h1>Employee<br/>Self<br/>Service</h1>
+    <div class="accent-line"></div>
+    <p>Your central hub for HR, payroll, leave, and personal records. Sign in with your staff credentials to get started.</p>
+  </div>
+
+  <!-- RIGHT CONTENT -->
+  <div class="right-content">
+
+    <!-- Mobile brand header -->
+    <div class="mobile-brand">
+      <div class="logo-wrap">
+        <span class="logo-initials">AP<br/>HF</span>
+      </div>
+      <div>
+        <div class="brand-name">Africa Public Health Foundation</div>
+        <div class="brand-sub">Employee Self Service Portal</div>
+      </div>
+    </div>
+
+    <h2>Sign in</h2>
+    <p class="sub-text">Sign in with your staff credentials</p>
+
+    <div class="input-group">
+      <span class="input-icon">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+          <circle cx="12" cy="8" r="4"/>
+          <path d="M4 20c0-4 3.58-7 8-7s8 3 8 7"/>
+        </svg>
+      </span>
+      <input type="text" placeholder="Email / Username"/>
+    </div>
+
+    <div class="input-group">
+      <span class="input-icon">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+          <rect x="3" y="11" width="18" height="11" rx="2.5"/>
+          <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+        </svg>
+      </span>
+      <input id="pwd" type="password" placeholder="Password"/>
+      <button class="show-btn" onclick="togglePwd()">SHOW</button>
+    </div>
+
+    <div class="row-options">
+      <label class="remember">
+        <input type="checkbox" checked/> Remember me
+      </label>
+      <a href="#" class="forgot-link">Forgot Password?</a>
+    </div>
+
+    <button class="btn-signin">Sign in</button>
+
+    <div class="divider">
+      <div class="divider-line"></div>
+      <span>Or</span>
+      <div class="divider-line"></div>
+    </div>
+
+    <button class="btn-other">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#64748b" stroke-width="1.8" stroke-linecap="round">
+        <circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/>
+      </svg>
+      Sign in with SSO
+    </button>
+
+    <div class="signup-row">
+      Need access? <a href="#">Contact HR</a>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  function togglePwd() {
+    const inp = document.getElementById('pwd');
+    const btn = inp.nextElementSibling;
+    if (inp.type === 'password') { inp.type = 'text'; btn.textContent = 'HIDE'; }
+    else { inp.type = 'password'; btn.textContent = 'SHOW'; }
+  }
+</script>
+</body>
+</html>
