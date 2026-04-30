@@ -63,7 +63,11 @@ class ARIAgent:
         self.cache_dir.mkdir(exist_ok=True)
         self.cache_index_file = self.cache_dir / "cache_index.json"
 
-        self.sound_cache = SoundCache(self.cache_dir, self.cache_index_file, self.asterisk_sounds_dir)
+        self.sound_cache = SoundCache(
+            self.cache_dir, self.cache_index_file, self.asterisk_sounds_dir,
+            azure_speech_key=self.azure_speech_key,
+            azure_speech_region=self.azure_speech_region
+        )
 
         # Initialize transcriber
         try:
@@ -101,17 +105,15 @@ class ARIAgent:
     def _default_prompt(self):
         return """You are a professional phone assistant for Jubilee Insurance.
 
-STRICT RULES:
-- Maximum 20 words per response. Do NOT exceed this. Ever.
-- Be direct and helpful. No filler phrases like "Thank you for your inquiry!"
-- Never say "I'm an AI" or mention being artificial
-- Use natural, conversational language
-- If you don't know something specific, say so in one short sentence and offer to transfer
+RULES:
+- STRICT LIMIT: Respond in 20 words or fewer. This is a phone call — be brief.
+- Never exceed 2 short sentences.
+- Be helpful, professional, and empathetic.
+- Never say "I'm an AI" or mention being artificial.
+- Use natural, conversational language.
+- If you need more information, ask only one question.
 
-Examples of good responses:
-- "Yes, Jubilee Insurance offers education policies. Would you like details or to speak with sales?"
-- "I can transfer you to our claims team. Shall I do that now?"
-- "I don't have that information. Want me to connect you with a specialist?"""
+When you cannot help or the caller requests a human, say you will transfer them now."""
 
     async def start(self):
         """Start the ARI agent"""
@@ -554,7 +556,7 @@ class CallInstance:
             # Greeting
             hour = datetime.now().hour
             time_greeting = 'Good morning' if hour < 12 else 'Good afternoon' if hour < 17 else 'Good evening'
-            greeting = f"{time_greeting}, thank you for calling. How can I help you today?"
+            greeting = f"{time_greeting}, thank you for calling Jubilee Insurance. How can I help you today?"
 
             if not await self.speak(greeting):
                 return
@@ -812,8 +814,8 @@ class CallInstance:
             self.active = False
             return False
 
-    async def record(self, duration=7, silence=1.5):
-        """Record audio from user - polls for early completion via silence detection"""
+    async def record(self, duration=8, silence=2.0):
+        """Record audio from user"""
         if not await self.is_alive():
             return None
 
@@ -828,27 +830,7 @@ class CallInstance:
                 terminateOn="none"
             )
 
-            # Poll every 0.5s instead of sleeping the full duration.
-            # ARI stops recording when silence threshold is reached,
-            # so we check if the recording has finished early.
-            poll_interval = 0.5
-            max_wait = duration + 1.0
-            elapsed = 0.0
-            while elapsed < max_wait:
-                await asyncio.sleep(poll_interval)
-                elapsed += poll_interval
-                try:
-                    # If the recording is complete, ARI will have it in stored recordings
-                    check_url = f"{self.ari_url}/recordings/stored/{name}"
-                    check = requests.get(
-                        check_url,
-                        auth=(self.ari_username, self.ari_password),
-                        timeout=2
-                    )
-                    if check.status_code == 200:
-                        break  # Recording is available, silence was detected
-                except Exception:
-                    pass
+            await asyncio.sleep(duration + 0.5)
 
             try:
                 await recording.stop()
@@ -910,10 +892,13 @@ class CallInstance:
 class SoundCache:
     """Cache for TTS audio"""
 
-    def __init__(self, cache_dir, index_file, asterisk_sounds_dir):
+    def __init__(self, cache_dir, index_file, asterisk_sounds_dir,
+                 azure_speech_key=None, azure_speech_region='eastus'):
         self.cache_dir = cache_dir
         self.index_file = index_file
         self.asterisk_sounds_dir = asterisk_sounds_dir
+        self.azure_speech_key = azure_speech_key
+        self.azure_speech_region = azure_speech_region
         self.index = self._load_index()
 
     def _load_index(self):
@@ -960,28 +945,58 @@ class SoundCache:
             if output_file.exists():
                 return str(output_file)
 
+            # Use Azure Speech TTS (faster, no external HTTP round-trip, same region as STT)
             try:
-                from gtts import gTTS
-                temp_file = self.cache_dir / f"{key}_temp.mp3"
-                await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    lambda: gTTS(text=text, lang='en', slow=False).save(str(temp_file))
+                import azure.cognitiveservices.speech as speechsdk
+
+                speech_config = speechsdk.SpeechConfig(
+                    subscription=self.azure_speech_key,
+                    region=self.azure_speech_region
+                )
+                speech_config.speech_synthesis_voice_name = "en-US-AriaNeural"
+                speech_config.set_speech_synthesis_output_format(
+                    speechsdk.SpeechSynthesisOutputFormat.Riff8Khz16BitMonoPcm
                 )
 
-                audio = AudioSegment.from_file(str(temp_file))
-                audio = normalize(audio).set_frame_rate(8000).set_channels(1).set_sample_width(2)
-                audio.export(str(output_file), format="wav")
+                audio_config = speechsdk.audio.AudioOutputConfig(filename=str(output_file))
+                synthesizer = speechsdk.SpeechSynthesizer(
+                    speech_config=speech_config,
+                    audio_config=audio_config
+                )
 
-                try:
-                    temp_file.unlink()
-                except:
-                    pass
+                result = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: synthesizer.speak_text_async(text).get()
+                )
 
-                return str(output_file)
+                if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                    logger.debug(f"Azure TTS generated: {text[:40]}...")
+                    return str(output_file)
+                else:
+                    logger.error(f"Azure TTS failed: {result.reason}")
+                    # Fall through to gTTS fallback
 
             except Exception as e:
-                logger.error(f"TTS generation failed: {e}")
-                return None
+                logger.warning(f"Azure TTS error, falling back to gTTS: {e}")
+
+            # Fallback: gTTS
+            from gtts import gTTS
+            temp_file = self.cache_dir / f"{key}_temp.mp3"
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: gTTS(text=text, lang='en', slow=False).save(str(temp_file))
+            )
+
+            audio = AudioSegment.from_file(str(temp_file))
+            audio = normalize(audio).set_frame_rate(8000).set_channels(1).set_sample_width(2)
+            audio.export(str(output_file), format="wav")
+
+            try:
+                temp_file.unlink()
+            except:
+                pass
+
+            return str(output_file)
 
         except Exception as e:
             logger.error(f"TTS error: {e}")
