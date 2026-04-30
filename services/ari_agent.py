@@ -99,15 +99,19 @@ class ARIAgent:
         logger.info("ARI Agent initialized")
 
     def _default_prompt(self):
-        return """You are a professional phone assistant for an insurance company.
+        return """You are a professional phone assistant for Jubilee Insurance.
 
-RULES:
-- Keep responses between 15-35 words for phone conversations
-- Be helpful, professional, and empathetic
+STRICT RULES:
+- Maximum 20 words per response. Do NOT exceed this. Ever.
+- Be direct and helpful. No filler phrases like "Thank you for your inquiry!"
 - Never say "I'm an AI" or mention being artificial
 - Use natural, conversational language
+- If you don't know something specific, say so in one short sentence and offer to transfer
 
-When you cannot help or caller requests a human, acknowledge their request and confirm you'll transfer them."""
+Examples of good responses:
+- "Yes, Jubilee Insurance offers education policies. Would you like details or to speak with sales?"
+- "I can transfer you to our claims team. Shall I do that now?"
+- "I don't have that information. Want me to connect you with a specialist?"""
 
     async def start(self):
         """Start the ARI agent"""
@@ -669,8 +673,8 @@ class CallInstance:
                     response = await self.ai_client.chat.completions.create(
                         model=self.deployment,
                         messages=self.conversation,
-                        max_tokens=200,
-                        temperature=0.9
+                        max_tokens=60,
+                        temperature=0.5
                     )
 
                     ai_text = response.choices[0].message.content.strip()
@@ -808,8 +812,8 @@ class CallInstance:
             self.active = False
             return False
 
-    async def record(self, duration=8, silence=2.0):
-        """Record audio from user"""
+    async def record(self, duration=7, silence=1.5):
+        """Record audio from user - polls for early completion via silence detection"""
         if not await self.is_alive():
             return None
 
@@ -824,7 +828,27 @@ class CallInstance:
                 terminateOn="none"
             )
 
-            await asyncio.sleep(duration + 0.5)
+            # Poll every 0.5s instead of sleeping the full duration.
+            # ARI stops recording when silence threshold is reached,
+            # so we check if the recording has finished early.
+            poll_interval = 0.5
+            max_wait = duration + 1.0
+            elapsed = 0.0
+            while elapsed < max_wait:
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+                try:
+                    # If the recording is complete, ARI will have it in stored recordings
+                    check_url = f"{self.ari_url}/recordings/stored/{name}"
+                    check = requests.get(
+                        check_url,
+                        auth=(self.ari_username, self.ari_password),
+                        timeout=2
+                    )
+                    if check.status_code == 200:
+                        break  # Recording is available, silence was detected
+                except Exception:
+                    pass
 
             try:
                 await recording.stop()
