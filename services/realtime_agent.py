@@ -308,7 +308,7 @@ class RealtimeSession:
                     "type": "realtime",
                     "model": self.deployment,
                     "instructions": self.system_prompt,
-                    "output_modalities": ["audio", "text"],
+                    "output_modalities": ["audio"],
                     "audio": {
                         "input": {
                             # GA requires format as an object, not a bare string.
@@ -342,7 +342,7 @@ class RealtimeSession:
             config = {
                 "type": "session.update",
                 "session": {
-                    "modalities": ["audio", "text"],
+                    "modalities": ["audio"],
                     "instructions": self.system_prompt,
                     "voice": "alloy",   # alloy, echo, fable, onyx, nova, shimmer
                     "input_audio_format": "pcm16",
