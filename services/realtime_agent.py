@@ -250,8 +250,7 @@ class RealtimeSession:
                 "output_modalities": ["audio", "text"],
                 "audio": {
                     "input": {
-                        # GA requires format as an object, not a bare string.
-                        "format": {"type": "audio/pcm", "rate": REALTIME_RATE},
+                        "format": "pcm16",
                         "transcription": {
                             # whisper-1 is deprecated for Realtime in GA;
                             # gpt-4o-mini-transcribe is the supported model.
@@ -266,7 +265,7 @@ class RealtimeSession:
                         }
                     },
                     "output": {
-                        "format": {"type": "audio/pcm", "rate": REALTIME_RATE},
+                        "format": "pcm16",
                         "voice": "alloy",   # Azure supported voices: alloy, echo, fable, onyx, nova, shimmer
                     }
                 },
