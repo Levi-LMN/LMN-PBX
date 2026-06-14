@@ -191,10 +191,15 @@ class RealtimeSession:
         # We always use the GA path; api_version is kept for the header only.
         base = endpoint.rstrip('/').replace('https://', 'wss://')
         self.uri = f"{base}/openai/v1/realtime?model={deployment}"
+        self.deployment = deployment
         self.api_version = api_version
         self.headers = {
             "api-key": api_key,
-            "OpenAI-Beta": "realtime=v1",   # required by some Azure resource versions
+            # NOTE: Do NOT send "OpenAI-Beta: realtime=v1" on the GA
+            # /openai/v1/realtime endpoint — Azure's GA Realtime API
+            # rejects the handshake with HTTP 400 if this header is
+            # present. It was only required for the old preview path
+            # (/openai/realtime?api-version=...).
         }
         self.system_prompt = system_prompt
         self.ws: websockets.WebSocketClientProtocol | None = None
@@ -216,26 +221,38 @@ class RealtimeSession:
         logger.info("✅ Realtime WebSocket connected")
 
     async def configure(self):
-        """Send session.update to configure voice, VAD, and instructions."""
+        """Send session.update to configure voice, VAD, and instructions (GA schema)."""
         config = {
             "type": "session.update",
             "session": {
-                "modalities": ["audio", "text"],
+                # GA requires an explicit session "type". For speech-to-speech
+                # this must be "realtime" (the other option is "transcription").
+                "type": "realtime",
+                "model": self.deployment,
                 "instructions": self.system_prompt,
-                "voice": "alloy",          # Azure supported voices: alloy, echo, fable, onyx, nova, shimmer
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": "whisper-1"   # enables transcript events
+                "output_modalities": ["audio", "text"],
+                "audio": {
+                    "input": {
+                        "format": "pcm16",
+                        "transcription": {
+                            # whisper-1 is deprecated for Realtime in GA;
+                            # gpt-4o-mini-transcribe is the supported model.
+                            "model": "gpt-4o-mini-transcribe"
+                        },
+                        "turn_detection": {
+                            "type": "server_vad",          # server-side VAD – no need to manage silence timers
+                            "threshold": 0.5,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 600,    # 600 ms silence = end of user turn
+                            "create_response": True        # auto-respond after each turn
+                        }
+                    },
+                    "output": {
+                        "format": "pcm16",
+                        "voice": "alloy",   # Azure supported voices: alloy, echo, fable, onyx, nova, shimmer
+                    }
                 },
-                "turn_detection": {
-                    "type": "server_vad",          # server-side VAD – no need to manage silence timers
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 600,    # 600 ms silence = end of user turn
-                    "create_response": True         # auto-respond after each turn
-                },
-                "max_response_output_tokens": 150  # keep responses brief for phone calls
+                "max_output_tokens": 150  # keep responses brief for phone calls
             }
         }
         await self._send(config)
@@ -280,18 +297,18 @@ class RealtimeSession:
             elif etype == "session.updated":
                 logger.debug("Session updated")
 
-            elif etype == "response.audio.delta":
+            elif etype in ("response.audio.delta", "response.output_audio.delta"):
                 # Streaming audio chunk back from the model
                 delta_b64 = event.get("delta", "")
                 if delta_b64:
                     pcm = base64.b64decode(delta_b64)
                     await on_audio(pcm)
 
-            elif etype == "response.audio_transcript.delta":
+            elif etype in ("response.audio_transcript.delta", "response.output_audio_transcript.delta"):
                 # Streaming text transcript of the AI's speech
                 pass  # we log on .done
 
-            elif etype == "response.audio_transcript.done":
+            elif etype in ("response.audio_transcript.done", "response.output_audio_transcript.done"):
                 text = event.get("transcript", "").strip()
                 if text:
                     logger.info(f"🤖 AI: {text}")
