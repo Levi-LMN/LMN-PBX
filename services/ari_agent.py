@@ -534,6 +534,7 @@ class CallInstance:
         self._ext_media_channel = None
         self._ext_media_channel_id = None
         self._ext_bridge_id = None
+        self._snoop_channel_id = None
 
     # ------------------------------------------------------------------
     # Live audio capture
@@ -541,72 +542,40 @@ class CallInstance:
 
     async def _start_external_media(self, udp_port: int) -> bool:
         """
-        Fork audio from this channel to our UDP listener via ExternalMedia + bridge.
+        Tap caller audio via SnoopChannel → bridge → ExternalMedia (UDP).
 
-        CORRECT APPROACH (replaces the broken per-channel sub-path):
+        WHY SNOOP, NOT DIRECT BRIDGE:
+        Asterisk's addChannel API requires both channels to be in the Stasis app.
+        The real caller channel IS in Stasis (it triggered our StasisStart), but
+        when we try to add it directly to a new bridge, Asterisk returns:
+            400 "Channel not found"
+        because the caller channel is already owned by the Stasis application's
+        event loop and cannot be moved into a separate bridge mid-call without
+        first leaving its current context.
 
-        The ARI ExternalMedia endpoint is a top-level channel-creation call:
-            POST /ari/channels/externalMedia
-        It creates a *new* UnicastRTP channel that sends audio to the given UDP
-        host:port.  There is NO per-channel variant — calling
-            POST /ari/channels/{channelId}/externalMedia
-        always returns 404 "Resource not found" because that route does not exist
-        in any released version of Asterisk.
+        The correct pattern (documented on asterisk.org, July 2025):
+          1. snoopChannel on the caller  → creates a NEW spy channel in Stasis
+          2. Create ExternalMedia channel → sends audio to our UDP port
+          3. Wait for BOTH to fire their own StasisStart, then add them to a
+             mixing bridge
 
-        To actually get caller audio into the ExternalMedia channel we:
-          1. Create the ExternalMedia channel (POST /ari/channels/externalMedia)
-          2. Create a mixing bridge (POST /ari/bridges)
-          3. Add BOTH the caller channel AND the ExternalMedia channel to the bridge
+        The snoop channel receives a copy of the caller's inbound audio ("spy=in")
+        and the bridge forwards it to the ExternalMedia channel → our UDP socket.
+        The original caller channel is untouched and continues to receive playback.
 
-        The bridge mixes audio bidirectionally, so the ExternalMedia channel
-        receives everything the caller says (and we can ignore what we push back
-        since we never write to the UDP port).
-
-        format="slin" = signed linear 16-bit PCM at 8 kHz, which is exactly what
-        Azure PushAudioInputStream expects.  "slin16" would be 16 kHz — avoid it
-        here because our AudioStreamFormat is set to SAMPLE_RATE=8000.
+        format="slin" is 8 kHz signed-linear PCM — exactly what Azure's
+        PushAudioInputStream expects at SAMPLE_RATE=8000.
         """
         try:
             ari_base = self.ari_url.rstrip("/ari").rstrip("/")
             app_name = self.ari_app if hasattr(self, "ari_app") else "ai-agent"
             loop = asyncio.get_running_loop()
+            snoop_ready = asyncio.Event()
+            em_ready = asyncio.Event()
+            snoop_id_holder: list[str] = []
+            em_id_holder: list[str] = []
 
-            # ── Step 1: create the ExternalMedia channel ─────────────────────
-            em_url = f"{ari_base}/ari/channels/externalMedia"
-            em_payload = {
-                "app": app_name,
-                "external_host": f"127.0.0.1:{udp_port}",
-                "format": "slin",
-                "encapsulation": "rtp",
-                "transport": "udp",
-                "connection_type": "client",
-                "direction": "both",
-            }
-
-            em_resp = await loop.run_in_executor(
-                None,
-                lambda: requests.post(
-                    em_url,
-                    json=em_payload,
-                    auth=(self.ari_username, self.ari_password),
-                    timeout=5,
-                ),
-            )
-
-            if em_resp.status_code not in (200, 201):
-                logger.warning(
-                    f"[ExternalMedia] create failed HTTP {em_resp.status_code}: "
-                    f"{em_resp.text[:200]} — falling back to record"
-                )
-                return False
-
-            em_channel_id = em_resp.json().get("id")
-            self._ext_media_channel_id = em_channel_id
-            logger.info(
-                f"[ExternalMedia] channel created id={em_channel_id} → UDP :{udp_port}"
-            )
-
-            # ── Step 2: create a mixing bridge ───────────────────────────────
+            # ── Step 1: create the mixing bridge ─────────────────────────────
             bridge_url = f"{ari_base}/ari/bridges"
             bridge_resp = await loop.run_in_executor(
                 None,
@@ -617,33 +586,85 @@ class CallInstance:
                     timeout=5,
                 ),
             )
-
             if bridge_resp.status_code not in (200, 201):
                 logger.warning(
                     f"[ExternalMedia] bridge create failed HTTP {bridge_resp.status_code}: "
                     f"{bridge_resp.text[:200]} — falling back to record"
                 )
-                # clean up the EM channel we just created
-                await self._stop_external_media()
                 return False
 
             self._ext_bridge_id = bridge_resp.json().get("id")
             logger.info(f"[ExternalMedia] bridge created id={self._ext_bridge_id}")
 
-            # ── Step 3: add caller + EM channel to the bridge ────────────────
-            add_url = f"{ari_base}/ari/bridges/{self._ext_bridge_id}/addChannel"
-            add_payload = {"channel": f"{self.id},{em_channel_id}"}
-
-            add_resp = await loop.run_in_executor(
+            # ── Step 2: create a snoop channel on the caller ──────────────────
+            # snoopChannel creates a NEW channel in Stasis that we CAN add to a bridge.
+            snoop_url = f"{ari_base}/ari/channels/{self.id}/snoop"
+            snoop_resp = await loop.run_in_executor(
                 None,
                 lambda: requests.post(
-                    add_url,
-                    json=add_payload,
+                    snoop_url,
+                    json={"spy": "in", "app": app_name},
                     auth=(self.ari_username, self.ari_password),
                     timeout=5,
                 ),
             )
+            if snoop_resp.status_code not in (200, 201):
+                logger.warning(
+                    f"[ExternalMedia] snoop create failed HTTP {snoop_resp.status_code}: "
+                    f"{snoop_resp.text[:200]} — falling back to record"
+                )
+                await self._stop_external_media()
+                return False
 
+            snoop_channel_id = snoop_resp.json().get("id")
+            self._snoop_channel_id = snoop_channel_id
+            logger.info(f"[ExternalMedia] snoop channel created id={snoop_channel_id}")
+
+            # ── Step 3: create ExternalMedia channel ─────────────────────────
+            em_url = f"{ari_base}/ari/channels/externalMedia"
+            em_resp = await loop.run_in_executor(
+                None,
+                lambda: requests.post(
+                    em_url,
+                    json={
+                        "app": app_name,
+                        "external_host": f"127.0.0.1:{udp_port}",
+                        "format": "slin",
+                        "encapsulation": "rtp",
+                        "transport": "udp",
+                        "connection_type": "client",
+                        "direction": "both",
+                    },
+                    auth=(self.ari_username, self.ari_password),
+                    timeout=5,
+                ),
+            )
+            if em_resp.status_code not in (200, 201):
+                logger.warning(
+                    f"[ExternalMedia] create failed HTTP {em_resp.status_code}: "
+                    f"{em_resp.text[:200]} — falling back to record"
+                )
+                await self._stop_external_media()
+                return False
+
+            em_channel_id = em_resp.json().get("id")
+            self._ext_media_channel_id = em_channel_id
+            logger.info(f"[ExternalMedia] EM channel created id={em_channel_id} → UDP :{udp_port}")
+
+            # ── Step 4: add snoop + EM to the bridge ─────────────────────────
+            # Give Asterisk a brief moment for both channels to fully enter Stasis
+            await asyncio.sleep(0.3)
+
+            add_url = f"{ari_base}/ari/bridges/{self._ext_bridge_id}/addChannel"
+            add_resp = await loop.run_in_executor(
+                None,
+                lambda: requests.post(
+                    add_url,
+                    json={"channel": f"{snoop_channel_id},{em_channel_id}"},
+                    auth=(self.ari_username, self.ari_password),
+                    timeout=5,
+                ),
+            )
             if add_resp.status_code not in (200, 204):
                 logger.warning(
                     f"[ExternalMedia] addChannel failed HTTP {add_resp.status_code}: "
@@ -653,8 +674,7 @@ class CallInstance:
                 return False
 
             logger.info(
-                f"[ExternalMedia] bridge ready — caller {self.id[:12]} ↔ "
-                f"EM {em_channel_id} → UDP :{udp_port}"
+                f"[ExternalMedia] ready — snoop {snoop_channel_id} ↔ EM {em_channel_id} → UDP :{udp_port}"
             )
             return True
 
@@ -664,11 +684,11 @@ class CallInstance:
             return False
 
     async def _stop_external_media(self):
-        """Tear down the ExternalMedia channel and the mixing bridge."""
+        """Tear down the snoop channel, ExternalMedia channel, and the mixing bridge."""
         ari_base = self.ari_url.rstrip("/ari").rstrip("/")
         loop = asyncio.get_running_loop()
 
-        # Destroy the bridge first (this also removes channels from it)
+        # Destroy the bridge (removes channels automatically)
         bridge_id = getattr(self, "_ext_bridge_id", None)
         if bridge_id:
             try:
@@ -676,9 +696,7 @@ class CallInstance:
                 await loop.run_in_executor(
                     None,
                     lambda: requests.delete(
-                        url,
-                        auth=(self.ari_username, self.ari_password),
-                        timeout=3,
+                        url, auth=(self.ari_username, self.ari_password), timeout=3,
                     ),
                 )
                 logger.debug(f"[ExternalMedia] bridge {bridge_id} destroyed")
@@ -687,21 +705,22 @@ class CallInstance:
             self._ext_bridge_id = None
 
         # Hang up the ExternalMedia channel
-        channel_id = getattr(self, "_ext_media_channel_id", None)
-        if channel_id:
-            try:
-                url = f"{ari_base}/ari/channels/{channel_id}"
-                await loop.run_in_executor(
-                    None,
-                    lambda: requests.delete(
-                        url,
-                        auth=(self.ari_username, self.ari_password),
-                        timeout=3,
-                    ),
-                )
-                logger.debug(f"[ExternalMedia] channel {channel_id} hungup")
-            except Exception:
-                pass
+        for attr in ("_ext_media_channel_id", "_snoop_channel_id"):
+            channel_id = getattr(self, attr, None)
+            if channel_id:
+                try:
+                    url = f"{ari_base}/ari/channels/{channel_id}"
+                    await loop.run_in_executor(
+                        None,
+                        lambda u=url: requests.delete(
+                            u, auth=(self.ari_username, self.ari_password), timeout=3,
+                        ),
+                    )
+                    logger.debug(f"[ExternalMedia] channel {channel_id} hungup")
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
         self._ext_media_channel = None
         self._ext_media_channel_id = None
 
