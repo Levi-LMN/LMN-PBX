@@ -15,6 +15,7 @@ Why Realtime API?
 
 import asyncio
 import aiohttp
+from aiohttp.web_exceptions import HTTPUnprocessableEntity
 import aioari
 import os
 import socket
@@ -146,6 +147,23 @@ class ARIAgent:
     # ── ARI event handlers ────────────────────────────────────────────────────
 
     def _handle_stasis_start(self, event):
+        channel = event.get("channel", {})
+        channel_name = channel.get("name", "")
+
+        # ExternalMedia channels (created via channels.externalMedia for
+        # RTP I/O) also enter this Stasis app — they belong to an existing
+        # RealtimeCallSession's media leg, NOT a new inbound call. If we
+        # don't filter these out, _process_call() tries to treat the
+        # ExternalMedia channel as a brand-new call (answer it, spin up
+        # another session, etc.), which fails with "Not Found" since that
+        # channel can't be answered/handled like a SIP channel.
+        if channel_name.startswith("UnicastRTP/"):
+            logger.debug(
+                f"StasisStart for ExternalMedia channel "
+                f"{channel.get('id', '')[:12]} — ignoring (not a new call)"
+            )
+            return
+
         asyncio.create_task(self._process_call(event))
 
     def _handle_stasis_end(self, event):
@@ -339,24 +357,25 @@ class RealtimeCallSession:
             self._udp_sock.setblocking(False)
             logger.info(f"🔌 [{self.channel_id[:12]}] UDP RTP listening on port {self.rtp_port}")
 
-            # 4. Create ExternalMedia channel
+            # 4. Create ExternalMedia channel — Asterisk will push RTP here
             ext_channel = await self.ari_client.channels.externalMedia(
-                app=os.getenv("ARI_APP", "ai-agent"),
-                external_host=f"127.0.0.1:{self.rtp_port}",
-                format="ulaw",
-                encapsulation="rtp",
-                transport="udp",
-                connection_type="client",
-                direction="both",
+                app           = os.getenv("ARI_APP", "ai-agent"),
+                external_host = f"127.0.0.1:{self.rtp_port}",
+                format        = "ulaw",   # μ-law 8 kHz — what Asterisk prefers
+                encapsulation = "rtp",
+                transport     = "udp",
+                connection_type = "client",
+                direction     = "both",
             )
             self._ext_channel_id = ext_channel.id
             logger.info(f"📡 [{self.channel_id[:12]}] ExternalMedia channel: {self._ext_channel_id}")
 
-            # ⏱️  Wait for the channel to become ready (RTP socket, media engine)
-            await asyncio.sleep(0.5)
-
-            # Now add to bridge – this should succeed
-            await bridge.addChannel(channel=self._ext_channel_id)
+            # Newly created ExternalMedia channels need a brief moment to
+            # fully register with the Stasis app on the Asterisk side.
+            # Adding them to a bridge immediately can raise 422
+            # Unprocessable Entity ("Channel not in Stasis application"),
+            # so retry briefly with a short backoff.
+            await self._add_channel_to_bridge_with_retry(bridge, self._ext_channel_id)
 
             # 5. Connect to OpenAI Realtime
             await self._connect_openai()
@@ -376,6 +395,42 @@ class RealtimeCallSession:
             logger.error(f"❌ [{self.channel_id[:12]}] Session run error: {e}", exc_info=True)
         finally:
             await self.close()
+
+    async def _add_channel_to_bridge_with_retry(self, bridge, channel_id,
+                                                  retries: int = 5,
+                                                  delay: float = 0.2):
+        """
+        Add a channel to a bridge, retrying briefly if Asterisk responds
+        with 422 Unprocessable Entity ("Channel not in Stasis application").
+
+        This happens when bridge.addChannel() is called immediately after
+        channels.externalMedia() returns — the channel exists, but Asterisk
+        hasn't finished registering it with the Stasis app yet.
+        """
+        last_err = None
+        for attempt in range(1, retries + 1):
+            try:
+                await bridge.addChannel(channel=channel_id)
+                if attempt > 1:
+                    logger.info(
+                        f"🌉 [{self.channel_id[:12]}] Channel {channel_id} "
+                        f"added to bridge on attempt {attempt}"
+                    )
+                return
+            except HTTPUnprocessableEntity as e:
+                last_err = e
+                logger.debug(
+                    f"[{self.channel_id[:12]}] addChannel({channel_id}) "
+                    f"attempt {attempt}/{retries} not ready yet "
+                    f"(422) — retrying in {delay}s …"
+                )
+                await asyncio.sleep(delay)
+
+        logger.error(
+            f"❌ [{self.channel_id[:12]}] Could not add channel {channel_id} "
+            f"to bridge after {retries} attempts"
+        )
+        raise last_err
 
     # ── OpenAI WebSocket ──────────────────────────────────────────────────────
 
