@@ -339,19 +339,25 @@ class RealtimeCallSession:
             self._udp_sock.setblocking(False)
             logger.info(f"🔌 [{self.channel_id[:12]}] UDP RTP listening on port {self.rtp_port}")
 
-            # 4. Create ExternalMedia channel — Asterisk will push RTP here
+            # 4. Create ExternalMedia channel
             ext_channel = await self.ari_client.channels.externalMedia(
-                app           = os.getenv("ARI_APP", "ai-agent"),
-                external_host = f"127.0.0.1:{self.rtp_port}",
-                format        = "ulaw",   # μ-law 8 kHz — what Asterisk prefers
-                encapsulation = "rtp",
-                transport     = "udp",
-                connection_type = "client",
-                direction     = "both",
+                app=os.getenv("ARI_APP", "ai-agent"),
+                external_host=f"127.0.0.1:{self.rtp_port}",
+                format="ulaw",
+                encapsulation="rtp",
+                transport="udp",
+                connection_type="client",
+                direction="both",
             )
             self._ext_channel_id = ext_channel.id
-            await bridge.addChannel(channel=self._ext_channel_id)
             logger.info(f"📡 [{self.channel_id[:12]}] ExternalMedia channel: {self._ext_channel_id}")
+
+            # *** ADD THESE TWO LINES ***
+            await ext_channel.answer()  # Bring channel to "Up" state
+            await asyncio.sleep(0.2)  # Brief pause for Asterisk to process
+
+            # Now add to bridge
+            await bridge.addChannel(channel=self._ext_channel_id)
 
             # 5. Connect to OpenAI Realtime
             await self._connect_openai()
