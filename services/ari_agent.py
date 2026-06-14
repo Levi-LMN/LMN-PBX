@@ -352,11 +352,10 @@ class RealtimeCallSession:
             self._ext_channel_id = ext_channel.id
             logger.info(f"📡 [{self.channel_id[:12]}] ExternalMedia channel: {self._ext_channel_id}")
 
-            # *** ADD THESE TWO LINES ***
-            await ext_channel.answer()  # Bring channel to "Up" state
-            await asyncio.sleep(0.2)  # Brief pause for Asterisk to process
+            # ⏱️  Wait for the channel to become ready (RTP socket, media engine)
+            await asyncio.sleep(0.5)
 
-            # Now add to bridge
+            # Now add to bridge – this should succeed
             await bridge.addChannel(channel=self._ext_channel_id)
 
             # 5. Connect to OpenAI Realtime
