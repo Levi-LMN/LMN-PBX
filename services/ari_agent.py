@@ -77,12 +77,16 @@ class LiveStreamTranscriber:
     # Public API
     # ------------------------------------------------------------------
 
-    async def listen_and_transcribe(self) -> tuple[str, str, int]:
+    def listen_and_transcribe(self) -> tuple[int, object]:
         """
         Open a UDP port, return (udp_port, coroutine).
 
+        This is a regular (non-async) function so the returned coroutine is
+        not nested inside another coroutine object, avoiding the
+        "coroutine was never awaited" RuntimeWarning.
+
         Usage:
-            port, transcribe_coro = await transcriber.listen_and_transcribe()
+            port, transcribe_coro = transcriber.listen_and_transcribe()
             # Tell Asterisk to send RTP to 127.0.0.1:<port>
             text, confidence, duration_ms = await transcribe_coro
         """
@@ -537,7 +541,9 @@ class CallInstance:
             t0 = time.monotonic()
 
             # Reserve a UDP port and get the recognition coroutine
-            udp_port, transcribe_coro = await self.live_transcriber.listen_and_transcribe()
+            # Note: listen_and_transcribe is NOT async — calling it directly
+            # avoids the "coroutine never awaited" RuntimeWarning.
+            udp_port, transcribe_coro = self.live_transcriber.listen_and_transcribe()
 
             # Tell Asterisk to stream audio to that port
             media_ok = await self._start_external_media(udp_port)
@@ -951,8 +957,48 @@ class CallInstance:
             self.active = False
             return False
 
+    @staticmethod
+    def _clean_for_tts(text: str) -> str:
+        """
+        Strip markdown / list formatting that the LLM sometimes inserts
+        despite instructions.  TTS engines render asterisks and hyphens
+        literally, which sounds terrible on a phone call.
+
+        Rules applied (in order):
+          1. Remove bold/italic markers  (**text**, *text*, __text__, _text_)
+          2. Convert numbered list items  "1. Foo" → "Foo"
+          3. Convert bullet list items   "- Foo" / "* Foo" → "Foo,"
+          4. Collapse multiple newlines to a single space
+          5. Collapse multiple spaces
+          6. Strip leading/trailing whitespace
+        """
+        import re
+
+        # 1. Remove bold / italic markers
+        text = re.sub(r'\*{1,2}([^*]+?)\*{1,2}', r'\1', text)
+        text = re.sub(r'_{1,2}([^_]+?)_{1,2}', r'\1', text)
+
+        # 2. Numbered list items — "1. Item" → "Item"
+        text = re.sub(r'(?m)^\s*\d+\.\s+', '', text)
+
+        # 3. Bullet list items — "- Item" or "* Item" → "Item,"
+        #    Add a comma so items flow naturally in speech.
+        text = re.sub(r'(?m)^\s*[-*]\s+', '', text)
+
+        # 4. Multiple newlines / carriage-returns → single space
+        text = re.sub(r'[\r\n]+', ' ', text)
+
+        # 5. Collapse multiple spaces
+        text = re.sub(r'  +', ' ', text)
+
+        return text.strip()
+
     async def speak(self, text: str) -> bool:
         if not await self.is_alive():
+            return False
+        # Always sanitise before TTS — the LLM may ignore formatting instructions
+        text = self._clean_for_tts(text)
+        if not text:
             return False
         try:
             sound_path, duration = await self.sound_cache.get(text, self.file_access)
