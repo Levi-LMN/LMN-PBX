@@ -213,6 +213,7 @@ class RealtimeSession:
             "OpenAI-Beta": "realtime=v1",
         }
         self.system_prompt = system_prompt
+        self._protocol = "ga"  # set to "ga" or "preview" once connect() succeeds
         self.ws: websockets.WebSocketClientProtocol | None = None
         self._audio_queue: asyncio.Queue = asyncio.Queue()   # outbound audio chunks
         self._transcript_log: list[dict] = []
@@ -236,6 +237,7 @@ class RealtimeSession:
                 ping_timeout=30,
             )
             self._connected = True
+            self._protocol = "ga"
             logger.info("✅ Realtime WebSocket connected (GA path)")
             return
         except websockets.exceptions.InvalidStatus as e:
@@ -287,46 +289,80 @@ class RealtimeSession:
             raise
 
         self._connected = True
+        self._protocol = "preview"
         logger.info("✅ Realtime WebSocket connected (preview path fallback)")
 
     async def configure(self):
-        """Send session.update to configure voice, VAD, and instructions (GA schema)."""
-        config = {
-            "type": "session.update",
-            "session": {
-                # GA requires an explicit session "type". For speech-to-speech
-                # this must be "realtime" (the other option is "transcription").
-                "type": "realtime",
-                "model": self.deployment,
-                "instructions": self.system_prompt,
-                "output_modalities": ["audio", "text"],
-                "audio": {
-                    "input": {
-                        # GA requires format as an object, not a bare string.
-                        "format": {"type": "audio/pcm", "rate": REALTIME_RATE},
-                        "transcription": {
-                            # whisper-1 is deprecated for Realtime in GA;
-                            # gpt-4o-mini-transcribe is the supported model.
-                            "model": "gpt-4o-mini-transcribe"
+        """Send session.update to configure voice, VAD, and instructions.
+
+        Schema differs between the GA and preview Realtime protocols, so we
+        branch on which path actually connected (set in connect()).
+        """
+        if self._protocol == "ga":
+            config = {
+                "type": "session.update",
+                "session": {
+                    # GA requires an explicit session "type". For
+                    # speech-to-speech this must be "realtime" (the other
+                    # option is "transcription").
+                    "type": "realtime",
+                    "model": self.deployment,
+                    "instructions": self.system_prompt,
+                    "output_modalities": ["audio", "text"],
+                    "audio": {
+                        "input": {
+                            # GA requires format as an object, not a bare string.
+                            "format": {"type": "audio/pcm", "rate": REALTIME_RATE},
+                            "transcription": {
+                                # whisper-1 is deprecated for Realtime in GA;
+                                # gpt-4o-mini-transcribe is the supported model.
+                                "model": "gpt-4o-mini-transcribe"
+                            },
+                            "turn_detection": {
+                                "type": "server_vad",          # server-side VAD – no need to manage silence timers
+                                "threshold": 0.5,
+                                "prefix_padding_ms": 300,
+                                "silence_duration_ms": 600,    # 600 ms silence = end of user turn
+                                "create_response": True        # auto-respond after each turn
+                            }
                         },
-                        "turn_detection": {
-                            "type": "server_vad",          # server-side VAD – no need to manage silence timers
-                            "threshold": 0.5,
-                            "prefix_padding_ms": 300,
-                            "silence_duration_ms": 600,    # 600 ms silence = end of user turn
-                            "create_response": True        # auto-respond after each turn
+                        "output": {
+                            "format": {"type": "audio/pcm", "rate": REALTIME_RATE},
+                            "voice": "alloy",   # Azure supported voices: alloy, echo, fable, onyx, nova, shimmer
                         }
                     },
-                    "output": {
-                        "format": {"type": "audio/pcm", "rate": REALTIME_RATE},
-                        "voice": "alloy",   # Azure supported voices: alloy, echo, fable, onyx, nova, shimmer
-                    }
-                },
-                "max_output_tokens": 150  # keep responses brief for phone calls
+                    "max_output_tokens": 150  # keep responses brief for phone calls
+                }
             }
-        }
+        else:
+            # Preview protocol (/openai/realtime?api-version=2025-04-01-preview).
+            # No "type" field inside session; flat audio format strings;
+            # voice + modalities + transcription live at the top level of
+            # "session", not nested under "audio".
+            config = {
+                "type": "session.update",
+                "session": {
+                    "modalities": ["audio", "text"],
+                    "instructions": self.system_prompt,
+                    "voice": "alloy",   # alloy, echo, fable, onyx, nova, shimmer
+                    "input_audio_format": "pcm16",
+                    "output_audio_format": "pcm16",
+                    "input_audio_transcription": {
+                        "model": "whisper-1"
+                    },
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 600,
+                        "create_response": True
+                    },
+                    "max_response_output_tokens": 150  # keep responses brief for phone calls
+                }
+            }
+
         await self._send(config)
-        logger.info("Realtime session configured")
+        logger.info(f"Realtime session configured (protocol={self._protocol})")
 
     async def send_audio(self, pcm_24k: bytes):
         """Append audio to the input buffer (caller's voice)."""
