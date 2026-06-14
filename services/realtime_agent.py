@@ -367,6 +367,7 @@ class RealtimeCallInstance:
         self._stop = asyncio.Event()
         self._rtp = RTPBridge()
         self._ext_channel = None   # ExternalMedia channel
+        self._bridge = None        # ARI mixing bridge
 
         system_prompt = config.get('DEFAULT_SYSTEM_PROMPT', '') or self._default_prompt()
 
@@ -396,13 +397,20 @@ class RealtimeCallInstance:
             await self.channel.answer()
             logger.info("✅ Call answered")
 
-            # 1. Open RTP bridge
+            # 1. Open our local UDP socket that will receive/send RTP
             self._rtp.open()
 
-            # 2. Create an ExternalMedia channel tapped directly off the caller channel.
-            #    ExternalMedia channels are virtual — they cannot be placed into a
-            #    mixing bridge (that gives 422). Instead we pass channelId so Asterisk
-            #    splices audio from the caller channel straight to our UDP socket.
+            # 2. Create a mixing bridge then add the caller channel.
+            #    We create the bridge first so when ExternalMedia is added it
+            #    immediately has a peer to exchange audio with.
+            bridge = await self.ari_client.bridges.create(type='mixing')
+            self._bridge = bridge
+            await bridge.addChannel(channel=self.id)
+            logger.info(f"✅ Bridge created, caller channel added")
+
+            # 3. Create ExternalMedia channel (no channelId param — universally supported).
+            #    Our StasisStart filter ignores ExternalMedia channels so this won't
+            #    trigger a second call handler.
             ext = await self.ari_client.channels.externalMedia(
                 app=self.config.get('ARI_APP', 'ai-agent'),
                 external_host=f"127.0.0.1:{self._rtp.local_port}",
@@ -411,44 +419,50 @@ class RealtimeCallInstance:
                 transport="udp",
                 connection_type="client",
                 direction="both",
-                channelId=self.id,   # tap audio FROM this caller channel
             )
             self._ext_channel = ext
 
-            # Asterisk tells us which port it will send RTP to on our side
-            asterisk_rtp_host = ext.json.get('channelvars', {}).get(
-                'UNICASTRTP_LOCAL_ADDRESS', '127.0.0.1'
-            )
-            asterisk_rtp_port = ext.json.get('channelvars', {}).get(
-                'UNICASTRTP_LOCAL_PORT', 0
-            )
+            # 4. Add ExternalMedia channel to the same bridge as the caller.
+            #    Now Asterisk routes audio: caller ↔ bridge ↔ ExternalMedia ↔ our UDP.
+            await bridge.addChannel(channel=ext.id)
+            logger.info("✅ ExternalMedia channel bridged")
+
+            # 5. Read Asterisk's RTP address from channel variables.
+            #    These are set on the ExternalMedia channel after it's created.
+            ch_vars = ext.json.get('channelvars', {})
+            asterisk_rtp_host = ch_vars.get('UNICASTRTP_LOCAL_ADDRESS', '127.0.0.1')
+            asterisk_rtp_port = ch_vars.get('UNICASTRTP_LOCAL_PORT', 0)
+
             if not asterisk_rtp_port:
-                # Fall back: parse from the channel name (ExternalMedia/udp/host:port)
+                # Fallback: the channel name encodes the address, e.g.
+                # "UnicastRTP/127.0.0.1:12366-..."
                 ch_name = ext.json.get('name', '')
-                if ':' in ch_name:
-                    try:
-                        asterisk_rtp_port = int(ch_name.rsplit(':', 1)[-1])
-                        asterisk_rtp_host = ch_name.rsplit('/', 1)[-1].rsplit(':', 1)[0]
-                    except Exception:
-                        pass
+                try:
+                    # name is like: UnicastRTP/udp/127.0.0.1:PORT-...
+                    addr_part = ch_name.split('/')[-1].split('-')[0]  # "127.0.0.1:PORT"
+                    asterisk_rtp_host, port_str = addr_part.rsplit(':', 1)
+                    asterisk_rtp_port = int(port_str)
+                    logger.info(f"Parsed RTP addr from channel name: {asterisk_rtp_host}:{asterisk_rtp_port}")
+                except Exception:
+                    logger.warning(f"Could not parse RTP port from channel name: {ch_name!r}")
 
             self._rtp.set_remote(asterisk_rtp_host, int(asterisk_rtp_port or 0))
-            logger.info("✅ RTP bridge established with Asterisk")
+            logger.info(f"✅ RTP bridge ready — Asterisk:{asterisk_rtp_host}:{asterisk_rtp_port} ↔ us:{self._rtp.local_port}")
 
-            # 4. Connect Realtime WebSocket
+            # 6. Connect to Azure Realtime WebSocket
             await self._session.connect()
 
-            # 5. Run audio pump + event loop concurrently
+            # 7. Run all loops concurrently until call ends
             await asyncio.gather(
-                self._audio_inbound_pump(),    # caller audio → Realtime
-                self._audio_outbound_pump(),   # Realtime audio → Asterisk RTP
-                self._session.receive_loop(    # Realtime events
+                self._audio_inbound_pump(),    # caller audio (UDP) → Azure Realtime
+                self._audio_outbound_pump(),   # (keepalive — audio sent in receive_loop)
+                self._session.receive_loop(    # Azure Realtime events + audio out
                     on_audio=self._on_realtime_audio,
                     on_transcript=self._on_transcript,
                     on_transfer_intent=self._on_transfer_intent,
                     stop_event=self._stop,
                 ),
-                self._watchdog(),              # hang-up detection
+                self._watchdog(),              # hang-up / timeout detection
                 return_exceptions=True,
             )
 
@@ -547,6 +561,13 @@ class RealtimeCallInstance:
         self._stop.set()
         await self._session.close()
         self._rtp.close()
+
+        # Destroy bridge (removes all channels from it)
+        if hasattr(self, '_bridge') and self._bridge:
+            try:
+                await self._bridge.destroy()
+            except Exception:
+                pass
 
         # Clean up ExternalMedia channel
         if self._ext_channel:
