@@ -579,7 +579,7 @@ class CallInstance:
                 "format": "slin",
                 "encapsulation": "rtp",
                 "transport": "udp",
-                "connection_type": "server",
+                "connection_type": "client",
                 "direction": "both",
             }
 
@@ -1093,7 +1093,7 @@ class CallInstance:
                     response = await self.ai_client.chat.completions.create(
                         model=self.deployment,
                         messages=self.conversation,
-                        max_tokens=60,       # hard cap — prevents verbose responses
+                        max_tokens=40,       # ~30 spoken words — hard physical cap
                         temperature=0.5,
                     )
                     ai_text = response.choices[0].message.content.strip()
