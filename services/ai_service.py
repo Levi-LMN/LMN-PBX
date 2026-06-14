@@ -396,6 +396,6 @@ def create_ai_service(app_config) -> AIService:
         api_key=api_key,
         endpoint=endpoint,
         deployment=app_config.get('AZURE_OPENAI_DEPLOYMENT', 'gpt-4o-mini'),
-        api_version=app_config.get('AZURE_OPENAI_API_VERSION', '2024-02-15-preview'),
+        api_version=app_config.get('AZURE_OPENAI_API_VERSION', '2025-04-01-preview'),
         system_prompt=app_config.get('DEFAULT_SYSTEM_PROMPT', 'You are a helpful AI assistant.')
     )

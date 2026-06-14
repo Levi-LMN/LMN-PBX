@@ -4,12 +4,6 @@ aioari~=0.10.2
 requests~=2.32.3
 pydub~=0.25.1
 openai~=1.54.4
-httpx>=0.23.0,<0.28.0       # openai 1.x requires httpx < 0.28; newer httpx removed 'proxies' arg
 python-dotenv~=1.0.0
 SQLAlchemy~=2.0.23
-
-# Azure Speech SDK — required for live streaming STT and neural TTS
-azure-cognitiveservices-speech>=1.38.0
-
-# Optional TTS fallback (used if Azure Speech TTS fails)
-gTTS>=2.5.0
+websockets>=12.0

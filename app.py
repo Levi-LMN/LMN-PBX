@@ -24,7 +24,11 @@ from blueprints.auth.routes import auth_bp
 from blueprints.calls.routes import calls_bp
 from blueprints.admin.routes import admin_bp
 
-# Import ARI agent
+# Import ARI agents
+# RealtimeARIAgent uses Azure OpenAI Realtime API (gpt-realtime / gpt-realtime-mini)
+# and is ~4x faster than the classic STT→LLM→TTS pipeline.
+# Falls back to classic ARIAgent if AZURE_OPENAI_REALTIME_DEPLOYMENT is not set.
+from services.realtime_agent import RealtimeARIAgent
 from services.ari_agent import ARIAgent
 
 # Configure logging
@@ -156,8 +160,17 @@ def start_ari_agent(app):
     logger.info("=" * 60)
 
     try:
+        # Auto-select agent: Realtime API if deployment is configured, else classic
+        realtime_deployment = app.config.get('AZURE_OPENAI_REALTIME_DEPLOYMENT', '')
+        if realtime_deployment:
+            AgentClass = RealtimeARIAgent
+            logger.info(f"🚀 Using Realtime API agent (deployment: {realtime_deployment})")
+        else:
+            AgentClass = ARIAgent
+            logger.info("⚠️  AZURE_OPENAI_REALTIME_DEPLOYMENT not set – using classic agent")
+
         # Create agent with app config AND Flask app reference
-        _ari_agent = ARIAgent(app.config, flask_app=app)
+        _ari_agent = AgentClass(app.config, flask_app=app)
 
         # Run agent in separate thread with its own event loop
         def run_agent():

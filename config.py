@@ -39,11 +39,21 @@ class Config:
     AZURE_SPEECH_KEY = os.getenv('AZURE_SPEECH_KEY', '')
     AZURE_SPEECH_REGION = os.getenv('AZURE_SPEECH_REGION', 'eastus')
 
-    # Azure OpenAI
+    # Azure OpenAI – chat completions (ai_service.py / admin panel)
     AZURE_OPENAI_KEY = os.getenv('AZURE_OPENAI_KEY', '')
     AZURE_OPENAI_ENDPOINT = os.getenv('AZURE_OPENAI_ENDPOINT', '')
     AZURE_OPENAI_DEPLOYMENT = os.getenv('AZURE_OPENAI_DEPLOYMENT', 'gpt-4o-mini')
-    AZURE_OPENAI_API_VERSION = os.getenv('AZURE_OPENAI_API_VERSION', '2024-08-01-preview')
+    AZURE_OPENAI_API_VERSION = os.getenv('AZURE_OPENAI_API_VERSION', '2025-04-01-preview')
+
+    # Azure OpenAI – Realtime API (realtime_agent.py, live phone calls)
+    # In Azure AI Foundry → Deployments, deploy one of:
+    #   gpt-realtime        full model, best quality
+    #   gpt-realtime-mini   faster and cheaper
+    #   gpt-realtime-1.5    latest version
+    # Then set AZURE_OPENAI_REALTIME_DEPLOYMENT to the deployment name you chose.
+    AZURE_OPENAI_REALTIME_DEPLOYMENT = os.getenv(
+        'AZURE_OPENAI_REALTIME_DEPLOYMENT', 'gpt-realtime'
+    )
 
     # Dataverse (Optional - for customer data)
     DATAVERSE_URL = os.getenv('DATAVERSE_URL', '')
@@ -66,16 +76,15 @@ Your role is to:
 - Be empathetic and helpful with customer concerns
 - Identify when a caller needs to speak with a human agent
 
-STRICT FORMATTING RULES — VIOLATING THESE WILL BREAK THE PHONE SYSTEM:
-- MAXIMUM 20 WORDS PER RESPONSE. Count your words before responding. Stop at 20.
-- PLAIN SPEECH ONLY. This is a phone call; your text is converted to audio by a TTS engine.
-- NEVER use bullet points, numbered lists, dashes, asterisks, bold, or any markdown.
-- NEVER use newlines or line breaks. One continuous sentence or two at most.
-- Do not say "Here are some options:" or similar list intros.
-- Do not say "I'm an AI" or mention being artificial.
-- Use natural, conversational spoken language only.
-- If you need clarification, ask exactly one short question.
-- If you cannot help or the caller requests a human, say you will transfer them now.""")
+RULES:
+- STRICT LIMIT: Respond in 20 words or fewer. This is a phone call — be brief.
+- Never exceed 2 short sentences.
+- Never say "I'm an AI" or mention being artificial
+- Use natural, conversational language
+- Be honest when you don't know something
+- If you need clarification, ask only one question.
+
+If you cannot help or the caller requests a human, say you will transfer them now.""")
 
 
 class DevelopmentConfig(Config):
