@@ -185,17 +185,16 @@ class RealtimeSession:
 
     def __init__(self, endpoint: str, api_key: str, deployment: str,
                  api_version: str, system_prompt: str):
-        # Build WSS URI
-        # GA path: wss://<resource>.openai.azure.com/openai/v1/realtime?model=<deployment>
-        # Preview:  wss://<resource>.openai.azure.com/openai/realtime?api-version=...&deployment=...
+        # GA models (gpt-realtime, gpt-realtime-mini, gpt-realtime-1.5) use:
+        #   wss://<resource>.openai.azure.com/openai/v1/realtime?model=<deployment>
+        # Preview models used the older path with api-version + deployment params.
+        # We always use the GA path; api_version is kept for the header only.
         base = endpoint.rstrip('/').replace('https://', 'wss://')
-        self.uri = (
-            f"{base}/openai/realtime"
-            f"?api-version={api_version}"
-            f"&deployment={deployment}"
-        )
+        self.uri = f"{base}/openai/v1/realtime?model={deployment}"
+        self.api_version = api_version
         self.headers = {
             "api-key": api_key,
+            "OpenAI-Beta": "realtime=v1",   # required by some Azure resource versions
         }
         self.system_prompt = system_prompt
         self.ws: websockets.WebSocketClientProtocol | None = None
@@ -400,7 +399,10 @@ class RealtimeCallInstance:
             # 1. Open RTP bridge
             self._rtp.open()
 
-            # 2. Create ExternalMedia channel so Asterisk routes audio to our UDP port
+            # 2. Create an ExternalMedia channel tapped directly off the caller channel.
+            #    ExternalMedia channels are virtual — they cannot be placed into a
+            #    mixing bridge (that gives 422). Instead we pass channelId so Asterisk
+            #    splices audio from the caller channel straight to our UDP socket.
             ext = await self.ari_client.channels.externalMedia(
                 app=self.config.get('ARI_APP', 'ai-agent'),
                 external_host=f"127.0.0.1:{self._rtp.local_port}",
@@ -409,22 +411,28 @@ class RealtimeCallInstance:
                 transport="udp",
                 connection_type="client",
                 direction="both",
+                channelId=self.id,   # tap audio FROM this caller channel
             )
             self._ext_channel = ext
 
-            # Find out which port Asterisk picked on its side
+            # Asterisk tells us which port it will send RTP to on our side
             asterisk_rtp_host = ext.json.get('channelvars', {}).get(
                 'UNICASTRTP_LOCAL_ADDRESS', '127.0.0.1'
             )
             asterisk_rtp_port = ext.json.get('channelvars', {}).get(
                 'UNICASTRTP_LOCAL_PORT', 0
             )
-            self._rtp.set_remote(asterisk_rtp_host, asterisk_rtp_port)
+            if not asterisk_rtp_port:
+                # Fall back: parse from the channel name (ExternalMedia/udp/host:port)
+                ch_name = ext.json.get('name', '')
+                if ':' in ch_name:
+                    try:
+                        asterisk_rtp_port = int(ch_name.rsplit(':', 1)[-1])
+                        asterisk_rtp_host = ch_name.rsplit('/', 1)[-1].rsplit(':', 1)[0]
+                    except Exception:
+                        pass
 
-            # 3. Bridge caller channel → ExternalMedia channel
-            bridge = await self.ari_client.bridges.create(type='mixing')
-            await bridge.addChannel(channel=self.id)
-            await bridge.addChannel(channel=ext.id)
+            self._rtp.set_remote(asterisk_rtp_host, int(asterisk_rtp_port or 0))
             logger.info("✅ RTP bridge established with Asterisk")
 
             # 4. Connect Realtime WebSocket
@@ -733,6 +741,19 @@ class RealtimeARIAgent:
         channel_id = event.get("channel", {}).get("id")
         if not channel_id:
             return
+
+        # Skip ExternalMedia channels — they fire their own StasisStart but are
+        # not real callers.  Their names start with "UnicastRTP/" or "ExternalMedia/".
+        channel_name = event.get("channel", {}).get("name", "")
+        if channel_name.startswith(("UnicastRTP/", "ExternalMedia/")):
+            logger.debug(f"Ignoring ExternalMedia StasisStart: {channel_name}")
+            return
+
+        # Also skip if we're already handling this channel
+        if channel_id in self.active_calls:
+            logger.debug(f"Duplicate StasisStart for {channel_id[:12]} — ignoring")
+            return
+
         try:
             channel = await self.ari_client.channels.get(channelId=channel_id)
             await self._handle_call(channel)
