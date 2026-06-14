@@ -21,6 +21,12 @@ Fixes applied (2026-06-14):
   4. System prompt hardened with CRITICAL TTS constraints at the very top so
      the model can't bury them under its own helpfulness heuristics.
      max_tokens kept at 60 (enforced in code) to hard-cap verbosity.
+  5. Fixed duplicate-call loop: _process_call() now filters out ExternalMedia
+     channels (UnicastRTP/*, ExternalMedia/*, Local/*) and any "Up" channel
+     with no caller number.  When externalMedia() is called with app="ai-agent"
+     Asterisk fires a StasisStart for the new audio-fork leg, which was being
+     processed as a second incoming call, spawning another ExternalMedia leg,
+     and so on — causing every real call to appear as 8–10 ghost calls.
 """
 
 import asyncio
@@ -1295,6 +1301,38 @@ class ARIAgent:
         channel_id = event.get("channel", {}).get("id")
         if not channel_id:
             return
+
+        # ── Skip ExternalMedia / internal channels ───────────────────────────
+        # When _start_external_media() calls ari_client.channels.externalMedia(
+        # app="ai-agent"), Asterisk fires a StasisStart for the new audio-fork
+        # channel too.  That channel is NOT a real caller — processing it would
+        # create an infinite loop (each ExternalMedia leg triggers another
+        # ExternalMedia leg, etc.).
+        #
+        # Guard 1 — channel name prefix:
+        #   Asterisk always names ExternalMedia channels "UnicastRTP/…" or
+        #   "ExternalMedia/…".  Local dialplan channels use "Local/…".
+        #   None of these are real inbound PSTN/SIP callers.
+        #
+        # Guard 2 — state + missing caller number:
+        #   A genuine inbound call starts in "Ring" state and always carries a
+        #   caller number.  The ghost channels we saw in logs were all
+        #   state="Up" with an empty caller number — Asterisk's internal legs.
+        channel_data = event.get("channel", {})
+        channel_name = channel_data.get("name", "")
+        if channel_name.startswith(("UnicastRTP/", "ExternalMedia/", "Local/")):
+            logger.debug(f"[StasisStart] Ignoring internal channel: {channel_name}")
+            return
+
+        channel_state = channel_data.get("state", "")
+        caller_number = channel_data.get("caller", {}).get("number", "")
+        if channel_state == "Up" and not caller_number:
+            logger.debug(
+                f"[StasisStart] Ignoring Up channel with no caller: {channel_id[:16]}"
+            )
+            return
+        # ────────────────────────────────────────────────────────────────────
+
         try:
             channel = await self.ari_client.channels.get(channelId=channel_id)
             await self._handle_call(channel)
