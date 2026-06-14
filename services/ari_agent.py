@@ -532,6 +532,7 @@ class CallInstance:
         self.conversation = [{"role": "system", "content": system_prompt}]
 
         self._ext_media_channel = None
+        self._ext_media_channel_id = None
 
     # ------------------------------------------------------------------
     # Live audio capture
@@ -541,50 +542,86 @@ class CallInstance:
         """
         Ask Asterisk to fork audio from this channel to our UDP listener.
 
-        FIX 1: format="slin" instead of "ulaw".
-          - slin = signed linear 16-bit PCM, which is exactly what Azure's
-            PushAudioInputStream expects.  Requesting ulaw on some Asterisk
-            builds caused a 500 because the ARI handler couldn't transcode
-            on the fly; slin goes through as-is.
+        ROOT CAUSE FIX:
+        The ARI endpoint POST /channels/externalMedia uses `channelId` as the
+        ID to *assign* to the newly created ExternalMedia channel — NOT as the
+        source channel to fork.  Passing `channelId=self.id` (the real caller's
+        channel ID) caused Asterisk to return 500 "Internal Server Error" because
+        a channel with that ID already existed.
 
-        FIX 2: channelId=self.id is the SOURCE channel, not a new channel ID.
-          - channelId tells Asterisk which channel's audio to fork to UDP.
-            An earlier version accidentally omitted it entirely (after fixing
-            a "channel exists" 500), which meant Asterisk created the
-            ExternalMedia leg but didn't know which call to pull audio from —
-            so the UDP port received no packets and Azure always got silence.
+        The correct approach is to use the per-channel endpoint:
+            POST /channels/{sourceChannelId}/externalMedia
+        which explicitly forks audio FROM sourceChannelId.  We call this via a
+        direct HTTP POST because aioari's helper method maps to the wrong
+        top-level endpoint.
+
+        format="slin" (signed linear 16-bit PCM at 8 kHz) is correct for Azure's
+        PushAudioInputStream.  "ulaw" caused a second 500 on some Asterisk builds
+        due to codec transcoding rejection at the ExternalMedia handler level.
         """
         try:
-            # channelId here is the SOURCE channel whose audio we want to fork.
-            # Previously this was accidentally set to self.id (the caller channel
-            # id) which caused "channel already exists" 500 errors — because
-            # aioari was treating it as the ID to ASSIGN to the new ExternalMedia
-            # channel, not the source.
-            #
-            # The correct ARI parameter to specify the source is `channelId`
-            # in the Asterisk 16+ API.  We pass self.id (the real caller's
-            # channel) so Asterisk knows which call to fork audio from.
-            # The ExternalMedia leg itself gets an auto-generated ID.
-            self._ext_media_channel = await self.ari_client.channels.externalMedia(
-                app=self.ari_app if hasattr(self, "ari_app") else "ai-agent",
-                external_host=f"127.0.0.1:{udp_port}",
-                format="slin",
-                encapsulation="rtp",
-                channelId=self.id,       # SOURCE channel — fork THIS call's audio
+            ari_base = self.ari_url.rstrip("/ari").rstrip("/")
+            url = f"{ari_base}/ari/channels/{self.id}/externalMedia"
+            app_name = self.ari_app if hasattr(self, "ari_app") else "ai-agent"
+
+            payload = {
+                "app": app_name,
+                "external_host": f"127.0.0.1:{udp_port}",
+                "format": "slin",
+                "encapsulation": "rtp",
+            }
+
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: requests.post(
+                    url,
+                    json=payload,
+                    auth=(self.ari_username, self.ari_password),
+                    timeout=5,
+                ),
             )
-            logger.info(f"[ExternalMedia] started → UDP port {udp_port}")
-            return True
+
+            if response.status_code in (200, 201):
+                self._ext_media_channel_id = response.json().get("id")
+                logger.info(
+                    f"[ExternalMedia] started → UDP port {udp_port} "
+                    f"(ExternalMedia id={self._ext_media_channel_id})"
+                )
+                return True
+            else:
+                logger.warning(
+                    f"[ExternalMedia] HTTP {response.status_code}: {response.text[:200]} "
+                    f"— falling back to record"
+                )
+                return False
+
         except Exception as e:
             logger.warning(f"[ExternalMedia] not available: {e} — falling back to record")
             return False
 
     async def _stop_external_media(self):
-        if self._ext_media_channel:
+        channel_id = getattr(self, "_ext_media_channel_id", None) or (
+            self._ext_media_channel.id if self._ext_media_channel else None
+        )
+        if channel_id:
             try:
-                await self._ext_media_channel.hangup()
+                ari_base = self.ari_url.rstrip("/ari").rstrip("/")
+                url = f"{ari_base}/ari/channels/{channel_id}"
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda: requests.delete(
+                        url,
+                        auth=(self.ari_username, self.ari_password),
+                        timeout=3,
+                    ),
+                )
+                logger.debug(f"[ExternalMedia] channel {channel_id} hungup")
             except Exception:
                 pass
-            self._ext_media_channel = None
+        self._ext_media_channel = None
+        self._ext_media_channel_id = None
 
     async def listen(self) -> tuple[str, str]:
         """
@@ -653,7 +690,21 @@ class CallInstance:
         return text, confidence
 
     async def record(self, duration: int = 8, silence: float = 2.0) -> str | None:
-        """Record audio clip via ARI stored recordings."""
+        """
+        Record audio clip via ARI stored recordings.
+
+        FIX: The original implementation did `await asyncio.sleep(duration + 0.5)`
+        unconditionally — an 8.5-second blind wait before stopping the recording.
+        Combined with the fallback path being triggered on every call (due to the
+        ExternalMedia bug), callers heard 8+ seconds of silence and hung up before
+        the AI could respond.
+
+        New approach: poll the ARI /recordings/live/{name} endpoint every 250 ms.
+        Asterisk sets recording.state to "complete" when maxSilenceSeconds has
+        elapsed or the caller hangs up.  We stop waiting as soon as that happens,
+        which typically cuts the wait to 2–3 seconds (the silence detection window)
+        instead of the full maxDurationSeconds.
+        """
         if not await self.is_alive():
             return None
 
@@ -667,13 +718,50 @@ class CallInstance:
                 ifExists="overwrite",
                 terminateOn="none",
             )
-            await asyncio.sleep(duration + 0.5)
+
+            # Poll until recording finishes naturally (silence timeout) or we
+            # hit the hard cap, whichever comes first.
+            deadline = time.monotonic() + duration + 1.0
+            ari_base = self.ari_url.rstrip("/ari").rstrip("/")
+            rec_url = f"{ari_base}/ari/recordings/live/{name}"
+            loop = asyncio.get_running_loop()
+
+            while time.monotonic() < deadline:
+                if self.user_hung_up or not self.active:
+                    logger.info("📡 User hung up during recording (poll loop)")
+                    return None
+
+                await asyncio.sleep(0.25)
+
+                try:
+                    resp = await loop.run_in_executor(
+                        None,
+                        lambda: requests.get(
+                            rec_url,
+                            auth=(self.ari_username, self.ari_password),
+                            timeout=2,
+                        ),
+                    )
+                    if resp.status_code == 200:
+                        state = resp.json().get("state", "")
+                        if state in ("complete", "failed", "canceled"):
+                            logger.debug(f"[record] state={state} — stopping early")
+                            break
+                    elif resp.status_code == 404:
+                        # Recording already finished and moved to stored
+                        break
+                except Exception:
+                    pass  # ARI briefly unavailable — keep polling
+
+            # Ensure recording is stopped (no-op if already done)
             try:
                 await recording.stop()
             except Exception:
                 pass
+
             await asyncio.sleep(0.2)
             return await self._download_recording(name)
+
         except Exception as e:
             if "Not Found" in str(e):
                 self.user_hung_up = True
