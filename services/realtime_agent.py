@@ -367,11 +367,12 @@ class RealtimeCallInstance:
       - RTPBridge to shuttle UDP frames
     """
 
-    def __init__(self, channel, ari_client, config: dict, flask_app=None):
+    def __init__(self, channel, ari_client, config: dict, flask_app=None, agent=None):
         self.channel = channel
         self.ari_client = ari_client
         self.config = config
         self.flask_app = flask_app
+        self.agent = agent
 
         self.id = channel.id
         self.active = True
@@ -435,6 +436,14 @@ class RealtimeCallInstance:
                 direction="both",
             )
             self._ext_channel = ext
+
+            # 3b. Wait for the ExternalMedia channel's own StasisStart event.
+            #     externalMedia() returns as soon as the channel object exists,
+            #     but Asterisk joins it to the Stasis app asynchronously.
+            #     Calling bridge.addChannel() before that completes fails with
+            #     422 "Channel not in Stasis application".
+            if self.agent is not None:
+                await self.agent.wait_for_ext_media_ready(ext.id)
 
             # 4. Add the ExternalMedia channel to the bridge FIRST.
             #    Asterisk's mixing bridge negotiates its media format from the
@@ -713,6 +722,11 @@ class RealtimeARIAgent:
         self.running = False
         self.active_calls: dict = {}
         self.total_calls: int = 0
+        # ExternalMedia channels fire their own StasisStart once Asterisk has
+        # fully joined them to the Stasis app. We must wait for that event
+        # before adding them to a bridge, or addChannel fails with
+        # "Channel not in Stasis application" (422). Keyed by channel id.
+        self._ext_media_ready: dict = {}
 
         self.ari_base     = os.getenv('ARI_BASE', app_config.get('ARI_BASE', 'http://localhost:8088'))
         self.ari_username = os.getenv('ARI_USERNAME', app_config.get('ARI_USERNAME', 'asterisk'))
@@ -790,16 +804,44 @@ class RealtimeARIAgent:
             call.user_hung_up = True
             call._stop.set()
 
+    async def wait_for_ext_media_ready(self, channel_id: str, timeout: float = 5.0):
+        """
+        Block until the ExternalMedia channel with the given id has fired its
+        own StasisStart (i.e. Asterisk has fully joined it to our Stasis app).
+        Adding it to a bridge before this happens fails with
+        "Channel not in Stasis application" (422).
+        """
+        ev = self._ext_media_ready.get(channel_id)
+        if ev is None:
+            ev = asyncio.Event()
+            self._ext_media_ready[channel_id] = ev
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f"Timed out waiting for ExternalMedia channel {channel_id[:12]} StasisStart")
+        finally:
+            self._ext_media_ready.pop(channel_id, None)
+
     async def _process_call(self, event):
         channel_id = event.get("channel", {}).get("id")
         if not channel_id:
             return
 
-        # Skip ExternalMedia channels — they fire their own StasisStart but are
-        # not real callers.  Their names start with "UnicastRTP/" or "ExternalMedia/".
+        # ExternalMedia channels fire their own StasisStart but are not real
+        # callers. Signal any waiter (process() waiting to bridge this
+        # channel) that it's now in the Stasis app, then return.
         channel_name = event.get("channel", {}).get("name", "")
         if channel_name.startswith(("UnicastRTP/", "ExternalMedia/")):
-            logger.debug(f"Ignoring ExternalMedia StasisStart: {channel_name}")
+            logger.debug(f"ExternalMedia channel ready: {channel_name} ({channel_id[:12]})")
+            ev = self._ext_media_ready.get(channel_id)
+            if ev:
+                ev.set()
+            else:
+                # process() hasn't registered a waiter yet — pre-set so the
+                # upcoming wait_for_ext_media_ready() returns immediately.
+                ready = asyncio.Event()
+                ready.set()
+                self._ext_media_ready[channel_id] = ready
             return
 
         # Also skip if we're already handling this channel
@@ -822,6 +864,7 @@ class RealtimeARIAgent:
             ari_client=self.ari_client,
             config=self.config,
             flask_app=self.flask_app,
+            agent=self,
         )
 
         self.active_calls[channel.id] = call
