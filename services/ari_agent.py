@@ -1,241 +1,168 @@
 # services/ari_agent.py
 """
-Enhanced ARI-based agent service with:
-- Actual call transfers to human agents
-- Knowledge base integration
-- Intent-based routing
+ARI-based agent service using OpenAI Realtime API for ultra-low latency voice.
+
+Architecture (new):
+  Caller → Asterisk → ARI ExternalMedia → RTP UDP socket (this service)
+         ↕ PCM audio (μ-law 8kHz)
+  This service ↔ OpenAI Realtime WebSocket (PCM16 24kHz)
+  ↓ audio back → RTP → Asterisk → Caller
+
+Why Realtime API?
+  Old: record → Azure STT → GPT chat → Azure TTS → play file  (~3-5 s latency)
+  New: stream RTP → OpenAI Realtime (VAD + STT + LLM + TTS in one hop) → stream back (~300 ms)
 """
 
 import asyncio
+import aiohttp
 import aioari
 import os
-import tempfile
-import time
-import requests
-import logging
-import hashlib
+import socket
+import struct
+import audioop
+import base64
 import json
-import shutil
-import subprocess
-from pathlib import Path
-from pydub import AudioSegment
-from pydub.effects import normalize
-from openai import AsyncAzureOpenAI
-import azure.cognitiveservices.speech as speechsdk
+import logging
+import websockets
 from datetime import datetime
 from flask import Flask
 
 logger = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
+REALTIME_MODEL = "gpt-4o-realtime-preview"
+
+# Audio parameters
+ASTERISK_SAMPLE_RATE = 8000    # Asterisk sends μ-law 8 kHz
+OPENAI_SAMPLE_RATE   = 24000   # OpenAI Realtime expects PCM16 24 kHz
+RTP_PACKET_MS        = 20      # 20 ms RTP packets from Asterisk (160 samples @ 8 kHz)
+RTP_HEADER_SIZE      = 12      # Standard RTP header
+
+# Default RTP port range for ExternalMedia channels
+RTP_LISTEN_HOST = "0.0.0.0"
+RTP_PORT_START  = 20000
+RTP_PORT_END    = 20100
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ARIAgent — top-level service
+# ─────────────────────────────────────────────────────────────────────────────
 
 class ARIAgent:
-    """ARI-based AI voice agent with call transfer and knowledge base"""
+    """Manages the ARI connection and spawns a RealtimeCallSession per call."""
 
     def __init__(self, app_config, flask_app=None):
-        self.config = app_config
-        self.flask_app = flask_app
-        self.running = False
-        self.active_calls = {}
+        self.config     = app_config
+        self.flask_app  = flask_app
+        self.running    = False
+        self.active_calls: dict[str, "RealtimeCallSession"] = {}
         self.total_calls = 0
 
-        # ARI Configuration
-        self.ari_url = os.getenv('ARI_URL', 'http://localhost:8088/ari')
-        self.ari_base = os.getenv('ARI_BASE', 'http://localhost:8088')
-        self.ari_username = os.getenv('ARI_USERNAME', 'asterisk')
-        self.ari_password = os.getenv('ARI_PASSWORD', 'your_ari_password')
-        self.ari_app = os.getenv('ARI_APP', 'ai-agent')
+        # ARI
+        self.ari_url      = os.getenv("ARI_URL",      "http://localhost:8088/ari")
+        self.ari_base     = os.getenv("ARI_BASE",     "http://localhost:8088")
+        self.ari_username = os.getenv("ARI_USERNAME", "asterisk")
+        self.ari_password = os.getenv("ARI_PASSWORD", "your_ari_password")
+        self.ari_app      = os.getenv("ARI_APP",      "ai-agent")
 
-        # File system
-        self.asterisk_sounds_dir = '/var/lib/asterisk/sounds/custom'
+        # OpenAI
+        self.openai_api_key = os.getenv("OPENAI_API_KEY", "")
+        self.openai_voice   = os.getenv("OPENAI_VOICE", "alloy")  # alloy / echo / shimmer / ash / coral / verse
+        self.system_prompt  = os.getenv("DEFAULT_SYSTEM_PROMPT") or self._default_prompt()
 
-        # Azure configuration
-        self.azure_openai_endpoint = os.getenv('AZURE_OPENAI_ENDPOINT')
-        self.azure_openai_key = os.getenv('AZURE_OPENAI_KEY')
-        self.azure_openai_deployment = os.getenv('AZURE_OPENAI_DEPLOYMENT', 'gpt-4o-mini')
-        self.azure_speech_key = os.getenv('AZURE_SPEECH_KEY')
-        self.azure_speech_region = os.getenv('AZURE_SPEECH_REGION', 'eastus')
+        # Port allocator for ExternalMedia RTP sockets
+        self._next_rtp_port = RTP_PORT_START
+        self._port_lock     = asyncio.Lock()
 
-        # System prompt
-        self.system_prompt = os.getenv('DEFAULT_SYSTEM_PROMPT') or self._default_prompt()
-
-        # Initialize components
-        self.cache_dir = Path.home() / ".asterisk_cache"
-        self.cache_dir.mkdir(exist_ok=True)
-        self.cache_index_file = self.cache_dir / "cache_index.json"
-
-        self.sound_cache = SoundCache(
-            self.cache_dir, self.cache_index_file, self.asterisk_sounds_dir,
-            azure_speech_key=self.azure_speech_key,
-            azure_speech_region=self.azure_speech_region
-        )
-
-        # Initialize transcriber
-        try:
-            self.transcriber = AzureSpeechTranscriber(self.azure_speech_key, self.azure_speech_region)
-            logger.info("✅ Speech transcriber initialized")
-        except Exception as e:
-            logger.error(f"❌ Failed to initialize transcriber: {e}")
-            self.transcriber = None
-
-        # File system access
-        self.file_access = FileSystemAccess(self.asterisk_sounds_dir)
-
-        # OpenAI client initialization
-        self.ai_client = None
-        if self.azure_openai_endpoint and self.azure_openai_key:
-            try:
-                endpoint = self.azure_openai_endpoint.rstrip('/')
-                self.ai_client = AsyncAzureOpenAI(
-                    api_key=self.azure_openai_key,
-                    azure_endpoint=endpoint,
-                    api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2025-04-01-preview")
-                )
-                logger.info("✅ OpenAI client object created")
-            except Exception as e:
-                logger.error(f"❌ Failed to initialize OpenAI client: {e}")
-                self.ai_client = None
-        else:
-            logger.warning("⚠️ Azure OpenAI not configured")
-
-        # ARI client
         self.ari_client = None
+        logger.info("ARIAgent (Realtime) initialised")
 
-        logger.info("ARI Agent initialized")
+    # ── helpers ──────────────────────────────────────────────────────────────
 
     def _default_prompt(self):
-        return """You are a professional phone assistant for Jubilee Insurance.
+        return (
+            "You are a professional phone assistant for Jubilee Insurance. "
+            "RULES: respond in 20 words or fewer — this is a phone call, be brief. "
+            "Never say you are an AI. Be empathetic and professional. "
+            "When the caller wants a human agent, say you will transfer them now."
+        )
 
-RULES:
-- STRICT LIMIT: Respond in 20 words or fewer. This is a phone call — be brief.
-- Never exceed 2 short sentences.
-- Be helpful, professional, and empathetic.
-- Never say "I'm an AI" or mention being artificial.
-- Use natural, conversational language.
-- If you need more information, ask only one question.
+    async def _alloc_rtp_port(self) -> int:
+        async with self._port_lock:
+            port = self._next_rtp_port
+            self._next_rtp_port = port + 2  # step by 2 (RTP + RTCP)
+            if self._next_rtp_port > RTP_PORT_END:
+                self._next_rtp_port = RTP_PORT_START
+            return port
 
-When you cannot help or the caller requests a human, say you will transfer them now."""
+    # ── lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self):
-        """Start the ARI agent"""
         self.running = True
-
         logger.info("=" * 60)
-        logger.info("🤖 ARI Agent Starting")
+        logger.info("🤖 ARI Realtime Agent starting")
+        logger.info(f"   Model  : {REALTIME_MODEL}")
+        logger.info(f"   Voice  : {self.openai_voice}")
         logger.info("=" * 60)
 
-        if not self.ai_client:
-            logger.error("❌ Cannot start - Azure OpenAI client failed to initialize")
+        if not self.openai_api_key:
+            logger.error("❌ OPENAI_API_KEY not set — cannot start")
             return
 
-        # Test AI connection
         try:
-            logger.info("Testing AI connection...")
-            test_response = await self.ai_client.chat.completions.create(
-                model=self.azure_openai_deployment,
-                messages=[{"role": "user", "content": "Hi"}],
-                max_tokens=5
-            )
-            logger.info("✅ AI connection verified")
-        except Exception as e:
-            logger.error(f"❌ AI connection test failed: {e}")
-            return
-
-        # Test file system access
-        if self.file_access.test_access():
-            logger.info("✅ File system access verified")
-        else:
-            logger.warning("⚠️ Limited file system access")
-
-        # Pre-cache phrases
-        await self._precache_phrases()
-
-        # Connect to ARI
-        try:
-            logger.info(f"Connecting to ARI at {self.ari_base}...")
+            logger.info(f"Connecting to ARI at {self.ari_base} …")
             self.ari_client = await aioari.connect(
-                self.ari_base,
-                self.ari_username,
-                self.ari_password
+                self.ari_base, self.ari_username, self.ari_password
             )
             logger.info("✅ ARI connected")
 
-            # Register event handlers
-            self.ari_client.on_event("StasisStart", self._handle_stasis_start)
-            self.ari_client.on_event("StasisEnd", self._handle_stasis_end)
+            self.ari_client.on_event("StasisStart",        self._handle_stasis_start)
+            self.ari_client.on_event("StasisEnd",          self._handle_stasis_end)
             self.ari_client.on_event("ChannelHangupRequest", self._handle_hangup_request)
 
+            logger.info("🎙️  READY — waiting for calls")
             logger.info("=" * 60)
-            logger.info("🎙️ SYSTEM READY - Waiting for calls")
-            logger.info(f"   ARI App: {self.ari_app}")
-            logger.info(f"   AI Model: {self.azure_openai_deployment}")
-            logger.info("=" * 60)
-
             await self.ari_client.run(apps=self.ari_app)
 
         except Exception as e:
-            logger.error(f"❌ ARI connection error: {e}")
+            logger.error(f"❌ ARI error: {e}")
             self.running = False
 
     async def stop(self):
-        """Stop the ARI agent"""
-        logger.info("Stopping ARI agent...")
         self.running = False
-
-        for call in list(self.active_calls.values()):
-            try:
-                await call.hangup()
-            except:
-                pass
-
+        for session in list(self.active_calls.values()):
+            await session.close()
         if self.ari_client:
             try:
                 await self.ari_client.close()
-            except:
+            except Exception:
                 pass
+        logger.info("ARIAgent stopped")
 
-        logger.info("ARI agent stopped")
-
-    async def _precache_phrases(self):
-        """Pre-cache common TTS phrases"""
-        phrases = [
-            "Good morning, thank you for calling. How can I help you today?",
-            "Good afternoon, thank you for calling. How can I help you today?",
-            "Good evening, thank you for calling. How can I help you today?",
-            "Thank you for calling!",
-            "Could you repeat that please?",
-            "Let me transfer you to a specialist who can help. Please hold.",
-        ]
-
-        logger.info("Caching common phrases...")
-        for phrase in phrases:
-            await self.sound_cache.get(phrase, self.file_access)
+    # ── ARI event handlers ────────────────────────────────────────────────────
 
     def _handle_stasis_start(self, event):
         asyncio.create_task(self._process_call(event))
 
     def _handle_stasis_end(self, event):
-        """Handle when a channel leaves the Stasis application"""
         channel_id = event.get("channel", {}).get("id")
-        if channel_id and channel_id in self.active_calls:
-            logger.info(f"📴 Channel {channel_id[:12]} left Stasis (user hung up)")
-            call = self.active_calls[channel_id]
-            call.user_hung_up = True
-            call.active = False
+        if channel_id in self.active_calls:
+            logger.info(f"📴 Channel {channel_id[:12]} left Stasis")
+            self.active_calls[channel_id].caller_hung_up = True
 
     def _handle_hangup_request(self, event):
-        """Handle hangup request event"""
         channel_id = event.get("channel", {}).get("id")
-        if channel_id and channel_id in self.active_calls:
-            logger.info(f"📴 Hangup requested for {channel_id[:12]}")
-            call = self.active_calls[channel_id]
-            call.user_hung_up = True
-            call.active = False
+        if channel_id in self.active_calls:
+            self.active_calls[channel_id].caller_hung_up = True
 
     async def _process_call(self, event):
         channel_id = event.get("channel", {}).get("id")
         if not channel_id:
             return
-
         try:
             channel = await self.ari_client.channels.get(channelId=channel_id)
             await self._handle_call(channel)
@@ -243,884 +170,571 @@ When you cannot help or the caller requests a human, say you will transfer them 
             logger.error(f"❌ Call processing error: {e}")
 
     async def _handle_call(self, channel):
-        caller_number = channel.json.get('caller', {}).get('number', 'Unknown')
-        channel_state = channel.json.get('state', 'Unknown')
-        logger.info(f"📞 Incoming call from {caller_number} (State: {channel_state})")
+        caller_number = channel.json.get("caller", {}).get("number", "Unknown")
+        logger.info(f"📞 Incoming call from {caller_number}")
 
-        call = CallInstance(
-            channel=channel,
-            ari_client=self.ari_client,
-            ai_client=self.ai_client,
-            sound_cache=self.sound_cache,
-            file_access=self.file_access,
-            transcriber=self.transcriber,
-            system_prompt=self.system_prompt,
-            deployment=self.azure_openai_deployment,
-            ari_url=self.ari_url,
-            ari_username=self.ari_username,
-            ari_password=self.ari_password,
-            flask_app=self.flask_app
+        rtp_port = await self._alloc_rtp_port()
+
+        session = RealtimeCallSession(
+            channel       = channel,
+            ari_client    = self.ari_client,
+            openai_api_key= self.openai_api_key,
+            openai_voice  = self.openai_voice,
+            system_prompt = self.system_prompt,
+            rtp_port      = rtp_port,
+            ari_url       = self.ari_url,
+            ari_username  = self.ari_username,
+            ari_password  = self.ari_password,
+            flask_app     = self.flask_app,
         )
 
-        self.active_calls[channel.id] = call
+        self.active_calls[channel.id] = session
         self.total_calls += 1
-
-        self._log_call_start(call.id, caller_number)
+        self._db_log_call_start(channel.id, caller_number)
 
         try:
-            await call.process()
+            await session.run()
         except Exception as e:
-            logger.error(f"❌ Call error: {e}")
-            self._log_call_error(call.id, str(e))
+            logger.error(f"❌ Session error: {e}")
+            self._db_log_call_error(channel.id, str(e))
         finally:
-            if channel.id in self.active_calls:
-                del self.active_calls[channel.id]
-            await call.cleanup()
-            self._log_call_end(call)
+            self.active_calls.pop(channel.id, None)
+            await session.close()
+            self._db_log_call_end(session)
 
-    def _log_call_start(self, call_id, caller_number):
-        """Log call start to database with proper application context"""
+    # ── DB helpers ────────────────────────────────────────────────────────────
+
+    def _db_log_call_start(self, call_id, caller_number):
         if not self.flask_app:
-            logger.warning("Flask app not available - skipping database logging")
             return
-
         try:
             with self.flask_app.app_context():
                 from models import db, Call
-                call = Call(
-                    call_id=call_id,
-                    caller_number=caller_number,
-                    status='active',
-                    started_at=datetime.utcnow()
-                )
-                db.session.add(call)
+                db.session.add(Call(
+                    call_id       = call_id,
+                    caller_number = caller_number,
+                    status        = "active",
+                    started_at    = datetime.utcnow(),
+                ))
                 db.session.commit()
-                logger.info(f"✅ Call {call_id} logged to database")
         except Exception as e:
-            logger.error(f"Failed to log call start: {e}")
+            logger.error(f"DB log start error: {e}")
 
-    def _log_call_error(self, call_id, error_msg):
-        """Log call error to database with proper application context"""
+    def _db_log_call_error(self, call_id, error_msg):
         if not self.flask_app:
             return
-
         try:
             with self.flask_app.app_context():
                 from models import db, Call
-                call = Call.query.filter_by(call_id=call_id).first()
-                if call:
-                    call.status = 'error'
-                    call.ended_at = datetime.utcnow()
+                c = Call.query.filter_by(call_id=call_id).first()
+                if c:
+                    c.status     = "error"
+                    c.ended_at   = datetime.utcnow()
                     db.session.commit()
         except Exception as e:
-            logger.error(f"Failed to log error: {e}")
+            logger.error(f"DB log error error: {e}")
 
-    def _log_call_end(self, call_instance):
-        """Log call end to database with proper application context"""
+    def _db_log_call_end(self, session: "RealtimeCallSession"):
         if not self.flask_app:
             return
-
         try:
             with self.flask_app.app_context():
                 from models import db, Call
-                call = Call.query.filter_by(call_id=call_instance.id).first()
-                if call:
-                    if call_instance.escalated:
-                        call.status = 'escalated'
-                        call.escalated = True
-                        call.escalated_to_department_id = call_instance.escalated_to_dept_id
-                        call.escalation_reason = call_instance.escalation_reason
-                    elif call_instance.user_hung_up:
-                        call.status = 'completed'
-                    else:
-                        call.status = 'completed'
-
-                    call.ended_at = datetime.utcnow()
-                    if call.started_at:
-                        call.duration_seconds = int((call.ended_at - call.started_at).total_seconds())
-                    call.total_interactions = call_instance.turn_count
+                c = Call.query.filter_by(call_id=session.channel_id).first()
+                if c:
+                    c.status            = "escalated" if session.escalated else "completed"
+                    c.escalated         = session.escalated
+                    c.ended_at          = datetime.utcnow()
+                    if c.started_at:
+                        c.duration_seconds = int(
+                            (c.ended_at - c.started_at).total_seconds()
+                        )
                     db.session.commit()
-                    logger.info(f"✅ Call {call_instance.id} completed - logged to database")
         except Exception as e:
-            logger.error(f"Failed to log call end: {e}")
+            logger.error(f"DB log end error: {e}")
 
 
-class CallInstance:
-    """Represents a single call with knowledge base and transfer capability"""
+# ─────────────────────────────────────────────────────────────────────────────
+# RealtimeCallSession
+# ─────────────────────────────────────────────────────────────────────────────
 
-    def __init__(self, channel, ari_client, ai_client, sound_cache, file_access,
-                 transcriber, system_prompt, deployment, ari_url, ari_username, ari_password,
-                 flask_app=None):
-        self.channel = channel
-        self.ari_client = ari_client
-        self.ai_client = ai_client
-        self.sound_cache = sound_cache
-        self.file_access = file_access
-        self.transcriber = transcriber
-        self.system_prompt = system_prompt
-        self.deployment = deployment
-        self.ari_url = ari_url
-        self.ari_username = ari_username
-        self.ari_password = ari_password
-        self.flask_app = flask_app
+class RealtimeCallSession:
+    """
+    One session per inbound call.
 
-        self.id = channel.id
-        self.active = True
-        self.user_hung_up = False
-        self.escalated = False
-        self.escalated_to_dept_id = None
-        self.escalation_reason = None
-        self.temp_files = []
-        self.turn_count = 0
-        self.conversation = [{"role": "system", "content": system_prompt}]
+    Flow:
+      1. Answer the call via ARI.
+      2. Create a mixing bridge.
+      3. Create an ExternalMedia channel → Asterisk will RTP audio to us on `rtp_port`.
+      4. Open a UDP socket to receive that RTP stream.
+      5. Open a WebSocket to OpenAI Realtime API.
+      6. Pump audio: UDP → base64 → OpenAI WS  (caller speech)
+                     OpenAI WS → base64 → UDP   (AI speech back)
+      7. Parse Realtime events for transcripts, VAD boundaries, and function calls.
+      8. On transfer intent detected → continueInDialplan.
+    """
 
-    def _get_knowledge_context(self, user_text):
-        """Get relevant knowledge base entries for the user's query"""
-        if not self.flask_app:
-            return ""
+    TRANSFER_KEYWORDS = {
+        "speak", "talk", "human", "person", "agent",
+        "representative", "manager", "supervisor", "someone",
+        "transfer", "escalate", "real person",
+    }
 
+    def __init__(self, *, channel, ari_client, openai_api_key, openai_voice,
+                 system_prompt, rtp_port, ari_url, ari_username, ari_password,
+                 flask_app):
+        self.channel        = channel
+        self.channel_id     = channel.id
+        self.ari_client     = ari_client
+        self.openai_api_key = openai_api_key
+        self.openai_voice   = openai_voice
+        self.system_prompt  = system_prompt
+        self.rtp_port       = rtp_port
+        self.ari_url        = ari_url
+        self.ari_username   = ari_username
+        self.ari_password   = ari_password
+        self.flask_app      = flask_app
+
+        self.caller_hung_up  = False
+        self.escalated       = False
+        self._closed         = False
+
+        # RTP state
+        self._udp_sock: socket.socket | None = None
+        self._asterisk_rtp_addr: tuple | None = None  # (ip, port) — learned from first packet
+        self._rtp_seq   = 0
+        self._rtp_ts    = 0
+        self._rtp_ssrc  = 0xDEADBEEF
+
+        # OpenAI WS
+        self._openai_ws = None
+
+        # Bridge & external media channel IDs
+        self._bridge_id    = None
+        self._ext_channel_id = None
+
+        # Queues
+        self._audio_to_openai: asyncio.Queue[bytes] = asyncio.Queue(maxsize=500)
+        self._audio_to_asterisk: asyncio.Queue[bytes] = asyncio.Queue(maxsize=500)
+
+    # ── main run ──────────────────────────────────────────────────────────────
+
+    async def run(self):
+        """Answer → bridge → ExternalMedia → Realtime WebSocket → pump."""
         try:
-            with self.flask_app.app_context():
-                from models import KnowledgeBase
+            # 1. Answer
+            await self.channel.answer()
+            logger.info(f"✅ [{self.channel_id[:12]}] Call answered")
+            await asyncio.sleep(0.3)
 
-                # Search for relevant knowledge entries
-                user_lower = user_text.lower()
-                all_entries = KnowledgeBase.query.filter_by(is_active=True).all()
+            # 2. Create bridge
+            bridge = await self.ari_client.bridges.create(type="mixing")
+            self._bridge_id = bridge.id
+            await bridge.addChannel(channel=self.channel_id)
+            logger.info(f"🌉 [{self.channel_id[:12]}] Bridge created: {self._bridge_id}")
 
-                scored_entries = []
-                for entry in all_entries:
-                    score = 0
-                    keywords = json.loads(entry.keywords) if entry.keywords else []
+            # 3. Open UDP socket BEFORE creating ExternalMedia
+            self._udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._udp_sock.bind((RTP_LISTEN_HOST, self.rtp_port))
+            self._udp_sock.setblocking(False)
+            logger.info(f"🔌 [{self.channel_id[:12]}] UDP RTP listening on port {self.rtp_port}")
 
-                    # Score based on keyword matches
-                    for keyword in keywords:
-                        if keyword.lower() in user_lower:
-                            score += 2
+            # 4. Create ExternalMedia channel — Asterisk will push RTP here
+            ext_channel = await self.ari_client.channels.externalMedia(
+                app           = os.getenv("ARI_APP", "ai-agent"),
+                external_host = f"127.0.0.1:{self.rtp_port}",
+                format        = "ulaw",   # μ-law 8 kHz — what Asterisk prefers
+                encapsulation = "rtp",
+                transport     = "udp",
+                connection_type = "client",
+                direction     = "both",
+            )
+            self._ext_channel_id = ext_channel.id
+            await bridge.addChannel(channel=self._ext_channel_id)
+            logger.info(f"📡 [{self.channel_id[:12]}] ExternalMedia channel: {self._ext_channel_id}")
 
-                    # Score based on title match
-                    if any(word in user_lower for word in entry.title.lower().split()):
-                        score += 1
+            # 5. Connect to OpenAI Realtime
+            await self._connect_openai()
 
-                    if score > 0:
-                        scored_entries.append((score, entry))
+            # 6. Run all pumps concurrently until call ends
+            await asyncio.gather(
+                self._recv_rtp_loop(),
+                self._send_rtp_loop(),
+                self._openai_recv_loop(),
+                self._openai_send_loop(),
+                return_exceptions=True,
+            )
 
-                # Sort by score and take top 2
-                scored_entries.sort(reverse=True, key=lambda x: x[0])
-                top_entries = scored_entries[:2]
-
-                if not top_entries:
-                    return ""
-
-                # Format knowledge context
-                context_parts = ["\n\nRELEVANT COMPANY INFORMATION:"]
-                for _, entry in top_entries:
-                    context_parts.append(f"\n{entry.title}: {entry.content}")
-
-                    # Track usage
-                    entry.increment_usage()
-                    from models import db
-                    db.session.commit()
-
-                return "".join(context_parts)
-
+        except asyncio.CancelledError:
+            pass
         except Exception as e:
-            logger.error(f"Error getting knowledge context: {e}")
-            return ""
+            logger.error(f"❌ [{self.channel_id[:12]}] Session run error: {e}", exc_info=True)
+        finally:
+            await self.close()
 
-    def _detect_transfer_intent(self, user_text):
-        """Detect if user wants to speak with a human agent"""
-        transfer_keywords = [
-            'speak', 'talk', 'human', 'person', 'agent',
-            'representative', 'manager', 'supervisor', 'someone',
-            'transfer', 'escalate', 'real person'
-        ]
+    # ── OpenAI WebSocket ──────────────────────────────────────────────────────
 
-        user_lower = user_text.lower()
-        return any(keyword in user_lower for keyword in transfer_keywords)
-
-    def _classify_intent(self, user_text):
-        """Simple intent classification based on keywords"""
-        user_lower = user_text.lower()
-
-        intent_keywords = {
-            'sales': ['buy', 'purchase', 'new policy', 'quote', 'coverage', 'insurance'],
-            'claims': ['claim', 'accident', 'damage', 'file', 'incident'],
-            'billing': ['bill', 'payment', 'pay', 'invoice', 'charge', 'cost'],
-            'support': ['help', 'question', 'how', 'what', 'when', 'status']
+    async def _connect_openai(self):
+        headers = {
+            "Authorization": f"Bearer {self.openai_api_key}",
+            "OpenAI-Beta":   "realtime=v1",
         }
+        self._openai_ws = await websockets.connect(
+            REALTIME_URL,
+            additional_headers=headers,
+            ping_interval=20,
+            ping_timeout=30,
+        )
+        logger.info(f"🔗 [{self.channel_id[:12]}] OpenAI Realtime WS connected")
 
-        for intent_type, keywords in intent_keywords.items():
-            if any(keyword in user_lower for keyword in keywords):
-                return intent_type
+        # Configure session
+        await self._openai_ws.send(json.dumps({
+            "type": "session.update",
+            "session": {
+                "modalities":      ["audio", "text"],
+                "voice":           self.openai_voice,
+                "instructions":    self.system_prompt,
+                "input_audio_format":  "pcm16",
+                "output_audio_format": "pcm16",
+                "input_audio_transcription": {"model": "whisper-1"},
+                "turn_detection": {
+                    "type":               "server_vad",
+                    "threshold":          0.5,
+                    "prefix_padding_ms":  300,
+                    "silence_duration_ms": 600,
+                },
+                "temperature": 0.7,
+            },
+        }))
+        logger.info(f"⚙️  [{self.channel_id[:12]}] Realtime session configured")
 
-        return 'general'
+    # ── RTP receive (Asterisk → queue → OpenAI) ───────────────────────────────
 
-    def _get_department_for_intent(self, intent_type):
-        """Get the appropriate department based on intent"""
+    async def _recv_rtp_loop(self):
+        """Read μ-law RTP from Asterisk, convert to PCM16 24kHz, enqueue for OpenAI."""
+        loop = asyncio.get_running_loop()
+        while not self.caller_hung_up and not self._closed:
+            try:
+                # Non-blocking read from UDP socket
+                data, addr = await loop.run_in_executor(
+                    None, self._udp_sock.recvfrom, 4096
+                )
+                if not self._asterisk_rtp_addr:
+                    self._asterisk_rtp_addr = addr
+                    logger.info(
+                        f"📻 [{self.channel_id[:12]}] "
+                        f"Asterisk RTP source: {addr[0]}:{addr[1]}"
+                    )
+
+                # Strip 12-byte RTP header
+                if len(data) <= RTP_HEADER_SIZE:
+                    continue
+                ulaw_payload = data[RTP_HEADER_SIZE:]
+
+                # μ-law → PCM16 @ 8 kHz
+                pcm8 = audioop.ulaw2lin(ulaw_payload, 2)
+
+                # Upsample 8 kHz → 24 kHz (3× linear interpolation)
+                pcm24, _ = audioop.ratecv(pcm8, 2, 1, ASTERISK_SAMPLE_RATE, OPENAI_SAMPLE_RATE, None)
+
+                await self._audio_to_openai.put(pcm24)
+
+            except BlockingIOError:
+                await asyncio.sleep(0.005)
+            except Exception as e:
+                if not self._closed:
+                    logger.debug(f"RTP recv error: {e}")
+                break
+
+    # ── OpenAI send (queue → WS) ──────────────────────────────────────────────
+
+    async def _openai_send_loop(self):
+        """Pull PCM chunks from queue and send to OpenAI Realtime as base64."""
+        while not self.caller_hung_up and not self._closed:
+            try:
+                chunk = await asyncio.wait_for(
+                    self._audio_to_openai.get(), timeout=0.5
+                )
+                if self._openai_ws and not self._openai_ws.closed:
+                    await self._openai_ws.send(json.dumps({
+                        "type":  "input_audio_buffer.append",
+                        "audio": base64.b64encode(chunk).decode(),
+                    }))
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                if not self._closed:
+                    logger.debug(f"OpenAI send error: {e}")
+                break
+
+    # ── OpenAI receive (WS → queue / events) ─────────────────────────────────
+
+    async def _openai_recv_loop(self):
+        """
+        Receive events from OpenAI Realtime:
+          - response.audio.delta  → enqueue PCM for sending back to Asterisk
+          - conversation.item.input_audio_transcription.completed → check transfer intent
+          - response.done / error → logging
+        """
+        while not self.caller_hung_up and not self._closed:
+            try:
+                if not self._openai_ws:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                raw = await asyncio.wait_for(
+                    self._openai_ws.recv(), timeout=1.0
+                )
+                event = json.loads(raw)
+                etype = event.get("type", "")
+
+                if etype == "response.audio.delta":
+                    # Decode PCM16 24kHz from OpenAI
+                    pcm24 = base64.b64decode(event["delta"])
+                    # Downsample 24 kHz → 8 kHz
+                    pcm8, _ = audioop.ratecv(pcm24, 2, 1, OPENAI_SAMPLE_RATE, ASTERISK_SAMPLE_RATE, None)
+                    # PCM16 → μ-law
+                    ulaw = audioop.lin2ulaw(pcm8, 2)
+                    await self._audio_to_asterisk.put(ulaw)
+
+                elif etype == "conversation.item.input_audio_transcription.completed":
+                    transcript = event.get("transcript", "")
+                    logger.info(f"👤 [{self.channel_id[:12]}] Caller: {transcript}")
+                    self._db_log_transcript("caller", transcript, 1.0)
+                    # Check for transfer intent
+                    if self._detect_transfer_intent(transcript):
+                        logger.info(f"🔀 [{self.channel_id[:12]}] Transfer intent detected")
+                        await self._handle_escalation(transcript)
+
+                elif etype == "response.audio_transcript.delta":
+                    # Streamed AI transcript — ignore or accumulate
+                    pass
+
+                elif etype == "response.done":
+                    item = event.get("response", {})
+                    usage = item.get("usage", {})
+                    logger.debug(
+                        f"🤖 [{self.channel_id[:12]}] Response done "
+                        f"(tokens: {usage.get('total_tokens', '?')})"
+                    )
+
+                elif etype == "error":
+                    logger.error(
+                        f"❌ OpenAI Realtime error: {event.get('error', event)}"
+                    )
+
+                elif etype == "session.created":
+                    logger.info(
+                        f"✅ [{self.channel_id[:12]}] Realtime session created: "
+                        f"{event.get('session', {}).get('id', '')}"
+                    )
+
+            except asyncio.TimeoutError:
+                continue
+            except websockets.exceptions.ConnectionClosed:
+                if not self._closed:
+                    logger.warning(f"⚠️  [{self.channel_id[:12]}] OpenAI WS closed")
+                break
+            except Exception as e:
+                if not self._closed:
+                    logger.debug(f"OpenAI recv error: {e}")
+                break
+
+    # ── RTP send (queue → Asterisk) ───────────────────────────────────────────
+
+    async def _send_rtp_loop(self):
+        """
+        Pull μ-law chunks from queue and send back to Asterisk via RTP.
+        We build minimal RTP packets (sequence + timestamp + SSRC).
+        """
+        loop = asyncio.get_running_loop()
+        while not self.caller_hung_up and not self._closed:
+            try:
+                ulaw_chunk = await asyncio.wait_for(
+                    self._audio_to_asterisk.get(), timeout=0.5
+                )
+                if not self._asterisk_rtp_addr or not self._udp_sock:
+                    continue
+
+                # Build RTP packet
+                # Each μ-law byte = 1 sample @ 8 kHz → 125 μs per sample
+                n_samples = len(ulaw_chunk)
+                rtp_pkt   = self._build_rtp_packet(ulaw_chunk)
+                self._rtp_ts  += n_samples
+                self._rtp_seq = (self._rtp_seq + 1) & 0xFFFF
+
+                await loop.run_in_executor(
+                    None,
+                    self._udp_sock.sendto,
+                    rtp_pkt,
+                    self._asterisk_rtp_addr,
+                )
+
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                if not self._closed:
+                    logger.debug(f"RTP send error: {e}")
+                break
+
+    def _build_rtp_packet(self, payload: bytes) -> bytes:
+        """Minimal RTP/AVP header (RFC 3550) + μ-law payload (PT=0)."""
+        header = struct.pack(
+            "!BBHII",
+            0x80,           # V=2, P=0, X=0, CC=0
+            0x00,           # M=0, PT=0 (PCMU / μ-law)
+            self._rtp_seq,
+            self._rtp_ts,
+            self._rtp_ssrc,
+        )
+        return header + payload
+
+    # ── Transfer / escalation ─────────────────────────────────────────────────
+
+    def _detect_transfer_intent(self, text: str) -> bool:
+        lower = text.lower()
+        return any(kw in lower for kw in self.TRANSFER_KEYWORDS)
+
+    async def _handle_escalation(self, transcript: str):
+        """Route caller to appropriate department via dialplan continue."""
+        intent = self._classify_intent(transcript)
+        dept   = self._get_department_for_intent(intent)
+
+        if dept:
+            logger.info(
+                f"🔀 [{self.channel_id[:12]}] "
+                f"Transferring to {dept.name} (ext {dept.extension})"
+            )
+            self.escalated = True
+            try:
+                await self.channel.continueInDialplan(
+                    context   = "from-internal",
+                    extension = dept.extension,
+                    priority  = 1,
+                )
+            except Exception as e:
+                logger.error(f"Transfer error: {e}")
+        else:
+            logger.warning(f"⚠️  [{self.channel_id[:12]}] No department found for intent '{intent}'")
+
+    def _classify_intent(self, text: str) -> str:
+        lower = text.lower()
+        if any(w in lower for w in ["buy", "quote", "new policy", "coverage"]):
+            return "sales"
+        if any(w in lower for w in ["claim", "accident", "damage"]):
+            return "claims"
+        if any(w in lower for w in ["bill", "payment", "pay", "invoice"]):
+            return "billing"
+        return "support"
+
+    def _get_department_for_intent(self, intent_type: str):
         if not self.flask_app:
             return None
-
         try:
             with self.flask_app.app_context():
                 from models import Department, RoutingRule
-
-                # Try to find a routing rule for this intent
                 rule = RoutingRule.query.filter_by(
-                    intent_type=intent_type,
-                    is_active=True
+                    intent_type=intent_type, is_active=True
                 ).order_by(RoutingRule.priority.desc()).first()
-
                 if rule and rule.department:
                     return rule.department
-
-                # Fallback: find department by name matching intent
-                dept_name_map = {
-                    'sales': 'Sales',
-                    'claims': 'Claims',
-                    'billing': 'Billing',
-                    'support': 'Support'
+                name_map = {
+                    "sales": "Sales", "claims": "Claims",
+                    "billing": "Billing", "support": "Support",
                 }
-
-                if intent_type in dept_name_map:
-                    dept = Department.query.filter_by(
-                        name=dept_name_map[intent_type],
-                        is_active=True
+                if intent_type in name_map:
+                    d = Department.query.filter_by(
+                        name=name_map[intent_type], is_active=True
                     ).first()
-                    if dept:
-                        return dept
-
-                # Ultimate fallback: highest priority department
+                    if d:
+                        return d
                 return Department.query.filter_by(is_active=True).order_by(
                     Department.priority.desc()
                 ).first()
-
         except Exception as e:
-            logger.error(f"Error getting department: {e}")
+            logger.error(f"Dept lookup error: {e}")
             return None
 
-    async def transfer_to_department(self, department):
-        """Actually transfer the call to a department extension"""
-        try:
-            logger.info(f"🔀 Transferring call to {department.name} (ext {department.extension})")
+    # ── DB transcript helper ──────────────────────────────────────────────────
 
-            # Inform the caller
-            transfer_msg = f"Transferring you to {department.name} now. Please hold."
-            await self.speak(transfer_msg)
-            self._log_transcript('assistant', transfer_msg, 1.0)
-
-            await asyncio.sleep(0.5)
-
-            # Perform the transfer using ARI
-            # This continues the call to the specified extension in the dialplan
-            await self.channel.continueInDialplan(
-                context='from-internal',  # FreePBX default context
-                extension=department.extension,
-                priority=1
-            )
-
-            logger.info(f"✅ Call transferred to extension {department.extension}")
-            self.escalated = True
-            self.escalated_to_dept_id = department.id
-            self.escalation_reason = f"User requested transfer to {department.name}"
-
-            # Log the intent
-            self._log_intent('escalation', 1.0, f"Transferred to {department.name}")
-
-            return True
-
-        except Exception as e:
-            logger.error(f"❌ Transfer failed: {e}")
-            await self.speak(
-                "I apologize, but I'm having trouble transferring your call. Please hold while I try again.")
-            return False
-
-    async def process(self):
-        try:
-            # Answer the call
-            channel_state = self.channel.json.get('state', 'Unknown')
-            logger.info(f"Channel state before answer: {channel_state}")
-
-            try:
-                await self.channel.answer()
-                logger.info("✅ Call answered successfully")
-            except Exception as e:
-                logger.error(f"Failed to answer call: {e}")
-                current_channel = await self.ari_client.channels.get(channelId=self.id)
-                current_state = current_channel.json.get('state', 'Unknown')
-                if current_state.lower() != 'up':
-                    raise
-                logger.info("Channel is already up, continuing...")
-
-            await asyncio.sleep(0.2)
-
-            # Greeting
-            hour = datetime.now().hour
-            time_greeting = 'Good morning' if hour < 12 else 'Good afternoon' if hour < 17 else 'Good evening'
-            greeting = f"{time_greeting}, thank you for calling Jubilee Insurance. How can I help you today?"
-
-            if not await self.speak(greeting):
-                return
-
-            self.conversation.append({"role": "assistant", "content": greeting})
-            await asyncio.sleep(0.1)
-
-            if not await self.is_alive():
-                return
-
-            await self.channel.play(media="sound:beep")
-            await asyncio.sleep(0.15)
-
-            no_speech_count = 0
-            for turn in range(8):
-                if self.user_hung_up or not await self.is_alive():
-                    logger.info("📡 Call ended by user")
-                    break
-
-                self.turn_count += 1
-
-                audio_file = await self.record()
-
-                if self.user_hung_up or not await self.is_alive():
-                    logger.info("📡 User hung up during recording")
-                    break
-
-                await self.channel.play(media="sound:beep")
-                await asyncio.sleep(0.1)
-
-                if not audio_file:
-                    no_speech_count += 1
-                    if no_speech_count >= 2:
-                        await self.speak("I'm having trouble hearing you. Please try calling back.")
-                        break
-
-                    if not await self.speak("I didn't catch that. Please go ahead."):
-                        break
-
-                    await asyncio.sleep(0.1)
-                    if not await self.is_alive():
-                        break
-
-                    await self.channel.play(media="sound:beep")
-                    await asyncio.sleep(0.15)
-                    continue
-
-                text, confidence = await self.transcriber.transcribe(audio_file)
-                no_speech_count = 0
-
-                if not text or len(text) < 3:
-                    if not await self.speak("Could you repeat that please?"):
-                        break
-
-                    await asyncio.sleep(0.1)
-                    if not await self.is_alive():
-                        break
-
-                    await self.channel.play(media="sound:beep")
-                    await asyncio.sleep(0.15)
-                    continue
-
-                logger.info(f"👤 User: {text}")
-                self._log_transcript('caller', text, confidence)
-
-                # Check for goodbye
-                if len(text.split()) <= 5 and any(w in text.lower() for w in ["bye", "goodbye", "thanks", "done"]):
-                    goodbye = "Thank you for calling!"
-                    await self.speak(goodbye)
-                    self._log_transcript('assistant', goodbye, 1.0)
-                    break
-
-                # Check if user wants to be transferred
-                if self._detect_transfer_intent(text):
-                    logger.info("🔀 Transfer intent detected")
-
-                    # Classify the intent to determine department
-                    intent_type = self._classify_intent(text)
-                    logger.info(f"📊 Intent classified as: {intent_type}")
-                    self._log_intent(intent_type, 0.8, text)
-
-                    # Get the appropriate department
-                    department = self._get_department_for_intent(intent_type)
-
-                    if department:
-                        # Perform the transfer
-                        success = await self.transfer_to_department(department)
-                        if success:
-                            # Call will continue in dialplan, exit our loop
-                            return
-                        else:
-                            # Transfer failed, continue conversation
-                            error_msg = "I apologize for the difficulty. Let me try to help you another way. What can I assist you with?"
-                            await self.speak(error_msg)
-                            self._log_transcript('assistant', error_msg, 1.0)
-                            continue
-                    else:
-                        # No department found
-                        logger.warning("⚠️ No department found for transfer")
-                        fallback_msg = "I'd like to connect you with someone, but I'm having trouble right now. Can I help you with something else?"
-                        await self.speak(fallback_msg)
-                        self._log_transcript('assistant', fallback_msg, 1.0)
-                        continue
-
-                # Get knowledge base context for this query
-                knowledge_context = self._get_knowledge_context(text)
-
-                # Build AI message with knowledge
-                user_message_with_context = text
-                if knowledge_context:
-                    user_message_with_context = f"{text}{knowledge_context}"
-
-                self.conversation.append({"role": "user", "content": user_message_with_context})
-
-                try:
-                    response = await self.ai_client.chat.completions.create(
-                        model=self.deployment,
-                        messages=self.conversation,
-                        max_tokens=60,
-                        temperature=0.5
-                    )
-
-                    ai_text = response.choices[0].message.content.strip()
-
-                    # Store only the response without knowledge context
-                    self.conversation.append({"role": "assistant", "content": ai_text})
-                    logger.info(f"🤖 AI: {ai_text}")
-
-                    self._log_transcript('assistant', ai_text, 1.0)
-
-                    if not await self.speak(ai_text):
-                        break
-
-                    await asyncio.sleep(0.1)
-                    if not await self.is_alive():
-                        break
-
-                    await self.channel.play(media="sound:beep")
-                    await asyncio.sleep(0.15)
-
-                except Exception as e:
-                    logger.error(f"AI error: {e}")
-                    error_msg = "Technical issue. Let me connect you to someone."
-                    await self.speak(error_msg)
-                    self._log_transcript('assistant', error_msg, 1.0)
-
-                    # Try to transfer to support
-                    dept = self._get_department_for_intent('support')
-                    if dept:
-                        await self.transfer_to_department(dept)
-                        return
-                    break
-
-            # Only say goodbye if user didn't hang up and we're not transferring
-            if self.active and not self.user_hung_up and not self.escalated and await self.is_alive():
-                final_msg = "Thank you for calling!"
-                await self.speak(final_msg)
-                self._log_transcript('assistant', final_msg, 1.0)
-
-            await self.hangup()
-
-        except Exception as e:
-            if "Not Found" in str(e):
-                logger.info("📡 User hung up (channel not found)")
-                self.user_hung_up = True
-            else:
-                logger.error(f"Call processing error: {e}")
-            await self.hangup()
-
-    def _log_transcript(self, speaker, text, confidence):
-        """Log transcript to database with proper application context"""
-        if not self.flask_app:
+    def _db_log_transcript(self, speaker: str, text: str, confidence: float):
+        if not self.flask_app or not text:
             return
-
         try:
             with self.flask_app.app_context():
                 from models import db, Call, CallTranscript
-
-                call = Call.query.filter_by(call_id=self.id).first()
-                if not call:
-                    return
-
-                transcript = CallTranscript(
-                    call_id=call.id,
-                    speaker=speaker,
-                    text=text,
-                    confidence=confidence if isinstance(confidence, float) else 0.0,
-                    timestamp=datetime.utcnow()
-                )
-                db.session.add(transcript)
-                db.session.commit()
-
+                call = Call.query.filter_by(call_id=self.channel_id).first()
+                if call:
+                    db.session.add(CallTranscript(
+                        call_id    = call.id,
+                        speaker    = speaker,
+                        text       = text,
+                        confidence = confidence,
+                        timestamp  = datetime.utcnow(),
+                    ))
+                    db.session.commit()
         except Exception as e:
-            logger.error(f"Failed to log transcript: {e}")
+            logger.error(f"DB transcript error: {e}")
 
-    def _log_intent(self, intent_type, confidence, context):
-        """Log detected intent to database"""
-        if not self.flask_app:
+    # ── cleanup ───────────────────────────────────────────────────────────────
+
+    async def close(self):
+        if self._closed:
             return
+        self._closed = True
 
-        try:
-            with self.flask_app.app_context():
-                from models import db, Call, CallIntent
-
-                call = Call.query.filter_by(call_id=self.id).first()
-                if not call:
-                    return
-
-                intent = CallIntent(
-                    call_id=call.id,
-                    intent_type=intent_type,
-                    confidence=confidence,
-                    context=context,
-                    detected_at=datetime.utcnow()
-                )
-                db.session.add(intent)
-                db.session.commit()
-
-        except Exception as e:
-            logger.error(f"Failed to log intent: {e}")
-
-    async def is_alive(self):
-        """Check if channel is still active"""
-        if not self.active or self.user_hung_up:
-            return False
-        try:
-            await self.ari_client.channels.get(channelId=self.id)
-            return True
-        except Exception as e:
-            if "Not Found" in str(e):
-                self.user_hung_up = True
-            self.active = False
-            return False
-
-    async def speak(self, text):
-        """Speak text to user, return False if call ended"""
-        if not await self.is_alive():
-            return False
-
-        try:
-            sound_path, duration = await self.sound_cache.get(text, self.file_access)
-            if not sound_path:
-                return False
-
-            await self.channel.play(media=f"sound:{sound_path}")
-            estimated_duration = duration or (len(text.split()) * 0.4)
-            await asyncio.sleep(estimated_duration + 0.3)
-            return True
-        except Exception as e:
-            if "Not Found" in str(e):
-                self.user_hung_up = True
-                logger.info("📡 User hung up during speech")
-            elif "404" not in str(e):
-                logger.error(f"Speak error: {e}")
-            self.active = False
-            return False
-
-    async def record(self, duration=8, silence=2.0):
-        """Record audio from user"""
-        if not await self.is_alive():
-            return None
-
-        name = f"rec_{self.id}_{int(time.time() * 1000)}"
-        try:
-            recording = await self.channel.record(
-                name=name,
-                format="wav",
-                maxDurationSeconds=duration,
-                maxSilenceSeconds=silence,
-                ifExists="overwrite",
-                terminateOn="none"
-            )
-
-            await asyncio.sleep(duration + 0.5)
-
+        # Close OpenAI WebSocket
+        if self._openai_ws:
             try:
-                await recording.stop()
-            except:
+                await self._openai_ws.close()
+            except Exception:
                 pass
 
-            await asyncio.sleep(0.2)
-            return await self._download_recording(name)
-        except Exception as e:
-            if "Not Found" in str(e):
-                self.user_hung_up = True
-                logger.info("📡 User hung up during recording")
-            else:
-                logger.error(f"Record error: {e}")
-            return None
-
-    async def _download_recording(self, name):
-        """Download recorded audio file"""
-        for attempt in range(3):
+        # Close UDP socket
+        if self._udp_sock:
             try:
-                url = f"{self.ari_url}/recordings/stored/{name}/file"
-                response = requests.get(
-                    url,
-                    auth=(self.ari_username, self.ari_password),
-                    timeout=10
-                )
-
-                if response.status_code == 200 and len(response.content) > 4000:
-                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-                    temp_file.write(response.content)
-                    temp_file.close()
-                    self.temp_files.append(temp_file.name)
-                    return temp_file.name
-            except:
+                self._udp_sock.close()
+            except Exception:
                 pass
-            await asyncio.sleep(0.15)
 
-        return None
+        # Destroy ExternalMedia channel
+        if self._ext_channel_id:
+            try:
+                await self.ari_client.channels.hangup(channelId=self._ext_channel_id)
+            except Exception:
+                pass
 
-    async def hangup(self):
-        """Hang up the call gracefully"""
-        try:
-            if self.active and not self.user_hung_up and not self.escalated:
+        # Destroy bridge
+        if self._bridge_id:
+            try:
+                await self.ari_client.bridges.destroy(bridgeId=self._bridge_id)
+            except Exception:
+                pass
+
+        # Hang up caller channel if still active and not transferred
+        if not self.escalated and not self.caller_hung_up:
+            try:
                 await self.channel.hangup()
-        except Exception as e:
-            if "Not Found" not in str(e):
-                logger.debug(f"Hangup error: {e}")
-        self.active = False
-
-    async def cleanup(self):
-        """Clean up temporary files"""
-        for file_path in self.temp_files:
-            try:
-                os.unlink(file_path)
-            except:
+            except Exception:
                 pass
 
+        logger.info(f"🔒 [{self.channel_id[:12]}] Session closed")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stubs retained for backward compatibility with blueprints that may import them
+# ─────────────────────────────────────────────────────────────────────────────
 
 class SoundCache:
-    """Cache for TTS audio"""
-
-    def __init__(self, cache_dir, index_file, asterisk_sounds_dir,
-                 azure_speech_key=None, azure_speech_region='eastus'):
-        self.cache_dir = cache_dir
-        self.index_file = index_file
-        self.asterisk_sounds_dir = asterisk_sounds_dir
-        self.azure_speech_key = azure_speech_key
-        self.azure_speech_region = azure_speech_region
-        self.index = self._load_index()
-
-    def _load_index(self):
-        if self.index_file.exists():
-            try:
-                return json.load(open(self.index_file))
-            except:
-                return {}
-        return {}
-
-    def _save_index(self):
-        try:
-            json.dump(self.index, open(self.index_file, 'w'))
-        except:
-            pass
-
-    def _cache_key(self, text):
-        return hashlib.md5(text.encode()).hexdigest()
-
-    async def get(self, text, file_access):
-        key = self._cache_key(text)
-
-        if key in self.index and self.index[key].get('remote'):
-            return self.index[key]['remote'], self.index[key].get('duration')
-
-        local_path = await self._generate_tts(text, key)
-        if not local_path:
-            return None, None
-
-        duration = self._get_duration(local_path)
-
-        remote_path = file_access.copy_to_asterisk(local_path, f"c_{key}.wav")
-
-        if remote_path:
-            self.index[key] = {'remote': remote_path, 'duration': duration}
-            self._save_index()
-            return remote_path, duration
-
-        return local_path, duration
-
-    async def _generate_tts(self, text, key):
-        try:
-            output_file = self.cache_dir / f"{key}.wav"
-            if output_file.exists():
-                return str(output_file)
-
-            # Use Azure Speech TTS (faster, no external HTTP round-trip, same region as STT)
-            try:
-                import azure.cognitiveservices.speech as speechsdk
-
-                speech_config = speechsdk.SpeechConfig(
-                    subscription=self.azure_speech_key,
-                    region=self.azure_speech_region
-                )
-                speech_config.speech_synthesis_voice_name = "en-US-AriaNeural"
-                speech_config.set_speech_synthesis_output_format(
-                    speechsdk.SpeechSynthesisOutputFormat.Riff8Khz16BitMonoPcm
-                )
-
-                audio_config = speechsdk.audio.AudioOutputConfig(filename=str(output_file))
-                synthesizer = speechsdk.SpeechSynthesizer(
-                    speech_config=speech_config,
-                    audio_config=audio_config
-                )
-
-                result = await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    lambda: synthesizer.speak_text_async(text).get()
-                )
-
-                if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-                    logger.debug(f"Azure TTS generated: {text[:40]}...")
-                    return str(output_file)
-                else:
-                    logger.error(f"Azure TTS failed: {result.reason}")
-                    # Fall through to gTTS fallback
-
-            except Exception as e:
-                logger.warning(f"Azure TTS error, falling back to gTTS: {e}")
-
-            # Fallback: gTTS
-            from gtts import gTTS
-            temp_file = self.cache_dir / f"{key}_temp.mp3"
-            await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda: gTTS(text=text, lang='en', slow=False).save(str(temp_file))
-            )
-
-            audio = AudioSegment.from_file(str(temp_file))
-            audio = normalize(audio).set_frame_rate(8000).set_channels(1).set_sample_width(2)
-            audio.export(str(output_file), format="wav")
-
-            try:
-                temp_file.unlink()
-            except:
-                pass
-
-            return str(output_file)
-
-        except Exception as e:
-            logger.error(f"TTS error: {e}")
-            return None
-
-    def _get_duration(self, file_path):
-        try:
-            audio = AudioSegment.from_file(file_path)
-            return len(audio) / 1000.0
-        except:
-            return None
+    """No longer used — OpenAI Realtime streams audio directly."""
+    pass
 
 
 class FileSystemAccess:
-    """Direct file system access"""
-
-    def __init__(self, sounds_dir):
-        self.sounds_dir = sounds_dir
-        self.can_write = False
-        self.use_sudo = False
-
-    def test_access(self):
-        try:
-            test_file = os.path.join(self.sounds_dir, '.test_write')
-            with open(test_file, 'w') as f:
-                f.write('test')
-            os.unlink(test_file)
-            self.can_write = True
-            logger.info("Direct write access verified")
-            return True
-        except PermissionError:
-            try:
-                result = subprocess.run(
-                    ['sudo', '-n', 'touch', os.path.join(self.sounds_dir, '.test_write')],
-                    capture_output=True,
-                    timeout=2
-                )
-                if result.returncode == 0:
-                    subprocess.run(['sudo', 'rm', os.path.join(self.sounds_dir, '.test_write')])
-                    self.can_write = True
-                    self.use_sudo = True
-                    logger.info("Sudo access verified")
-                    return True
-            except:
-                pass
-
-            logger.warning("No write access - run as asterisk or use sudo")
-            return False
-
-    def copy_to_asterisk(self, local_path, filename):
-        try:
-            dest_path = os.path.join(self.sounds_dir, filename)
-
-            if self.use_sudo:
-                subprocess.run(['sudo', 'cp', local_path, dest_path], check=True)
-                subprocess.run(['sudo', 'chown', 'asterisk:asterisk', dest_path], check=True)
-                subprocess.run(['sudo', 'chmod', '644', dest_path], check=True)
-            else:
-                shutil.copy2(local_path, dest_path)
-                os.chmod(dest_path, 0o644)
-
-            return f"custom/{filename.replace('.wav', '')}"
-
-        except Exception as e:
-            logger.error(f"File copy error: {e}")
-            return None
+    """No longer used — no TTS files needed."""
+    pass
 
 
 class AzureSpeechTranscriber:
-    """Azure Speech transcription"""
-
-    def __init__(self, speech_key, speech_region):
-        if not speech_key or not speech_region:
-            raise ValueError("Azure Speech key and region required")
-
-        self.config = speechsdk.SpeechConfig(
-            subscription=speech_key,
-            region=speech_region
-        )
-        self.config.speech_recognition_language = "en-US"
-
-    async def transcribe(self, audio_file):
-        try:
-            if os.path.getsize(audio_file) < 4000:
-                return "", "low"
-
-            processed = await self._preprocess(audio_file)
-
-            audio_config = speechsdk.audio.AudioConfig(filename=processed)
-            recognizer = speechsdk.SpeechRecognizer(
-                speech_config=self.config,
-                audio_config=audio_config
-            )
-
-            result = await asyncio.get_running_loop().run_in_executor(
-                None,
-                recognizer.recognize_once
-            )
-
-            if result.reason == speechsdk.ResultReason.RecognizedSpeech:
-                text = result.text.strip()
-                confidence = "high"
-            else:
-                text = ""
-                confidence = "low"
-
-            if processed != audio_file:
-                try:
-                    os.unlink(processed)
-                except:
-                    pass
-
-            return text, confidence
-
-        except Exception as e:
-            logger.error(f"Transcription error: {e}")
-            return "", "low"
-
-    async def _preprocess(self, audio_file):
-        try:
-            audio = AudioSegment.from_file(audio_file)
-            audio = normalize(audio).set_frame_rate(16000).set_channels(1).set_sample_width(2)
-            processed = audio_file.replace('.wav', '_proc.wav')
-            audio.export(processed, format="wav")
-            return processed
-        except:
-            return audio_file
+    """No longer used — transcription handled by OpenAI Realtime VAD."""
+    pass
