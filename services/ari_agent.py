@@ -179,29 +179,50 @@ class LiveStreamTranscriber:
         recognizer.recognized.connect(on_recognized)
         recognizer.canceled.connect(on_canceled)
 
-        recognizer.start_continuous_recognition()
-
         # ── UDP receiver ────────────────────────────────────────────────
+        # IMPORTANT: bind the socket BEFORE starting the recognizer and BEFORE
+        # telling Asterisk to connect.  If we bind after externalMedia() is
+        # called, Asterisk may start sending RTP packets before the socket is
+        # ready and those early frames are silently dropped — Azure gets silence.
         udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         udp_sock.bind(("0.0.0.0", udp_port))
         udp_sock.setblocking(False)
 
+        recognizer.start_continuous_recognition()
+
         stop_receiver = threading.Event()
+        # Startup grace period: Asterisk needs ~1-2 s to negotiate the RTP
+        # session after externalMedia() returns.  We don't start the silence
+        # timeout until we've received at least one packet OR the grace period
+        # has passed.  Without this, the 2-second silence timeout fires before
+        # any audio arrives and we close the stream immediately.
+        STARTUP_GRACE = 4.0   # seconds to wait for the first RTP packet
 
         def rtp_receiver():
             """Runs in a daemon thread; pulls RTP packets and feeds PCM to Azure."""
+            first_packet_received = False
             last_packet_time = time.monotonic()
+            startup_time = time.monotonic()
+
             while not stop_receiver.is_set():
                 try:
                     data, _ = udp_sock.recvfrom(4096)
                     last_packet_time = time.monotonic()
+                    first_packet_received = True
                     if len(data) > self.RTP_HEADER_SIZE:
                         pcm = data[self.RTP_HEADER_SIZE:]   # strip RTP header
                         push_stream.write(pcm)
                 except BlockingIOError:
-                    if time.monotonic() - last_packet_time > self.SILENCE_TIMEOUT:
+                    now = time.monotonic()
+                    # Don't apply silence timeout until we've received at least
+                    # one packet AND the startup grace period has elapsed.
+                    if first_packet_received and (now - last_packet_time > self.SILENCE_TIMEOUT):
                         logger.debug("[STT live] silence timeout in UDP receiver")
+                        push_stream.close()
+                        break
+                    if not first_packet_received and (now - startup_time > STARTUP_GRACE + self.MAX_LISTEN_DURATION):
+                        logger.warning("[STT live] no RTP packets received — Asterisk may not be sending audio")
                         push_stream.close()
                         break
                 except Exception as exc:
@@ -526,20 +547,30 @@ class CallInstance:
             builds caused a 500 because the ARI handler couldn't transcode
             on the fly; slin goes through as-is.
 
-        FIX 2: removed channelId=self.id.
-          - In the ARI externalMedia API, channelId is the ID to *assign* to
-            the new external media channel, not the source channel.  Passing
-            self.id (which is already taken by the caller's channel) caused
-            Asterisk to reject the request with 500 "channel already exists".
-            Omitting it lets Asterisk auto-generate a unique ID.
+        FIX 2: channelId=self.id is the SOURCE channel, not a new channel ID.
+          - channelId tells Asterisk which channel's audio to fork to UDP.
+            An earlier version accidentally omitted it entirely (after fixing
+            a "channel exists" 500), which meant Asterisk created the
+            ExternalMedia leg but didn't know which call to pull audio from —
+            so the UDP port received no packets and Azure always got silence.
         """
         try:
+            # channelId here is the SOURCE channel whose audio we want to fork.
+            # Previously this was accidentally set to self.id (the caller channel
+            # id) which caused "channel already exists" 500 errors — because
+            # aioari was treating it as the ID to ASSIGN to the new ExternalMedia
+            # channel, not the source.
+            #
+            # The correct ARI parameter to specify the source is `channelId`
+            # in the Asterisk 16+ API.  We pass self.id (the real caller's
+            # channel) so Asterisk knows which call to fork audio from.
+            # The ExternalMedia leg itself gets an auto-generated ID.
             self._ext_media_channel = await self.ari_client.channels.externalMedia(
                 app=self.ari_app if hasattr(self, "ari_app") else "ai-agent",
                 external_host=f"127.0.0.1:{udp_port}",
-                format="slin",           # FIX: was "ulaw" — caused 500 on FreePBX 17
+                format="slin",
                 encapsulation="rtp",
-                # channelId intentionally omitted — caused 500 "channel exists"
+                channelId=self.id,       # SOURCE channel — fork THIS call's audio
             )
             logger.info(f"[ExternalMedia] started → UDP port {udp_port}")
             return True
