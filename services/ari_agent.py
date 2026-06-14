@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
-REALTIME_MODEL = "gpt-4o-realtime-preview"
+REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
+REALTIME_MODEL = "gpt-realtime"
 
 # Audio parameters
 ASTERISK_SAMPLE_RATE = 8000    # Asterisk sends μ-law 8 kHz
@@ -71,6 +71,26 @@ def _ws_header_kwargs(headers: dict) -> dict:
     if "additional_headers" in params:
         return {"additional_headers": headers}
     return {"extra_headers": headers}
+
+
+def _ws_is_open(ws) -> bool:
+    """
+    Return True if the given websockets connection is open and usable.
+
+      - websockets < 14 (legacy client) exposes a `.closed` bool.
+      - websockets >= 14 (new asyncio client) has no `.closed` attribute;
+        instead it exposes `.state` (a `websockets.State` enum).
+
+    Accessing the wrong attribute raises AttributeError, so detect at
+    runtime which one is available.
+    """
+    if ws is None:
+        return False
+    if hasattr(ws, "closed"):
+        return not ws.closed
+    if hasattr(ws, "state"):
+        return ws.state == websockets.State.OPEN
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -459,9 +479,11 @@ class RealtimeCallSession:
     # ── OpenAI WebSocket ──────────────────────────────────────────────────────
 
     async def _connect_openai(self):
+        # GA Realtime API: the "OpenAI-Beta: realtime=v1" header is no
+        # longer accepted — sending it now triggers a
+        # `beta_api_shape_disabled` error and the connection is closed.
         headers = {
             "Authorization": f"Bearer {self.openai_api_key}",
-            "OpenAI-Beta":   "realtime=v1",
         }
         self._openai_ws = await websockets.connect(
             REALTIME_URL,
@@ -471,23 +493,47 @@ class RealtimeCallSession:
         )
         logger.info(f"🔗 [{self.channel_id[:12]}] OpenAI Realtime WS connected")
 
-        # Configure session
+        # Configure session — GA shape.
+        # Beta → GA changes:
+        #   - session.type = "realtime" is now required
+        #   - session.model is set explicitly (in addition to the ?model=
+        #     query param)
+        #   - "modalities" → "output_modalities"
+        #   - "voice" / "input_audio_format" / "output_audio_format" /
+        #     "input_audio_transcription" / "turn_detection" all move
+        #     under session.audio.input / session.audio.output
+        #   - audio "format" is now an object ({"type": "audio/pcm",
+        #     "rate": 24000}) instead of a bare string ("pcm16")
         await self._openai_ws.send(json.dumps({
             "type": "session.update",
             "session": {
-                "modalities":      ["audio", "text"],
-                "voice":           self.openai_voice,
-                "instructions":    self.system_prompt,
-                "input_audio_format":  "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {"model": "whisper-1"},
-                "turn_detection": {
-                    "type":               "server_vad",
-                    "threshold":          0.5,
-                    "prefix_padding_ms":  300,
-                    "silence_duration_ms": 600,
+                "type":             "realtime",
+                "model":            REALTIME_MODEL,
+                "instructions":     self.system_prompt,
+                "output_modalities": ["audio"],
+                "audio": {
+                    "input": {
+                        "format": {
+                            "type": "audio/pcm",
+                            "rate": OPENAI_SAMPLE_RATE,
+                        },
+                        "transcription": {"model": "whisper-1"},
+                        "turn_detection": {
+                            "type":                "server_vad",
+                            "threshold":           0.5,
+                            "prefix_padding_ms":   300,
+                            "silence_duration_ms": 600,
+                            "create_response":     True,
+                        },
+                    },
+                    "output": {
+                        "voice": self.openai_voice,
+                        "format": {
+                            "type": "audio/pcm",
+                            "rate": OPENAI_SAMPLE_RATE,
+                        },
+                    },
                 },
-                "temperature": 0.7,
             },
         }))
         logger.info(f"⚙️  [{self.channel_id[:12]}] Realtime session configured")
@@ -539,7 +585,7 @@ class RealtimeCallSession:
                 chunk = await asyncio.wait_for(
                     self._audio_to_openai.get(), timeout=0.5
                 )
-                if self._openai_ws and not self._openai_ws.closed:
+                if self._openai_ws and _ws_is_open(self._openai_ws):
                     await self._openai_ws.send(json.dumps({
                         "type":  "input_audio_buffer.append",
                         "audio": base64.b64encode(chunk).decode(),
@@ -555,8 +601,8 @@ class RealtimeCallSession:
 
     async def _openai_recv_loop(self):
         """
-        Receive events from OpenAI Realtime:
-          - response.audio.delta  → enqueue PCM for sending back to Asterisk
+        Receive events from OpenAI Realtime (GA event names):
+          - response.output_audio.delta → enqueue PCM for sending back to Asterisk
           - conversation.item.input_audio_transcription.completed → check transfer intent
           - response.done / error → logging
         """
@@ -572,7 +618,7 @@ class RealtimeCallSession:
                 event = json.loads(raw)
                 etype = event.get("type", "")
 
-                if etype == "response.audio.delta":
+                if etype == "response.output_audio.delta":
                     # Decode PCM16 24kHz from OpenAI
                     pcm24 = base64.b64decode(event["delta"])
                     # Downsample 24 kHz → 8 kHz
@@ -590,7 +636,7 @@ class RealtimeCallSession:
                         logger.info(f"🔀 [{self.channel_id[:12]}] Transfer intent detected")
                         await self._handle_escalation(transcript)
 
-                elif etype == "response.audio_transcript.delta":
+                elif etype == "response.output_audio_transcript.delta":
                     # Streamed AI transcript — ignore or accumulate
                     pass
 
