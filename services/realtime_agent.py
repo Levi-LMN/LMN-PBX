@@ -400,13 +400,10 @@ class RealtimeCallInstance:
             # 1. Open our local UDP socket that will receive/send RTP
             self._rtp.open()
 
-            # 2. Create a mixing bridge then add the caller channel.
-            #    We create the bridge first so when ExternalMedia is added it
-            #    immediately has a peer to exchange audio with.
+            # 2. Create a mixing bridge.
             bridge = await self.ari_client.bridges.create(type='mixing')
             self._bridge = bridge
-            await bridge.addChannel(channel=self.id)
-            logger.info(f"✅ Bridge created, caller channel added")
+            logger.info("✅ Bridge created")
 
             # 3. Create ExternalMedia channel (no channelId param — universally supported).
             #    Our StasisStart filter ignores ExternalMedia channels so this won't
@@ -422,10 +419,19 @@ class RealtimeCallInstance:
             )
             self._ext_channel = ext
 
-            # 4. Add ExternalMedia channel to the same bridge as the caller.
-            #    Now Asterisk routes audio: caller ↔ bridge ↔ ExternalMedia ↔ our UDP.
+            # 4. Add the ExternalMedia channel to the bridge FIRST.
+            #    Asterisk's mixing bridge negotiates its media format from the
+            #    first member added. Adding the caller channel first (which
+            #    negotiates e.g. slin16) and then adding an ExternalMedia
+            #    (ulaw/RTP) channel causes a format-negotiation failure that
+            #    surfaces as "422 Unprocessable Entity" on addChannel. Adding
+            #    ExternalMedia first avoids that mismatch.
             await bridge.addChannel(channel=ext.id)
             logger.info("✅ ExternalMedia channel bridged")
+
+            # 5. Now add the caller channel to the same bridge.
+            await bridge.addChannel(channel=self.id)
+            logger.info("✅ Caller channel added to bridge")
 
             # 5. Read Asterisk's RTP address from channel variables.
             #    These are set on the ExternalMedia channel after it's created.
@@ -467,7 +473,16 @@ class RealtimeCallInstance:
             )
 
         except Exception as e:
-            logger.error(f"RealtimeCallInstance.process error: {e}", exc_info=True)
+            # aiohttp web exceptions (e.g. HTTPUnprocessableEntity) carry the
+            # ARI server's JSON error reason in .text, but the default str()
+            # only shows the generic HTTP reason phrase. Log the body too so
+            # the actual Asterisk-side cause (e.g. "Channel not in Stasis
+            # application", bad format negotiation, etc.) is visible.
+            body = getattr(e, "text", None)
+            if body:
+                logger.error(f"RealtimeCallInstance.process error: {e} | ARI response: {body}", exc_info=True)
+            else:
+                logger.error(f"RealtimeCallInstance.process error: {e}", exc_info=True)
         finally:
             await self._teardown()
 
