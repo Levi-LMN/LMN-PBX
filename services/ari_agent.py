@@ -652,15 +652,21 @@ class CallInstance:
             logger.info(f"[ExternalMedia] EM channel created id={em_channel_id} → UDP :{udp_port}")
 
             # ── Step 4: add snoop + EM to the bridge ─────────────────────────
-            # Give Asterisk a brief moment for both channels to fully enter Stasis
-            await asyncio.sleep(0.3)
+            # Give Asterisk a brief moment for both channels to fully enter Stasis.
+            await asyncio.sleep(0.5)
 
             add_url = f"{ari_base}/ari/bridges/{self._ext_bridge_id}/addChannel"
+            # CRITICAL: 'channel' must be sent as query parameters, not JSON body.
+            # The ARI spec says "Allows comma-separated values" but in practice
+            # Asterisk parses the query string, not a JSON body field.
+            # Sending json={"channel": "id1,id2"} is treated as a literal channel
+            # name containing a comma → 400 "Channel not found".
+            # Correct: params={"channel": ["id1", "id2"]} → ?channel=id1&channel=id2
             add_resp = await loop.run_in_executor(
                 None,
                 lambda: requests.post(
                     add_url,
-                    json={"channel": f"{snoop_channel_id},{em_channel_id}"},
+                    params={"channel": [snoop_channel_id, em_channel_id]},
                     auth=(self.ari_username, self.ari_password),
                     timeout=5,
                 ),
