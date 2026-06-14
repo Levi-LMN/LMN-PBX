@@ -188,9 +188,15 @@ class RealtimeSession:
         # GA models (gpt-realtime, gpt-realtime-mini, gpt-realtime-1.5) use:
         #   wss://<resource>.openai.azure.com/openai/v1/realtime?model=<deployment>
         # Preview models used the older path with api-version + deployment params.
-        # We always use the GA path; api_version is kept for the header only.
         base = endpoint.rstrip('/').replace('https://', 'wss://')
         self.uri = f"{base}/openai/v1/realtime?model={deployment}"
+        # Fallback URI (preview protocol) — some resources/regions reject
+        # the GA path with "OpperationNotSupported" even for GA-listed
+        # models. If GA handshake fails with 400, we retry on this URI.
+        self.fallback_uri = (
+            f"{base}/openai/realtime"
+            f"?api-version={api_version}&deployment={deployment}"
+        )
         self.deployment = deployment
         self.api_version = api_version
         self.headers = {
@@ -201,6 +207,11 @@ class RealtimeSession:
             # present. It was only required for the old preview path
             # (/openai/realtime?api-version=...).
         }
+        # Headers used only on the preview fallback path.
+        self.fallback_headers = {
+            "api-key": api_key,
+            "OpenAI-Beta": "realtime=v1",
+        }
         self.system_prompt = system_prompt
         self.ws: websockets.WebSocketClientProtocol | None = None
         self._audio_queue: asyncio.Queue = asyncio.Queue()   # outbound audio chunks
@@ -209,7 +220,13 @@ class RealtimeSession:
         self._session_ready = asyncio.Event()
 
     async def connect(self):
-        """Open WebSocket and wait for session to be ready."""
+        """Open WebSocket and wait for session to be ready.
+
+        Tries the GA path first (/openai/v1/realtime?model=...). If Azure
+        rejects it with HTTP 400 "OpperationNotSupported" (seen on some
+        resources/regions even for GA-listed models), retries on the
+        preview path (/openai/realtime?api-version=...&deployment=...).
+        """
         logger.info(f"Connecting to Azure Realtime: {self.uri}")
         try:
             self.ws = await websockets.connect(
@@ -218,10 +235,44 @@ class RealtimeSession:
                 ping_interval=20,
                 ping_timeout=30,
             )
+            self._connected = True
+            logger.info("✅ Realtime WebSocket connected (GA path)")
+            return
         except websockets.exceptions.InvalidStatus as e:
-            # The handshake response body usually contains Azure's actual
-            # error message (e.g. invalid model/deployment name, bad
-            # api-version, auth failure) — the bare "HTTP 400" hides this.
+            resp = getattr(e, "response", None)
+            body = None
+            status_code = None
+            if resp is not None:
+                status_code = resp.status_code
+                try:
+                    body = resp.body.decode("utf-8", errors="replace") if resp.body else None
+                except Exception:
+                    body = repr(getattr(resp, "body", None))
+                logger.error(
+                    f"Realtime WS handshake rejected (GA path): status={status_code} "
+                    f"headers={dict(resp.headers)} body={body}"
+                )
+
+            # Only fall back on the specific "wrong path/model for this
+            # resource" error. Other 400s (auth, bad deployment name,
+            # quota) won't be fixed by switching paths.
+            should_fallback = (
+                status_code == 400
+                and body is not None
+                and "OpperationNotSupported" in body
+            )
+            if not should_fallback:
+                raise
+
+        logger.info(f"GA path rejected — retrying via preview path: {self.fallback_uri}")
+        try:
+            self.ws = await websockets.connect(
+                self.fallback_uri,
+                additional_headers=self.fallback_headers,
+                ping_interval=20,
+                ping_timeout=30,
+            )
+        except websockets.exceptions.InvalidStatus as e:
             resp = getattr(e, "response", None)
             body = None
             if resp is not None:
@@ -230,12 +281,13 @@ class RealtimeSession:
                 except Exception:
                     body = repr(getattr(resp, "body", None))
                 logger.error(
-                    f"Realtime WS handshake rejected: status={resp.status_code} "
+                    f"Realtime WS handshake rejected (preview path): status={resp.status_code} "
                     f"headers={dict(resp.headers)} body={body}"
                 )
             raise
+
         self._connected = True
-        logger.info("✅ Realtime WebSocket connected")
+        logger.info("✅ Realtime WebSocket connected (preview path fallback)")
 
     async def configure(self):
         """Send session.update to configure voice, VAD, and instructions (GA schema)."""
@@ -250,7 +302,8 @@ class RealtimeSession:
                 "output_modalities": ["audio", "text"],
                 "audio": {
                     "input": {
-                        "format": "pcm16",
+                        # GA requires format as an object, not a bare string.
+                        "format": {"type": "audio/pcm", "rate": REALTIME_RATE},
                         "transcription": {
                             # whisper-1 is deprecated for Realtime in GA;
                             # gpt-4o-mini-transcribe is the supported model.
@@ -265,7 +318,7 @@ class RealtimeSession:
                         }
                     },
                     "output": {
-                        "format": "pcm16",
+                        "format": {"type": "audio/pcm", "rate": REALTIME_RATE},
                         "voice": "alloy",   # Azure supported voices: alloy, echo, fable, onyx, nova, shimmer
                     }
                 },
