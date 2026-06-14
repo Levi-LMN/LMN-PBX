@@ -533,6 +533,7 @@ class CallInstance:
 
         self._ext_media_channel = None
         self._ext_media_channel_id = None
+        self._ext_bridge_id = None
 
     # ------------------------------------------------------------------
     # Live audio capture
@@ -540,75 +541,156 @@ class CallInstance:
 
     async def _start_external_media(self, udp_port: int) -> bool:
         """
-        Ask Asterisk to fork audio from this channel to our UDP listener.
+        Fork audio from this channel to our UDP listener via ExternalMedia + bridge.
 
-        ROOT CAUSE FIX:
-        The ARI endpoint POST /channels/externalMedia uses `channelId` as the
-        ID to *assign* to the newly created ExternalMedia channel — NOT as the
-        source channel to fork.  Passing `channelId=self.id` (the real caller's
-        channel ID) caused Asterisk to return 500 "Internal Server Error" because
-        a channel with that ID already existed.
+        CORRECT APPROACH (replaces the broken per-channel sub-path):
 
-        The correct approach is to use the per-channel endpoint:
-            POST /channels/{sourceChannelId}/externalMedia
-        which explicitly forks audio FROM sourceChannelId.  We call this via a
-        direct HTTP POST because aioari's helper method maps to the wrong
-        top-level endpoint.
+        The ARI ExternalMedia endpoint is a top-level channel-creation call:
+            POST /ari/channels/externalMedia
+        It creates a *new* UnicastRTP channel that sends audio to the given UDP
+        host:port.  There is NO per-channel variant — calling
+            POST /ari/channels/{channelId}/externalMedia
+        always returns 404 "Resource not found" because that route does not exist
+        in any released version of Asterisk.
 
-        format="slin" (signed linear 16-bit PCM at 8 kHz) is correct for Azure's
-        PushAudioInputStream.  "ulaw" caused a second 500 on some Asterisk builds
-        due to codec transcoding rejection at the ExternalMedia handler level.
+        To actually get caller audio into the ExternalMedia channel we:
+          1. Create the ExternalMedia channel (POST /ari/channels/externalMedia)
+          2. Create a mixing bridge (POST /ari/bridges)
+          3. Add BOTH the caller channel AND the ExternalMedia channel to the bridge
+
+        The bridge mixes audio bidirectionally, so the ExternalMedia channel
+        receives everything the caller says (and we can ignore what we push back
+        since we never write to the UDP port).
+
+        format="slin" = signed linear 16-bit PCM at 8 kHz, which is exactly what
+        Azure PushAudioInputStream expects.  "slin16" would be 16 kHz — avoid it
+        here because our AudioStreamFormat is set to SAMPLE_RATE=8000.
         """
         try:
             ari_base = self.ari_url.rstrip("/ari").rstrip("/")
-            url = f"{ari_base}/ari/channels/{self.id}/externalMedia"
             app_name = self.ari_app if hasattr(self, "ari_app") else "ai-agent"
+            loop = asyncio.get_running_loop()
 
-            payload = {
+            # ── Step 1: create the ExternalMedia channel ─────────────────────
+            em_url = f"{ari_base}/ari/channels/externalMedia"
+            em_payload = {
                 "app": app_name,
                 "external_host": f"127.0.0.1:{udp_port}",
                 "format": "slin",
                 "encapsulation": "rtp",
+                "transport": "udp",
+                "connection_type": "server",
+                "direction": "both",
             }
 
-            loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(
+            em_resp = await loop.run_in_executor(
                 None,
                 lambda: requests.post(
-                    url,
-                    json=payload,
+                    em_url,
+                    json=em_payload,
                     auth=(self.ari_username, self.ari_password),
                     timeout=5,
                 ),
             )
 
-            if response.status_code in (200, 201):
-                self._ext_media_channel_id = response.json().get("id")
-                logger.info(
-                    f"[ExternalMedia] started → UDP port {udp_port} "
-                    f"(ExternalMedia id={self._ext_media_channel_id})"
-                )
-                return True
-            else:
+            if em_resp.status_code not in (200, 201):
                 logger.warning(
-                    f"[ExternalMedia] HTTP {response.status_code}: {response.text[:200]} "
-                    f"— falling back to record"
+                    f"[ExternalMedia] create failed HTTP {em_resp.status_code}: "
+                    f"{em_resp.text[:200]} — falling back to record"
                 )
                 return False
 
+            em_channel_id = em_resp.json().get("id")
+            self._ext_media_channel_id = em_channel_id
+            logger.info(
+                f"[ExternalMedia] channel created id={em_channel_id} → UDP :{udp_port}"
+            )
+
+            # ── Step 2: create a mixing bridge ───────────────────────────────
+            bridge_url = f"{ari_base}/ari/bridges"
+            bridge_resp = await loop.run_in_executor(
+                None,
+                lambda: requests.post(
+                    bridge_url,
+                    json={"type": "mixing"},
+                    auth=(self.ari_username, self.ari_password),
+                    timeout=5,
+                ),
+            )
+
+            if bridge_resp.status_code not in (200, 201):
+                logger.warning(
+                    f"[ExternalMedia] bridge create failed HTTP {bridge_resp.status_code}: "
+                    f"{bridge_resp.text[:200]} — falling back to record"
+                )
+                # clean up the EM channel we just created
+                await self._stop_external_media()
+                return False
+
+            self._ext_bridge_id = bridge_resp.json().get("id")
+            logger.info(f"[ExternalMedia] bridge created id={self._ext_bridge_id}")
+
+            # ── Step 3: add caller + EM channel to the bridge ────────────────
+            add_url = f"{ari_base}/ari/bridges/{self._ext_bridge_id}/addChannel"
+            add_payload = {"channel": f"{self.id},{em_channel_id}"}
+
+            add_resp = await loop.run_in_executor(
+                None,
+                lambda: requests.post(
+                    add_url,
+                    json=add_payload,
+                    auth=(self.ari_username, self.ari_password),
+                    timeout=5,
+                ),
+            )
+
+            if add_resp.status_code not in (200, 204):
+                logger.warning(
+                    f"[ExternalMedia] addChannel failed HTTP {add_resp.status_code}: "
+                    f"{add_resp.text[:200]} — falling back to record"
+                )
+                await self._stop_external_media()
+                return False
+
+            logger.info(
+                f"[ExternalMedia] bridge ready — caller {self.id[:12]} ↔ "
+                f"EM {em_channel_id} → UDP :{udp_port}"
+            )
+            return True
+
         except Exception as e:
-            logger.warning(f"[ExternalMedia] not available: {e} — falling back to record")
+            logger.warning(f"[ExternalMedia] setup error: {e} — falling back to record")
+            await self._stop_external_media()
             return False
 
     async def _stop_external_media(self):
-        channel_id = getattr(self, "_ext_media_channel_id", None) or (
-            self._ext_media_channel.id if self._ext_media_channel else None
-        )
+        """Tear down the ExternalMedia channel and the mixing bridge."""
+        ari_base = self.ari_url.rstrip("/ari").rstrip("/")
+        loop = asyncio.get_running_loop()
+
+        # Destroy the bridge first (this also removes channels from it)
+        bridge_id = getattr(self, "_ext_bridge_id", None)
+        if bridge_id:
+            try:
+                url = f"{ari_base}/ari/bridges/{bridge_id}"
+                await loop.run_in_executor(
+                    None,
+                    lambda: requests.delete(
+                        url,
+                        auth=(self.ari_username, self.ari_password),
+                        timeout=3,
+                    ),
+                )
+                logger.debug(f"[ExternalMedia] bridge {bridge_id} destroyed")
+            except Exception:
+                pass
+            self._ext_bridge_id = None
+
+        # Hang up the ExternalMedia channel
+        channel_id = getattr(self, "_ext_media_channel_id", None)
         if channel_id:
             try:
-                ari_base = self.ari_url.rstrip("/ari").rstrip("/")
                 url = f"{ari_base}/ari/channels/{channel_id}"
-                loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     None,
                     lambda: requests.delete(
