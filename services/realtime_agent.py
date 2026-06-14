@@ -211,12 +211,29 @@ class RealtimeSession:
     async def connect(self):
         """Open WebSocket and wait for session to be ready."""
         logger.info(f"Connecting to Azure Realtime: {self.uri}")
-        self.ws = await websockets.connect(
-            self.uri,
-            additional_headers=self.headers,
-            ping_interval=20,
-            ping_timeout=30,
-        )
+        try:
+            self.ws = await websockets.connect(
+                self.uri,
+                additional_headers=self.headers,
+                ping_interval=20,
+                ping_timeout=30,
+            )
+        except websockets.exceptions.InvalidStatus as e:
+            # The handshake response body usually contains Azure's actual
+            # error message (e.g. invalid model/deployment name, bad
+            # api-version, auth failure) — the bare "HTTP 400" hides this.
+            resp = getattr(e, "response", None)
+            body = None
+            if resp is not None:
+                try:
+                    body = resp.body.decode("utf-8", errors="replace") if resp.body else None
+                except Exception:
+                    body = repr(getattr(resp, "body", None))
+                logger.error(
+                    f"Realtime WS handshake rejected: status={resp.status_code} "
+                    f"headers={dict(resp.headers)} body={body}"
+                )
+            raise
         self._connected = True
         logger.info("✅ Realtime WebSocket connected")
 
