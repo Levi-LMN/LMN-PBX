@@ -22,6 +22,7 @@ import socket
 import struct
 import audioop
 import base64
+import inspect
 import json
 import logging
 import websockets
@@ -47,6 +48,29 @@ RTP_HEADER_SIZE      = 12      # Standard RTP header
 RTP_LISTEN_HOST = "0.0.0.0"
 RTP_PORT_START  = 20000
 RTP_PORT_END    = 20100
+
+
+def _ws_header_kwargs(headers: dict) -> dict:
+    """
+    Return the correct kwarg for passing extra headers to websockets.connect(),
+    depending on the installed websockets version:
+
+      - websockets >= 14 (new asyncio client) → `additional_headers`
+      - websockets <  14 (legacy client)      → `extra_headers`
+
+    Passing the wrong kwarg raises:
+      TypeError: ... got an unexpected keyword argument 'additional_headers'
+    (or 'extra_headers' on newer versions), so detect at runtime instead of
+    hardcoding one or the other.
+    """
+    try:
+        params = inspect.signature(websockets.connect).parameters
+    except (TypeError, ValueError):
+        params = inspect.signature(websockets.connect.__init__).parameters
+
+    if "additional_headers" in params:
+        return {"additional_headers": headers}
+    return {"extra_headers": headers}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -441,9 +465,9 @@ class RealtimeCallSession:
         }
         self._openai_ws = await websockets.connect(
             REALTIME_URL,
-            additional_headers=headers,
             ping_interval=20,
             ping_timeout=30,
+            **_ws_header_kwargs(headers),
         )
         logger.info(f"🔗 [{self.channel_id[:12]}] OpenAI Realtime WS connected")
 
