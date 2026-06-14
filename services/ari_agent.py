@@ -84,8 +84,8 @@ class LiveStreamTranscriber:
     BITS_PER_SAMPLE = 16
     RTP_HEADER_SIZE = 12          # bytes to strip from each UDP packet
     UDP_PORT_RANGE = (20000, 20999)
-    SILENCE_TIMEOUT = 2.0         # seconds of silence before we finalise
-    MAX_LISTEN_DURATION = 10.0    # hard cap on how long we listen
+    SILENCE_TIMEOUT = 2.5         # seconds of silence before we finalise
+    MAX_LISTEN_DURATION = 15.0    # hard cap on how long we listen
 
     def __init__(self, speech_key: str, speech_region: str):
         if not speech_key or not speech_region:
@@ -197,45 +197,62 @@ class LiveStreamTranscriber:
         # timeout until we've received at least one packet OR the grace period
         # has passed.  Without this, the 2-second silence timeout fires before
         # any audio arrives and we close the stream immediately.
-        STARTUP_GRACE = 4.0   # seconds to wait for the first RTP packet
+        STARTUP_GRACE = 5.0   # seconds to wait for the first RTP packet
 
         def rtp_receiver():
             """Runs in a daemon thread; pulls RTP packets and feeds PCM to Azure."""
             first_packet_received = False
             last_packet_time = time.monotonic()
             startup_time = time.monotonic()
+            packet_count = 0
 
             while not stop_receiver.is_set():
                 try:
-                    data, _ = udp_sock.recvfrom(4096)
+                    data, addr = udp_sock.recvfrom(4096)
                     last_packet_time = time.monotonic()
-                    first_packet_received = True
+                    if not first_packet_received:
+                        logger.info(f"[STT live] 🎤 First RTP packet from {addr} — size={len(data)}")
+                        first_packet_received = True
+                    packet_count += 1
                     if len(data) > self.RTP_HEADER_SIZE:
                         pcm = data[self.RTP_HEADER_SIZE:]   # strip RTP header
                         push_stream.write(pcm)
+                    elif packet_count <= 5:
+                        logger.debug(f"[STT live] tiny RTP packet ({len(data)} bytes) — may be RTCP or padding")
                 except BlockingIOError:
                     now = time.monotonic()
                     # Don't apply silence timeout until we've received at least
                     # one packet AND the startup grace period has elapsed.
                     if first_packet_received and (now - last_packet_time > self.SILENCE_TIMEOUT):
-                        logger.debug("[STT live] silence timeout in UDP receiver")
+                        logger.debug(f"[STT live] silence timeout after {packet_count} packets — closing stream")
                         push_stream.close()
                         break
                     if not first_packet_received and (now - startup_time > STARTUP_GRACE + self.MAX_LISTEN_DURATION):
-                        logger.warning("[STT live] no RTP packets received — Asterisk may not be sending audio")
+                        logger.warning(
+                            "[STT live] ❌ No RTP packets received after "
+                            f"{STARTUP_GRACE + self.MAX_LISTEN_DURATION:.0f}s — "
+                            "check: (1) ExternalMedia bridge formed? "
+                            "(2) Caller channel still active? "
+                            "(3) UDP port not blocked by firewall?"
+                        )
                         push_stream.close()
                         break
                 except Exception as exc:
                     logger.debug(f"[STT live] UDP recv error: {exc}")
                     break
-                time.sleep(0.005)
+                time.sleep(0.01)  # 10 ms — enough headroom for 8 kHz slin frames
 
         recv_thread = threading.Thread(target=rtp_receiver, daemon=True)
         recv_thread.start()
 
         # ── Wait for result or hard timeout ─────────────────────────────
+        # Use MAX_LISTEN_DURATION + 3s so the asyncio timeout never races with
+        # the RTP receiver's own silence/duration logic.  The receiver closes
+        # push_stream when done, which fires the Azure 'recognized' callback,
+        # which sets done_event — so the asyncio wait normally completes well
+        # before this outer timeout fires.  The +3 is only a safety net.
         try:
-            await asyncio.wait_for(done_event.wait(), timeout=self.MAX_LISTEN_DURATION)
+            await asyncio.wait_for(done_event.wait(), timeout=self.MAX_LISTEN_DURATION + 3.0)
         except asyncio.TimeoutError:
             logger.debug("[STT live] max listen duration reached")
 
@@ -585,7 +602,12 @@ class CallInstance:
                         "encapsulation": "rtp",
                         "transport": "udp",
                         "connection_type": "client",
-                        "direction": "both",
+                        # "receive" = only send caller→bot audio to UDP.
+                        # "both" caused Azure to hear the bot's own TTS echoed
+                        # back through the mixing bridge (Asterisk mixes ALL
+                        # bridge participants), so Azure recognised silence or
+                        # its own playback instead of the caller.
+                        "direction": "receive",
                     },
                     auth=(self.ari_username, self.ari_password),
                     timeout=5,
