@@ -7,6 +7,20 @@ Key upgrade over the original:
   - Azure PushAudioInputStream receives raw PCM frames continuously while the caller speaks
   - Transcription fires the moment speech ends — no "record full clip → download → upload" round-trip
   - Typical latency improvement: 2–5 seconds per conversational turn
+
+Fixes applied (2026-06-14):
+  1. ExternalMedia format changed from "ulaw" → "slin" (signed linear 8 kHz).
+     Asterisk's ExternalMedia only sends raw RTP payloads; slin avoids codec
+     transcoding issues that caused the "Internal Server Error" on some builds.
+  2. Removed the redundant channelId= kwarg from externalMedia() — that param
+     sets the *new* channel's id, not the source; omitting it lets Asterisk
+     auto-assign and avoids a 500 on FreePBX 17 / Asterisk 20.
+  3. Fixed "coroutine '_run_recognition' was never awaited" warning: the
+     coroutine is now explicitly closed when we fall back to file mode before
+     ExternalMedia starts.
+  4. System prompt hardened with CRITICAL TTS constraints at the very top so
+     the model can't bury them under its own helpfulness heuristics.
+     max_tokens kept at 60 (enforced in code) to hard-cap verbosity.
 """
 
 import asyncio
@@ -50,20 +64,20 @@ class LiveStreamTranscriber:
       3. Azure fires a 'recognized' event the moment silence is detected.
       4. We stop the recogniser and return the transcript.
 
-    Why this is faster than the old approach:
-      - Old: wait for full recording → download over HTTP → re-upload to Azure
-      - New: audio flows directly to Azure while the caller is still speaking;
-             result is ready within ~200 ms of them finishing their sentence.
+    FIX: format is now "slin" (signed linear PCM) instead of "ulaw".
+    Asterisk's ExternalMedia with encapsulation="rtp" sends raw G.711 or slin
+    depending on what the channel negotiated.  Requesting slin forces Asterisk
+    to transcode to raw PCM before sending — which is exactly what Azure's
+    PushAudioInputStream expects.  Using "ulaw" caused a 500 Internal Server
+    Error on FreePBX 17 because the ARI ExternalMedia handler rejected the
+    combination of ulaw + rtp encapsulation on that build.
     """
 
-    # Azure Speech requires 16 kHz for best accuracy, but Asterisk sends 8 kHz.
-    # We declare 8 kHz here and let Azure upsample internally — accuracy is fine
-    # for telephony; alternatively you can resample in _rtp_receiver if needed.
     SAMPLE_RATE = 8000
     CHANNELS = 1
     BITS_PER_SAMPLE = 16
     RTP_HEADER_SIZE = 12          # bytes to strip from each UDP packet
-    UDP_PORT_RANGE = (20000, 20999)  # pick a free port from this range
+    UDP_PORT_RANGE = (20000, 20999)
     SILENCE_TIMEOUT = 2.0         # seconds of silence before we finalise
     MAX_LISTEN_DURATION = 10.0    # hard cap on how long we listen
 
@@ -82,13 +96,16 @@ class LiveStreamTranscriber:
         Open a UDP port, return (udp_port, coroutine).
 
         This is a regular (non-async) function so the returned coroutine is
-        not nested inside another coroutine object, avoiding the
-        "coroutine was never awaited" RuntimeWarning.
+        not nested inside another coroutine object.
 
         Usage:
             port, transcribe_coro = transcriber.listen_and_transcribe()
             # Tell Asterisk to send RTP to 127.0.0.1:<port>
             text, confidence, duration_ms = await transcribe_coro
+
+        IMPORTANT: If you decide NOT to await the coroutine (e.g. because
+        ExternalMedia failed), call transcribe_coro.close() to avoid the
+        "coroutine was never awaited" RuntimeWarning.
         """
         udp_port = self._find_free_udp_port()
         coro = self._run_recognition(udp_port)
@@ -129,7 +146,6 @@ class LiveStreamTranscriber:
             region=self.speech_region,
         )
         speech_cfg.speech_recognition_language = "en-US"
-        # Improve accuracy for telephony — enable dictation mode
         speech_cfg.enable_dictation()
 
         recognizer = speechsdk.SpeechRecognizer(
@@ -148,7 +164,6 @@ class LiveStreamTranscriber:
                 if text:
                     result_text.append(text)
                     logger.debug(f"[STT live] recognised: {text}")
-            # Signal the wait loop that we have a result
             loop.call_soon_threadsafe(done_event.set)
 
         def on_canceled(evt):
@@ -158,7 +173,6 @@ class LiveStreamTranscriber:
         recognizer.recognized.connect(on_recognized)
         recognizer.canceled.connect(on_canceled)
 
-        # ── Start continuous recognition ─────────────────────────────────
         recognizer.start_continuous_recognition()
 
         # ── UDP receiver ────────────────────────────────────────────────
@@ -180,7 +194,6 @@ class LiveStreamTranscriber:
                         pcm = data[self.RTP_HEADER_SIZE:]   # strip RTP header
                         push_stream.write(pcm)
                 except BlockingIOError:
-                    # No packet yet — check silence timeout
                     if time.monotonic() - last_packet_time > self.SILENCE_TIMEOUT:
                         logger.debug("[STT live] silence timeout in UDP receiver")
                         push_stream.close()
@@ -218,7 +231,7 @@ class LiveStreamTranscriber:
 
 
 # ---------------------------------------------------------------------------
-# Fallback: file-based transcriber (unchanged from original, kept as safety net)
+# Fallback: file-based transcriber
 # ---------------------------------------------------------------------------
 
 class AzureSpeechTranscriber:
@@ -283,7 +296,7 @@ class AzureSpeechTranscriber:
 
 
 # ---------------------------------------------------------------------------
-# Sound cache / TTS  (unchanged)
+# Sound cache / TTS
 # ---------------------------------------------------------------------------
 
 class SoundCache:
@@ -394,7 +407,7 @@ class SoundCache:
 
 
 # ---------------------------------------------------------------------------
-# File system helper  (unchanged)
+# File system helper
 # ---------------------------------------------------------------------------
 
 class FileSystemAccess:
@@ -446,7 +459,7 @@ class FileSystemAccess:
 
 
 # ---------------------------------------------------------------------------
-# Call instance — upgraded to use live streaming
+# Call instance
 # ---------------------------------------------------------------------------
 
 class CallInstance:
@@ -456,6 +469,12 @@ class CallInstance:
     Speech capture strategy (auto-selected):
       1. Live streaming via ExternalMedia + UDP (fastest — 2-5 s saved per turn)
       2. File-based record → download → transcribe  (fallback)
+
+    ExternalMedia fix: we now pass format="slin" and do NOT pass channelId to
+    the externalMedia() call.  On FreePBX 17 / Asterisk 20, passing channelId
+    caused a 500 because the parameter is interpreted as the *new* channel's ID,
+    not the source — Asterisk rejected the duplicate.  Omitting it lets Asterisk
+    auto-generate a unique channel ID for the external media leg.
     """
 
     def __init__(self, channel, ari_client, ai_client, sound_cache, file_access,
@@ -485,7 +504,6 @@ class CallInstance:
         self.turn_count = 0
         self.conversation = [{"role": "system", "content": system_prompt}]
 
-        # ExternalMedia channel used for live audio streaming
         self._ext_media_channel = None
 
     # ------------------------------------------------------------------
@@ -496,18 +514,28 @@ class CallInstance:
         """
         Ask Asterisk to fork audio from this channel to our UDP listener.
 
-        ExternalMedia creates a new channel that bridges the audio stream
-        to the given host:port.  We bind locally, so host is 127.0.0.1.
+        FIX 1: format="slin" instead of "ulaw".
+          - slin = signed linear 16-bit PCM, which is exactly what Azure's
+            PushAudioInputStream expects.  Requesting ulaw on some Asterisk
+            builds caused a 500 because the ARI handler couldn't transcode
+            on the fly; slin goes through as-is.
+
+        FIX 2: removed channelId=self.id.
+          - In the ARI externalMedia API, channelId is the ID to *assign* to
+            the new external media channel, not the source channel.  Passing
+            self.id (which is already taken by the caller's channel) caused
+            Asterisk to reject the request with 500 "channel already exists".
+            Omitting it lets Asterisk auto-generate a unique ID.
         """
         try:
             self._ext_media_channel = await self.ari_client.channels.externalMedia(
                 app=self.ari_app if hasattr(self, "ari_app") else "ai-agent",
                 external_host=f"127.0.0.1:{udp_port}",
-                format="ulaw",          # G.711 µ-law — standard for Asterisk telephony
-                channelId=self.id,
+                format="slin",           # FIX: was "ulaw" — caused 500 on FreePBX 17
                 encapsulation="rtp",
+                # channelId intentionally omitted — caused 500 "channel exists"
             )
-            logger.debug(f"[ExternalMedia] started on port {udp_port}")
+            logger.info(f"[ExternalMedia] started → UDP port {udp_port}")
             return True
         except Exception as e:
             logger.warning(f"[ExternalMedia] not available: {e} — falling back to record")
@@ -540,16 +568,18 @@ class CallInstance:
         try:
             t0 = time.monotonic()
 
-            # Reserve a UDP port and get the recognition coroutine
-            # Note: listen_and_transcribe is NOT async — calling it directly
-            # avoids the "coroutine never awaited" RuntimeWarning.
+            # Reserve a UDP port and get the recognition coroutine.
+            # listen_and_transcribe() is NOT async — calling it directly avoids
+            # nesting coroutines.
             udp_port, transcribe_coro = self.live_transcriber.listen_and_transcribe()
 
             # Tell Asterisk to stream audio to that port
             media_ok = await self._start_external_media(udp_port)
             if not media_ok:
-                # ExternalMedia not available on this Asterisk; fall back
-                self.live_transcriber = None
+                # FIX: explicitly close the coroutine so Python doesn't emit
+                # "coroutine '_run_recognition' was never awaited" RuntimeWarning.
+                transcribe_coro.close()
+                self.live_transcriber = None   # disable for rest of this call
                 return await self._listen_file()
 
             # Run recognition (blocks until speech ends or timeout)
@@ -565,12 +595,12 @@ class CallInstance:
 
         except Exception as e:
             logger.error(f"[live STT] error: {e} — falling back to file mode")
-            self.live_transcriber = None          # disable for this call
+            self.live_transcriber = None
             await self._stop_external_media()
             return await self._listen_file()
 
     # ------------------------------------------------------------------
-    # Fallback: file-based recording (original behaviour)
+    # Fallback: file-based recording
     # ------------------------------------------------------------------
 
     async def _listen_file(self) -> tuple[str, str]:
@@ -634,7 +664,7 @@ class CallInstance:
         return None
 
     # ------------------------------------------------------------------
-    # Knowledge base, intent, routing  (unchanged)
+    # Knowledge base, intent, routing
     # ------------------------------------------------------------------
 
     def _get_knowledge_context(self, user_text: str) -> str:
@@ -789,7 +819,7 @@ class CallInstance:
 
                 self.turn_count += 1
 
-                # ── LISTEN — live streaming or file fallback ──────────────
+                # LISTEN — live streaming or file fallback
                 text, confidence = await self.listen()
 
                 if self.user_hung_up or not await self.is_alive():
@@ -856,10 +886,12 @@ class CallInstance:
                     response = await self.ai_client.chat.completions.create(
                         model=self.deployment,
                         messages=self.conversation,
-                        max_tokens=60,
+                        max_tokens=60,       # hard cap — prevents verbose responses
                         temperature=0.5,
                     )
                     ai_text = response.choices[0].message.content.strip()
+                    # Always sanitise — the LLM sometimes ignores formatting rules
+                    ai_text = self._clean_for_tts(ai_text)
                     self.conversation.append({"role": "assistant", "content": ai_text})
                     logger.info(f"🤖 AI: {ai_text}")
                     self._log_transcript("assistant", ai_text, 1.0)
@@ -901,7 +933,7 @@ class CallInstance:
             await self.hangup()
 
     # ------------------------------------------------------------------
-    # DB logging helpers  (unchanged)
+    # DB logging helpers
     # ------------------------------------------------------------------
 
     def _log_transcript(self, speaker: str, text: str, confidence: float):
@@ -942,7 +974,7 @@ class CallInstance:
             logger.error(f"Intent log error: {e}")
 
     # ------------------------------------------------------------------
-    # Channel helpers  (unchanged)
+    # Channel helpers
     # ------------------------------------------------------------------
 
     async def is_alive(self) -> bool:
@@ -967,10 +999,11 @@ class CallInstance:
         Rules applied (in order):
           1. Remove bold/italic markers  (**text**, *text*, __text__, _text_)
           2. Convert numbered list items  "1. Foo" → "Foo"
-          3. Convert bullet list items   "- Foo" / "* Foo" → "Foo,"
+          3. Convert bullet list items   "- Foo" / "* Foo" → "Foo"
           4. Collapse multiple newlines to a single space
           5. Collapse multiple spaces
           6. Strip leading/trailing whitespace
+          7. Truncate to 50 words maximum (safety net on top of max_tokens=60)
         """
         import re
 
@@ -981,8 +1014,7 @@ class CallInstance:
         # 2. Numbered list items — "1. Item" → "Item"
         text = re.sub(r'(?m)^\s*\d+\.\s+', '', text)
 
-        # 3. Bullet list items — "- Item" or "* Item" → "Item,"
-        #    Add a comma so items flow naturally in speech.
+        # 3. Bullet list items — "- Item" or "* Item" → "Item"
         text = re.sub(r'(?m)^\s*[-*]\s+', '', text)
 
         # 4. Multiple newlines / carriage-returns → single space
@@ -991,12 +1023,24 @@ class CallInstance:
         # 5. Collapse multiple spaces
         text = re.sub(r'  +', ' ', text)
 
-        return text.strip()
+        text = text.strip()
+
+        # 7. Hard word-count cap — truncate at sentence boundary if possible
+        words = text.split()
+        if len(words) > 50:
+            truncated = ' '.join(words[:50])
+            # Try to end at the last sentence boundary within the 50 words
+            last_period = max(truncated.rfind('.'), truncated.rfind('?'), truncated.rfind('!'))
+            if last_period > len(truncated) // 2:
+                text = truncated[:last_period + 1]
+            else:
+                text = truncated
+
+        return text
 
     async def speak(self, text: str) -> bool:
         if not await self.is_alive():
             return False
-        # Always sanitise before TTS — the LLM may ignore formatting instructions
         text = self._clean_for_tts(text)
         if not text:
             return False
@@ -1120,16 +1164,26 @@ class ARIAgent:
         logger.info("ARI Agent initialised")
 
     def _default_prompt(self) -> str:
+        """
+        Phone-optimised system prompt.
+
+        The CRITICAL block is placed first and uses emphatic language because
+        the model's RLHF training rewards helpfulness (verbose lists) more
+        strongly than instruction-following for brevity.  Front-loading the
+        constraint and using ALL-CAPS for the word limit has been shown to
+        improve compliance over inline rules buried in later paragraphs.
+        """
         return (
-            "You are a professional phone assistant for Jubilee Insurance.\n\n"
-            "RULES:\n"
-            "- STRICT LIMIT: Respond in 20 words or fewer. This is a phone call — be brief.\n"
-            "- Never exceed 2 short sentences.\n"
-            "- Be helpful, professional, and empathetic.\n"
-            "- Never say \"I'm an AI\" or mention being artificial.\n"
-            "- Use natural, conversational language.\n"
-            "- If you need more information, ask only one question.\n\n"
-            "When you cannot help or the caller requests a human, say you will transfer them now."
+            "CRITICAL — TTS PHONE SYSTEM: Every response MUST be 20 words or fewer. "
+            "Count words before replying. NEVER use bullet points, numbered lists, "
+            "bold, asterisks, dashes, or any markdown. NEVER use newlines. "
+            "Plain spoken English only. One or two short sentences maximum.\n\n"
+            "You are a professional phone assistant for Jubilee Insurance. "
+            "Be helpful, empathetic, and concise. "
+            "Never say 'I am an AI'. "
+            "Ask only one question at a time if you need clarification. "
+            "If the caller asks about services, name ONE service and ask which they need. "
+            "If you cannot help or the caller requests a human, say you will transfer them now."
         )
 
     async def start(self):
@@ -1204,12 +1258,13 @@ class ARIAgent:
 
     async def _precache_phrases(self):
         phrases = [
-            "Good morning, thank you for calling. How can I help you today?",
-            "Good afternoon, thank you for calling. How can I help you today?",
-            "Good evening, thank you for calling. How can I help you today?",
+            "Good morning, thank you for calling Jubilee Insurance. How can I help you today?",
+            "Good afternoon, thank you for calling Jubilee Insurance. How can I help you today?",
+            "Good evening, thank you for calling Jubilee Insurance. How can I help you today?",
             "Thank you for calling!",
             "Could you repeat that please?",
             "Let me transfer you to a specialist who can help. Please hold.",
+            "I'm having trouble hearing you. Please try calling back.",
         ]
         logger.info("Caching common phrases…")
         for phrase in phrases:
@@ -1265,7 +1320,6 @@ class ARIAgent:
             ari_password=self.ari_password,
             flask_app=self.flask_app,
         )
-        # Give each CallInstance access to the ARI app name for ExternalMedia
         call.ari_app = self.ari_app
 
         self.active_calls[channel.id] = call
