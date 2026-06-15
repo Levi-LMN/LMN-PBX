@@ -1,7 +1,7 @@
 # config.py
 """
 Configuration management for the FreePBX AI Assistant application.
-Updated for OpenAI Realtime API voice integration.
+Updated for Azure Voice Live API voice integration.
 """
 
 import os
@@ -17,7 +17,7 @@ class Config:
     SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key-change-in-production")
 
     # Database
-    SQLALCHEMY_DATABASE_URI    = os.getenv("DATABASE_URL", "sqlite:///freepbx_ai.db")
+    SQLALCHEMY_DATABASE_URI        = os.getenv("DATABASE_URL", "sqlite:///freepbx_ai.db")
     SQLALCHEMY_TRACK_MODIFICATIONS = False
 
     # ARI (Asterisk REST Interface)
@@ -27,35 +27,47 @@ class Config:
     ARI_PASSWORD = os.getenv("ARI_PASSWORD", "your_ari_password")
     ARI_APP      = os.getenv("ARI_APP",      "ai-agent")
 
-    # ── OpenAI Realtime API (PRIMARY voice path) ──────────────────────────────
-    # Replaces the old STT → Chat → TTS pipeline.
-    # One WebSocket connection handles STT, LLM, and TTS simultaneously,
-    # reducing response latency from ~3-5 s to ~300 ms.
-    OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
-    OPENAI_VOICE       = os.getenv("OPENAI_VOICE", "alloy")
-    # Supported voices: alloy, echo, shimmer, ash, ballad, coral, sage, verse
+    # ── Azure Voice Live API (PRIMARY voice path) ─────────────────────────────
+    # Single WebSocket connection handles STT (Azure Speech), LLM (GPT-4o Realtime),
+    # and TTS (Azure Neural Voices) simultaneously.
+    #
+    # Required env vars:
+    #   AZURE_VOICE_LIVE_RESOURCE  — your AI Foundry resource name
+    #                                (the subdomain of .services.ai.azure.com)
+    #   AZURE_SPEECH_KEY           — your API key for the resource
+    #
+    # Optional:
+    #   AZURE_VOICE_NAME           — Azure neural voice (default: en-US-AvaNeural)
+    #   AZURE_VOICE_TYPE           — "azure-standard" or "azure-custom"
+    #   AZURE_VOICE_LIVE_MODEL     — model to use (default: gpt-realtime)
+    AZURE_VOICE_LIVE_RESOURCE = os.getenv("AZURE_VOICE_LIVE_RESOURCE", "")
+    AZURE_SPEECH_KEY          = os.getenv("AZURE_SPEECH_KEY",          "")
+    AZURE_SPEECH_REGION       = os.getenv("AZURE_SPEECH_REGION",       "eastus")
+    AZURE_VOICE_NAME          = os.getenv("AZURE_VOICE_NAME",          "en-US-AvaNeural")
+    AZURE_VOICE_TYPE          = os.getenv("AZURE_VOICE_TYPE",          "azure-standard")
+    AZURE_VOICE_LIVE_MODEL    = os.getenv("AZURE_VOICE_LIVE_MODEL",    "gpt-realtime")
 
     # RTP port range for ExternalMedia channels (one port-pair per concurrent call)
     RTP_PORT_START = int(os.getenv("RTP_PORT_START", "20000"))
     RTP_PORT_END   = int(os.getenv("RTP_PORT_END",   "20100"))
 
     # ── Azure OpenAI REST (used by admin dashboard only) ──────────────────────
-    AZURE_OPENAI_KEY        = os.getenv("AZURE_OPENAI_KEY",        "")
-    AZURE_OPENAI_ENDPOINT   = os.getenv("AZURE_OPENAI_ENDPOINT",   "")
-    AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
-    AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION","2024-08-01-preview")
+    # Not on the call hot-path — used for intent classification & KB scoring.
+    AZURE_OPENAI_KEY         = os.getenv("AZURE_OPENAI_KEY",         "")
+    AZURE_OPENAI_ENDPOINT    = os.getenv("AZURE_OPENAI_ENDPOINT",    "")
+    AZURE_OPENAI_DEPLOYMENT  = os.getenv("AZURE_OPENAI_DEPLOYMENT",  "gpt-4o-mini")
+    AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
 
-    # ── Azure Speech (no longer used on call hot-path) ────────────────────────
-    # Kept here so existing admin UI config pages don't break.
-    AZURE_SPEECH_KEY    = os.getenv("AZURE_SPEECH_KEY",    "")
-    AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "eastus")
+    # ── Legacy OpenAI (no longer used on call hot-path) ───────────────────────
+    # Kept so existing dashboard pages that reference OPENAI_API_KEY don't break.
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
     # SSH (for direct file ops, if needed)
-    SSH_HOST             = os.getenv("SSH_HOST",   "localhost")
-    SSH_PORT             = int(os.getenv("SSH_PORT", "22"))
-    SSH_USER             = os.getenv("SSH_USER",   "sangoma")
-    SSH_PASSWORD         = os.getenv("SSH_PASSWORD","sangoma")
-    ASTERISK_SOUNDS_DIR  = os.getenv("ASTERISK_SOUNDS_DIR", "/var/lib/asterisk/sounds/custom")
+    SSH_HOST            = os.getenv("SSH_HOST",   "localhost")
+    SSH_PORT            = int(os.getenv("SSH_PORT", "22"))
+    SSH_USER            = os.getenv("SSH_USER",   "sangoma")
+    SSH_PASSWORD        = os.getenv("SSH_PASSWORD", "sangoma")
+    ASTERISK_SOUNDS_DIR = os.getenv("ASTERISK_SOUNDS_DIR", "/var/lib/asterisk/sounds/custom")
 
     # Dataverse (optional)
     DATAVERSE_URL = os.getenv("DATAVERSE_URL", "")
@@ -69,7 +81,7 @@ class Config:
     ESCALATION_THRESHOLD = int(os.getenv("ESCALATION_THRESHOLD", "3"))
     MAX_CALL_DURATION    = int(os.getenv("MAX_CALL_DURATION",    "600"))
 
-    # AI system prompt (passed to OpenAI Realtime session.update)
+    # AI system prompt — passed to Azure Voice Live session.update as `instructions`
     DEFAULT_SYSTEM_PROMPT = os.getenv("DEFAULT_SYSTEM_PROMPT", (
         "You are a professional phone assistant for Jubilee Insurance.\n\n"
         "Your role is to:\n"
@@ -100,8 +112,11 @@ class ProductionConfig(Config):
     if not os.getenv("SECRET_KEY"):
         raise ValueError("SECRET_KEY must be set in production environment")
 
-    if not os.getenv("OPENAI_API_KEY"):
-        raise ValueError("OPENAI_API_KEY must be set in production environment")
+    if not os.getenv("AZURE_SPEECH_KEY"):
+        raise ValueError("AZURE_SPEECH_KEY must be set in production environment")
+
+    if not os.getenv("AZURE_VOICE_LIVE_RESOURCE"):
+        raise ValueError("AZURE_VOICE_LIVE_RESOURCE must be set in production environment")
 
 
 class TestingConfig(Config):

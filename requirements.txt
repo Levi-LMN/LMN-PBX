@@ -11,19 +11,24 @@ aioari~=0.10.2
 requests~=2.32.3
 aiohttp~=3.9.5
 
-# ── OpenAI Realtime API (PRIMARY voice path) ──────────────────────────────────
-# WebSocket connection replaces STT + chat REST + TTS pipeline.
-# Cuts per-turn latency from ~3-5 s down to ~300 ms.
+# ── Azure Voice Live API (PRIMARY voice path) ──────────────────────────────────
+# Single WebSocket connection replaces the old STT → Chat REST → TTS pipeline.
+# Handles speech recognition (Azure Speech), LLM (GPT-4o Realtime), and
+# TTS (Azure Neural Voices) in one hop.
 websockets~=12.0
-openai~=1.54.4          # Still used by admin dashboard (REST chat completions)
+
+# Azure Speech SDK — still used by the admin dashboard for analytics;
+# Voice Live API connects via raw WebSocket (no SDK dependency on call path).
+azure-cognitiveservices-speech~=1.40.0
+
+# ── Azure OpenAI REST (admin dashboard only) ──────────────────────────────────
+# Used for intent classification & knowledge-base scoring in the admin UI.
+# NOT on the live call hot-path.
+openai~=1.54.4
 
 # Audio processing (PCM ↔ μ-law conversion, sample-rate conversion)
 # audioop is part of Python stdlib up to 3.12; on 3.13+ install audioop-lts
 # audioop-lts; python_requires >= "3.13"   # uncomment if on Python 3.13+
-
-# ── Azure services (admin dashboard / optional TTS fallback) ──────────────────
-# No longer on the call hot-path — safe to keep for admin analytics.
-azure-cognitiveservices-speech~=1.40.0
 
 # Audio file utilities (kept for any offline pre-caching scripts)
 pydub~=0.25.1
