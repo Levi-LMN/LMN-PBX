@@ -1,153 +1,133 @@
 # services/ari_agent.py
 """
-ARI-based agent using Azure Voice Live API for low-latency voice.
+ARI agent using Azure Voice Live API.
 
 Architecture:
-  Caller → Asterisk → ARI ExternalMedia → RTP UDP socket (this service)
-         ↕ PCM audio (μ-law 8kHz)
-  This service ↔ Azure Voice Live WebSocket (PCM16 16kHz)
-  ↓ audio back → RTP → Asterisk → Caller
+  Caller → Asterisk ARI ExternalMedia → UDP RTP (this service)
+  This service ↔ Azure Voice Live WebSocket
+  Azure audio → UDP RTP → Asterisk → Caller
 
-Escalation flow:
-  1. Caller says a transfer keyword OR AI announces a transfer
-  2. _handle_escalation() removes ExternalMedia from bridge (AI audio stops)
-  3. channel.continueInDialplan() sends caller to the department extension
-  4. Softphone / ring group rings
+Audio path (inbound):
+  μ-law 8kHz RTP  →  ulaw2lin  →  PCM16 8kHz  →  base64  →  Azure (declared 8kHz)
+
+Audio path (outbound):
+  Azure PCM16 24kHz  →  ratecv 24→8kHz  →  lin2ulaw  →  RTP → Asterisk
+
+Escalation:
+  Caller says transfer keyword  OR  AI announces transfer
+  → remove ExternalMedia from bridge → continueInDialplan → FreePBX dept ext
 """
 
 import asyncio
-import aiohttp
-from aiohttp.web_exceptions import HTTPUnprocessableEntity
-import aioari
-import os
-import socket
-import struct
 import audioop
 import base64
 import inspect
 import json
 import logging
+import os
+import socket
+import struct
 import websockets
+from aiohttp.web_exceptions import HTTPUnprocessableEntity
 from datetime import datetime
-from flask import Flask
 
-AZURE_VOICE_LIVE_HOST_SUFFIX = os.getenv(
-    "AZURE_VOICE_LIVE_HOST_SUFFIX", "services.ai.azure.com"
-)
+import aioari
 
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
 
-AZURE_VOICE_LIVE_API_VERSION = "2025-10-01"
-AZURE_VOICE_LIVE_MODEL       = "gpt-realtime"
+AZURE_API_VERSION   = "2025-10-01"
+AZURE_MODEL         = "gpt-realtime"
+AZURE_HOST_SUFFIX   = os.getenv("AZURE_VOICE_LIVE_HOST_SUFFIX", "services.ai.azure.com")
 
-ASTERISK_SAMPLE_RATE = 8000
-AZURE_SAMPLE_RATE    = 24000   # Azure Voice Live processes at 24 kHz internally
-AZURE_OUTPUT_RATE    = 24000
-RTP_HEADER_SIZE      = 12
+# Asterisk sends μ-law 8kHz; we tell Azure input is PCM16 8kHz (no upsample needed)
+ASTERISK_RATE  = 8000
+AZURE_IN_RATE  = 8000   # what we declare to Azure for input
+AZURE_OUT_RATE = 24000  # Azure always outputs 24kHz PCM16
 
-RTP_LISTEN_HOST = "0.0.0.0"
-RTP_PORT_START  = 20000
-RTP_PORT_END    = 20100
+RTP_HEADER_SIZE   = 12
+ULAW_FRAME_BYTES  = 160   # 20 ms @ 8kHz
+FRAME_DURATION    = 0.020  # seconds
+
+RTP_HOST  = "0.0.0.0"
+RTP_START = 20000
+RTP_END   = 20100
 
 
-def _build_azure_ws_url(resource_name: str, model: str) -> str:
+def _azure_ws_url(resource: str) -> str:
     return (
-        f"wss://{resource_name}.{AZURE_VOICE_LIVE_HOST_SUFFIX}"
+        f"wss://{resource}.{AZURE_HOST_SUFFIX}"
         f"/voice-live/realtime"
-        f"?api-version={AZURE_VOICE_LIVE_API_VERSION}"
-        f"&model={model}"
+        f"?api-version={AZURE_API_VERSION}"
+        f"&model={AZURE_MODEL}"
     )
 
 
-def _resolve_hostname(hostname: str) -> bool:
-    try:
-        socket.getaddrinfo(hostname, None)
-        return True
-    except socket.gaierror:
-        return False
-
-
-def _ws_header_kwargs(headers: dict) -> dict:
+def _ws_connect_kwargs(api_key: str) -> dict:
+    """Return the right header kwarg for the installed websockets version."""
     try:
         params = inspect.signature(websockets.connect).parameters
     except (TypeError, ValueError):
-        params = inspect.signature(websockets.connect.__init__).parameters
-    if "additional_headers" in params:
-        return {"additional_headers": headers}
-    return {"extra_headers": headers}
+        params = {}
+    key = "additional_headers" if "additional_headers" in params else "extra_headers"
+    return {key: {"api-key": api_key}}
 
 
-def _ws_is_open(ws) -> bool:
+def _ws_open(ws) -> bool:
     if ws is None:
         return False
     if hasattr(ws, "closed"):
         return not ws.closed
     if hasattr(ws, "state"):
-        return ws.state == websockets.State.OPEN
+        import websockets.connection
+        return ws.state == websockets.connection.State.OPEN
     return True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ARIAgent — top-level service, one per process
-# ─────────────────────────────────────────────────────────────────────────────
+# ── ARIAgent ──────────────────────────────────────────────────────────────────
 
 class ARIAgent:
-    """Manages the ARI WebSocket connection and spawns one session per call."""
+    """Top-level service: connects to ARI, spawns one session per inbound call."""
 
     def __init__(self, app_config, flask_app=None):
-        self.config    = app_config
-        self.flask_app = flask_app
-        self.running   = False
-        self.active_calls: dict[str, "AzureVoiceLiveCallSession"] = {}
+        self.flask_app  = flask_app
+        self.running    = False
         self.total_calls = 0
+        self.active_calls: dict[str, "CallSession"] = {}
 
-        self.ari_base     = os.getenv("ARI_BASE",     "http://localhost:8088")
-        self.ari_username = os.getenv("ARI_USERNAME", "asterisk")
-        self.ari_password = os.getenv("ARI_PASSWORD", "your_ari_password")
-        self.ari_app      = os.getenv("ARI_APP",      "ai-agent")
-        self.ari_url      = os.getenv("ARI_URL",      "http://localhost:8088/ari")
+        self.ari_base     = app_config.get("ARI_BASE",     "http://localhost:8088")
+        self.ari_username = app_config.get("ARI_USERNAME", "asterisk")
+        self.ari_password = app_config.get("ARI_PASSWORD", "your_ari_password")
+        self.ari_app      = app_config.get("ARI_APP",      "ai-agent")
+        self.ari_url      = app_config.get("ARI_URL",      "http://localhost:8088/ari")
 
-        self.azure_resource   = os.getenv("AZURE_VOICE_LIVE_RESOURCE", "")
-        self.azure_api_key    = os.getenv("AZURE_SPEECH_KEY", "")
-        self.azure_voice_name = os.getenv("AZURE_VOICE_NAME", "en-KE-AsiliaNeural")
-        self.azure_voice_type = os.getenv("AZURE_VOICE_TYPE", "azure-standard")
-        self.system_prompt    = os.getenv("DEFAULT_SYSTEM_PROMPT") or self._default_prompt()
+        self.azure_resource   = app_config.get("AZURE_VOICE_LIVE_RESOURCE", "")
+        self.azure_api_key    = app_config.get("AZURE_SPEECH_KEY", "")
+        self.azure_voice_name = app_config.get("AZURE_VOICE_NAME", "en-KE-AsiliaNeural")
+        self.azure_voice_type = app_config.get("AZURE_VOICE_TYPE", "azure-standard")
+        self.system_prompt    = app_config.get("DEFAULT_SYSTEM_PROMPT") or self._default_prompt()
 
-        self._next_rtp_port = RTP_PORT_START
         self._port_lock     = asyncio.Lock()
+        self._next_rtp_port = RTP_START
         self.ari_client     = None
         self._config_ok     = bool(self.azure_resource and self.azure_api_key)
 
-    # ── Properties for admin dashboard compatibility ───────────────────────────
+    # ── Dashboard compatibility ───────────────────────────────────────────────
 
     @property
     def ai_client(self):
-        """
-        Alias for ari_client — keeps the admin dashboard's system-status
-        check (``ari_agent.ai_client``) working without modifying route code.
-        Returns the live aioari client, or None if not yet connected.
-        """
         return self.ari_client
 
     @property
     def is_connected(self) -> bool:
-        """True when the ARI WebSocket is open and the agent is running."""
         return self.running and self.ari_client is not None
 
     @property
     def active_call_count(self) -> int:
-        """Number of calls currently being handled."""
         return len(self.active_calls)
 
     def get_status(self) -> dict:
-        """
-        Return a status dict consumed by /admin/api/system-status.
-        Keeps all status logic in one place rather than scattered across routes.
-        """
         return {
             "connected":      self.is_connected,
             "running":        self.running,
@@ -157,49 +137,8 @@ class ARIAgent:
             "azure_resource": self.azure_resource or "not set",
             "voice_name":     self.azure_voice_name,
             "voice_type":     self.azure_voice_type,
-            "model":          AZURE_VOICE_LIVE_MODEL,
+            "model":          AZURE_MODEL,
         }
-
-    # ── Default system prompt ─────────────────────────────────────────────────
-
-    def _default_prompt(self):
-        return (
-            "You are Ari, a friendly and knowledgeable phone assistant for Jubilee Insurance Kenya. "
-            "You have detailed knowledge of our products: motor, medical, life, last expense, "
-            "home, and travel insurance, plus claims processes and payment methods. "
-            "OUTPUT LANGUAGE — ABSOLUTE RULE, HIGHEST PRIORITY, OVERRIDES EVERYTHING ELSE: "
-            "Your output language is ENGLISH. Always. Every single response. No exceptions. "
-            "Even if the caller speaks Swahili, Sheng, Spanish, or any other language — "
-            "your reply is always in English. Even if the transcription you receive is in another "
-            "language — your reply is always in English. Never produce a single word in any "
-            "language other than English. Do not mirror, echo, or match the caller's language. "
-            "If you ever feel tempted to respond in another language, respond in English instead. "
-            "RULES: "
-            "(1) Give complete, helpful answers — 3 to 6 sentences is ideal. Never cut an answer short. "
-            "If a topic needs more detail to be useful, provide it. "
-            "(2) Never read bullet points — weave all information conversationally into flowing sentences. "
-            "(3) Be warm, natural, and conversational — like a knowledgeable Kenyan insurance agent on the phone. "
-            "Use natural connecting phrases: 'So what happens is...', 'The good news is...', 'What you'll need to do is...'. "
-            "(4) If asked broadly about all products or what we offer, name ALL of them in ONE response: "
-            "motor, medical, life, last expense, home, and travel insurance. Never drip them one per turn. "
-            "(5) Use specific details — KES amounts, timelines, M-PESA paybill numbers — when relevant. "
-            "(6) Never say you are an AI. "
-            "(7) Never use hollow filler like 'Certainly', 'Of course', 'Absolutely', or 'Great question'. "
-            "(8) Only transfer to a human if the caller EXPLICITLY says they want to speak to a person, agent, or manager. "
-            "(9) When transferring, say exactly: 'Let me transfer you to one of our agents right away.' "
-            "EXAMPLE — Caller asks what you offer: "
-            "We offer six types of cover here at Jubilee — motor, medical, life, last expense, home, and travel insurance. "
-            "Each one is designed to protect what matters most to you and your family. "
-            "Which of those would you like to know more about?"
-        )
-
-    async def _alloc_rtp_port(self) -> int:
-        async with self._port_lock:
-            port = self._next_rtp_port
-            self._next_rtp_port = port + 2
-            if self._next_rtp_port > RTP_PORT_END:
-                self._next_rtp_port = RTP_PORT_START
-            return port
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -208,20 +147,12 @@ class ARIAgent:
         logger.info("=" * 60)
         logger.info(f"   Resource : {self.azure_resource}")
         logger.info(f"   Voice    : {self.azure_voice_name} ({self.azure_voice_type})")
-        logger.info(f"   Model    : {AZURE_VOICE_LIVE_MODEL}")
+        logger.info(f"   Model    : {AZURE_MODEL}")
         logger.info("=" * 60)
 
-        if not self.azure_resource:
-            logger.error("❌ AZURE_VOICE_LIVE_RESOURCE not set — cannot start")
+        if not self.azure_resource or not self.azure_api_key:
+            logger.error("❌ AZURE_VOICE_LIVE_RESOURCE / AZURE_SPEECH_KEY not set")
             return
-        if not self.azure_api_key:
-            logger.error("❌ AZURE_SPEECH_KEY not set — cannot start")
-            return
-
-        _azure_hostname = f"{self.azure_resource}.{AZURE_VOICE_LIVE_HOST_SUFFIX}"
-        if not _resolve_hostname(_azure_hostname):
-            logger.error(f"❌ Cannot resolve '{_azure_hostname}' — check DNS/firewall")
-            self._config_ok = False
 
         try:
             logger.info(f"Connecting to ARI at {self.ari_base} …")
@@ -230,9 +161,9 @@ class ARIAgent:
             )
             logger.info("✅ ARI connected")
 
-            self.ari_client.on_event("StasisStart",          self._handle_stasis_start)
-            self.ari_client.on_event("StasisEnd",            self._handle_stasis_end)
-            self.ari_client.on_event("ChannelHangupRequest", self._handle_hangup_request)
+            self.ari_client.on_event("StasisStart",          self._on_stasis_start)
+            self.ari_client.on_event("StasisEnd",            self._on_stasis_end)
+            self.ari_client.on_event("ChannelHangupRequest", self._on_hangup_request)
 
             logger.info("🎙️  READY — waiting for calls")
             logger.info("=" * 60)
@@ -244,109 +175,108 @@ class ARIAgent:
 
     async def stop(self):
         self.running = False
-        for session in list(self.active_calls.values()):
-            await session.close()
+        for s in list(self.active_calls.values()):
+            await s.close()
         if self.ari_client:
             try:
                 await self.ari_client.close()
             except Exception:
                 pass
-        logger.info("ARIAgent stopped")
 
-    # ── ARI event handlers ────────────────────────────────────────────────────
+    # ── ARI events ────────────────────────────────────────────────────────────
 
-    def _handle_stasis_start(self, event):
-        channel_name = event.get("channel", {}).get("name", "")
-        if channel_name.startswith("UnicastRTP/"):
-            return  # Ignore ExternalMedia channels
-        asyncio.create_task(self._process_call(event))
-
-    def _handle_stasis_end(self, event):
-        channel_id   = event.get("channel", {}).get("id", "")
-        channel_name = event.get("channel", {}).get("name", "")
-        # Ignore ExternalMedia channels — their StasisEnd fires when we tear them
-        # down intentionally and does NOT mean the caller hung up.
-        if channel_name.startswith("UnicastRTP/"):
+    def _on_stasis_start(self, event):
+        name = event.get("channel", {}).get("name", "")
+        if name.startswith("UnicastRTP/"):
             return
-        if channel_id in self.active_calls:
-            logger.info(f"📴 [{channel_id[:12]}] StasisEnd — caller hung up")
-            sess = self.active_calls[channel_id]
-            sess.caller_hung_up = True
-            sess._closed = True
-        else:
-            logger.debug(f"StasisEnd for unknown channel {channel_id[:12]} (name={channel_name})")
+        asyncio.create_task(self._handle_call(event))
 
-    def _handle_hangup_request(self, event):
-        channel_id   = event.get("channel", {}).get("id", "")
-        channel_name = event.get("channel", {}).get("name", "")
-        if channel_name.startswith("UnicastRTP/"):
+    def _on_stasis_end(self, event):
+        name = event.get("channel", {}).get("name", "")
+        cid  = event.get("channel", {}).get("id", "")
+        if name.startswith("UnicastRTP/"):
             return
-        if channel_id in self.active_calls:
-            logger.info(f"📴 [{channel_id[:12]}] HangupRequest — caller hanging up")
-            sess = self.active_calls[channel_id]
+        sess = self.active_calls.get(cid)
+        if sess:
+            logger.info(f"📴 [{cid[:12]}] Caller hung up (StasisEnd)")
             sess.caller_hung_up = True
             sess._closed = True
 
-    async def _process_call(self, event):
-        channel_id = event.get("channel", {}).get("id")
-        if not channel_id:
+    def _on_hangup_request(self, event):
+        name = event.get("channel", {}).get("name", "")
+        cid  = event.get("channel", {}).get("id", "")
+        if name.startswith("UnicastRTP/"):
+            return
+        sess = self.active_calls.get(cid)
+        if sess:
+            logger.info(f"📴 [{cid[:12]}] Caller hanging up (HangupRequest)")
+            sess.caller_hung_up = True
+            sess._closed = True
+
+    async def _handle_call(self, event):
+        cid = event.get("channel", {}).get("id")
+        if not cid:
             return
         try:
-            channel = await self.ari_client.channels.get(channelId=channel_id)
-            await self._handle_call(channel)
+            channel = await self.ari_client.channels.get(channelId=cid)
         except Exception as e:
-            logger.error(f"❌ Call processing error: {e}")
+            logger.error(f"❌ Could not get channel {cid}: {e}")
+            return
 
-    async def _handle_call(self, channel):
-        caller_number = channel.json.get("caller", {}).get("number", "Unknown")
-        logger.info(f"📞 Incoming call from {caller_number}")
+        caller = channel.json.get("caller", {}).get("number", "Unknown")
+        logger.info(f"📞 Incoming call from {caller}")
 
         if not self._config_ok:
-            logger.error(f"❌ Rejecting call — Azure Voice Live not reachable")
+            logger.error("❌ Rejecting call — Azure not configured")
             try:
                 await channel.answer()
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)
                 await channel.hangup()
             except Exception:
                 pass
             return
 
-        rtp_port       = await self._alloc_rtp_port()
-        ws_url         = _build_azure_ws_url(self.azure_resource, AZURE_VOICE_LIVE_MODEL)
-        enriched_prompt = self.system_prompt + self._load_knowledge_context()
+        rtp_port = await self._alloc_rtp_port()
+        prompt   = self.system_prompt + self._load_kb()
 
-        session = AzureVoiceLiveCallSession(
+        sess = CallSession(
             channel       = channel,
             ari_client    = self.ari_client,
+            ari_app       = self.ari_app,
+            azure_ws_url  = _azure_ws_url(self.azure_resource),
             azure_api_key = self.azure_api_key,
-            azure_ws_url  = ws_url,
             voice_name    = self.azure_voice_name,
             voice_type    = self.azure_voice_type,
-            system_prompt = enriched_prompt,
+            system_prompt = prompt,
             rtp_port      = rtp_port,
-            ari_url       = self.ari_url,
-            ari_username  = self.ari_username,
-            ari_password  = self.ari_password,
             flask_app     = self.flask_app,
         )
 
-        self.active_calls[channel.id] = session
+        self.active_calls[cid] = sess
         self.total_calls += 1
-        self._db_log_call_start(channel.id, caller_number)
+        self._db_call_start(cid, caller)
 
         try:
-            await session.run()
+            await sess.run()
         except Exception as e:
-            logger.error(f"❌ Session error: {e}")
-            self._db_log_call_error(channel.id, str(e))
+            logger.error(f"❌ Session error: {e}", exc_info=True)
+            self._db_call_error(cid)
         finally:
-            self.active_calls.pop(channel.id, None)
-            await session.close()
-            self._db_log_call_end(session)
+            self.active_calls.pop(cid, None)
+            await sess.close()
+            self._db_call_end(sess)
 
-    # ── Knowledge base loader ─────────────────────────────────────────────────
+    async def _alloc_rtp_port(self) -> int:
+        async with self._port_lock:
+            port = self._next_rtp_port
+            self._next_rtp_port = port + 2
+            if self._next_rtp_port > RTP_END:
+                self._next_rtp_port = RTP_START
+            return port
 
-    def _load_knowledge_context(self) -> str:
+    # ── Knowledge base ────────────────────────────────────────────────────────
+
+    def _load_kb(self) -> str:
         if not self.flask_app:
             return ""
         try:
@@ -360,36 +290,34 @@ class ARIAgent:
                 )
                 if not entries:
                     return ""
-                parts = ["\n\nKNOWLEDGE BASE — use this to answer callers accurately:"]
+                parts = ["\n\nKNOWLEDGE BASE:"]
                 for e in entries:
                     parts.append(f"\n[{e.category.upper()}] {e.title}:\n{e.content}")
                     e.increment_usage()
                 db.session.commit()
-                logger.info(f"📚 Loaded {len(entries)} knowledge base entries into session prompt")
+                logger.info(f"📚 Loaded {len(entries)} KB entries")
                 return "\n".join(parts)
-        except Exception as exc:
-            logger.error(f"KB load error: {exc}")
+        except Exception as e:
+            logger.error(f"KB load error: {e}")
             return ""
 
     # ── DB helpers ────────────────────────────────────────────────────────────
 
-    def _db_log_call_start(self, call_id, caller_number):
+    def _db_call_start(self, call_id, caller):
         if not self.flask_app:
             return
         try:
             with self.flask_app.app_context():
                 from models import db, Call
                 db.session.add(Call(
-                    call_id       = call_id,
-                    caller_number = caller_number,
-                    status        = "active",
-                    started_at    = datetime.utcnow(),
+                    call_id=call_id, caller_number=caller,
+                    status="active", started_at=datetime.utcnow(),
                 ))
                 db.session.commit()
         except Exception as e:
-            logger.error(f"DB log start error: {e}")
+            logger.error(f"DB call start error: {e}")
 
-    def _db_log_call_error(self, call_id, error_msg):
+    def _db_call_error(self, call_id):
         if not self.flask_app:
             return
         try:
@@ -397,127 +325,123 @@ class ARIAgent:
                 from models import db, Call
                 c = Call.query.filter_by(call_id=call_id).first()
                 if c:
-                    c.status   = "error"
+                    c.status = "error"
                     c.ended_at = datetime.utcnow()
                     db.session.commit()
         except Exception as e:
-            logger.error(f"DB log error: {e}")
+            logger.error(f"DB call error log: {e}")
 
-    def _db_log_call_end(self, session: "AzureVoiceLiveCallSession"):
+    def _db_call_end(self, sess: "CallSession"):
         if not self.flask_app:
             return
         try:
             with self.flask_app.app_context():
                 from models import db, Call
-                c = Call.query.filter_by(call_id=session.channel_id).first()
+                c = Call.query.filter_by(call_id=sess.channel_id).first()
                 if c:
-                    c.status    = "escalated" if session.escalated else "completed"
-                    c.escalated = session.escalated
+                    c.status    = "escalated" if sess.escalated else "completed"
+                    c.escalated = sess.escalated
                     c.ended_at  = datetime.utcnow()
                     if c.started_at:
-                        c.duration_seconds = int(
-                            (c.ended_at - c.started_at).total_seconds()
-                        )
+                        c.duration_seconds = int((c.ended_at - c.started_at).total_seconds())
                     db.session.commit()
         except Exception as e:
-            logger.error(f"DB log end error: {e}")
+            logger.error(f"DB call end error: {e}")
+
+    def _default_prompt(self):
+        return (
+            "You are Ari, a friendly and knowledgeable phone assistant for Jubilee Insurance Kenya. "
+            "You have detailed knowledge of our products: motor, medical, life, last expense, "
+            "home, and travel insurance, plus claims processes and payment methods. "
+            "OUTPUT LANGUAGE — ABSOLUTE RULE: Your output is ALWAYS English. No exceptions. "
+            "Even if the caller speaks Swahili or any other language, reply in English only. "
+            "RULES: "
+            "(1) Give complete helpful answers — 3 to 6 sentences. "
+            "(2) Never read bullet points — speak conversationally. "
+            "(3) Be warm and natural, like a Kenyan insurance agent on the phone. "
+            "(4) If asked broadly about products, name ALL: motor, medical, life, last expense, home, travel. "
+            "(5) Use specific details — KES amounts, M-PESA paybill numbers — when relevant. "
+            "(6) Never say you are an AI. "
+            "(7) Never use filler like 'Certainly', 'Of course', 'Absolutely', or 'Great question'. "
+            "(8) Only transfer if the caller EXPLICITLY asks to speak to a person or agent. "
+            "(9) When transferring say exactly: 'Let me transfer you to one of our agents right away.'"
+        )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AzureVoiceLiveCallSession — one per inbound call
-# ─────────────────────────────────────────────────────────────────────────────
+# ── CallSession ───────────────────────────────────────────────────────────────
 
-class AzureVoiceLiveCallSession:
-    """
-    Manages a single call:
-      - Asterisk RTP ↔ Azure Voice Live WebSocket (audio bridge)
-      - Escalation detection on caller and AI transcripts
-      - Transfer via continueInDialplan → FreePBX softphone / ring group
-    """
+class CallSession:
+    """Manages one inbound call: RTP ↔ Azure Voice Live WebSocket."""
 
-    # Keywords in the CALLER's speech that trigger a transfer
     TRANSFER_KEYWORDS = {
         "speak to", "talk to", "human", "person", "agent",
         "representative", "manager", "supervisor", "someone else",
         "transfer", "escalate", "real person", "actual person",
         "real agent", "sales agent", "customer service",
     }
-
-    # Phrases in the AI's speech that mean it has committed to a transfer.
-    # Keep these specific — avoid generic words like "right away" that also
-    # appear in normal (non-transfer) sentences.
     AI_TRANSFER_PHRASES = [
-        "transfer you to",
-        "transferring you to",
-        "connect you to",
-        "put you through to",
-        "one of our agents",
-        "speak to an agent",
+        "transfer you to", "transferring you to", "connect you to",
+        "put you through to", "one of our agents", "speak to an agent",
     ]
 
-    ULAW_PACKET_BYTES = 160       # 20 ms @ 8 kHz μ-law
-    PACKET_INTERVAL_S = 0.020
-
-    def __init__(self, *, channel, ari_client, azure_api_key, azure_ws_url,
-                 voice_name, voice_type, system_prompt, rtp_port,
-                 ari_url, ari_username, ari_password, flask_app):
+    def __init__(self, *, channel, ari_client, ari_app, azure_ws_url,
+                 azure_api_key, voice_name, voice_type, system_prompt,
+                 rtp_port, flask_app):
         self.channel        = channel
         self.channel_id     = channel.id
         self.ari_client     = ari_client
-        self.azure_api_key  = azure_api_key
+        self.ari_app        = ari_app
         self.azure_ws_url   = azure_ws_url
+        self.azure_api_key  = azure_api_key
         self.voice_name     = voice_name
         self.voice_type     = voice_type
         self.system_prompt  = system_prompt
         self.rtp_port       = rtp_port
-        self.ari_url        = ari_url
-        self.ari_username   = ari_username
-        self.ari_password   = ari_password
         self.flask_app      = flask_app
 
         self.caller_hung_up     = False
         self.escalated          = False
         self._closed            = False
         self._greeting_sent     = False
-        self._ai_transcript_buf = ""
+        self._ai_buf            = ""
 
-        self._udp_sock:           socket.socket | None = None
-        self._asterisk_rtp_addr:  tuple | None         = None
-        self._rtp_seq  = 0
-        self._rtp_ts   = 0
-        self._rtp_ssrc = 0xDEADBEEF
+        self._udp_sock          = None
+        self._asterisk_addr     = None
+        self._rtp_seq           = 0
+        self._rtp_ts            = 0
+        self._rtp_ssrc          = 0xDEADBEEF
 
-        self._azure_ws       = None
-        self._bridge_id      = None
-        self._ext_channel_id = None
+        self._azure_ws          = None
+        self._bridge_id         = None
+        self._ext_channel_id    = None
 
-        self._audio_to_azure:    asyncio.Queue[bytes] = asyncio.Queue(maxsize=500)
-        self._audio_to_asterisk: asyncio.Queue[bytes] = asyncio.Queue(maxsize=500)
+        self._to_azure    = asyncio.Queue(maxsize=500)
+        self._to_asterisk = asyncio.Queue(maxsize=500)
+        self._ratecv_down = None   # 24kHz → 8kHz state
 
-        self._ratecv_state_up   = None  # 8 kHz → 16 kHz
-        self._ratecv_state_down = None  # 24 kHz → 8 kHz
-
-    # ── Main entry point ──────────────────────────────────────────────────────
+    # ── Main run ──────────────────────────────────────────────────────────────
 
     async def run(self):
         try:
             await self.channel.answer()
-            logger.info(f"✅ [{self.channel_id[:12]}] Call answered")
+            logger.info(f"✅ [{self.channel_id[:12]}] Answered")
             await asyncio.sleep(0.3)
 
+            # Create bridge
             bridge = await self.ari_client.bridges.create(type="mixing")
             self._bridge_id = bridge.id
             await bridge.addChannel(channel=self.channel_id)
-            logger.info(f"🌉 [{self.channel_id[:12]}] Bridge created: {self._bridge_id}")
+            logger.info(f"🌉 [{self.channel_id[:12]}] Bridge: {self._bridge_id}")
 
+            # Bind UDP socket for RTP (blocking with timeout for clean shutdown)
             self._udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self._udp_sock.bind((RTP_LISTEN_HOST, self.rtp_port))
-            # NOTE: do NOT call setblocking(False) here — _recv_rtp_loop sets
-            # its own timeout (0.05 s) so the executor thread yields regularly.
-            logger.info(f"🔌 [{self.channel_id[:12]}] UDP RTP listening on port {self.rtp_port}")
+            self._udp_sock.bind((RTP_HOST, self.rtp_port))
+            self._udp_sock.settimeout(0.05)
+            logger.info(f"🔌 [{self.channel_id[:12]}] RTP port {self.rtp_port}")
 
-            ext_channel = await self.ari_client.channels.externalMedia(
-                app             = os.getenv("ARI_APP", "ai-agent"),
+            # Create ExternalMedia channel
+            ext = await self.ari_client.channels.externalMedia(
+                app             = self.ari_app,
                 external_host   = f"127.0.0.1:{self.rtp_port}",
                 format          = "ulaw",
                 encapsulation   = "rtp",
@@ -525,15 +449,28 @@ class AzureVoiceLiveCallSession:
                 connection_type = "client",
                 direction       = "both",
             )
-            self._ext_channel_id = ext_channel.id
-            logger.info(f"📡 [{self.channel_id[:12]}] ExternalMedia channel: {self._ext_channel_id}")
+            self._ext_channel_id = ext.id
+            logger.info(f"📡 [{self.channel_id[:12]}] ExternalMedia: {self._ext_channel_id}")
 
-            await self._add_channel_to_bridge_with_retry(bridge, self._ext_channel_id)
+            # Add ExternalMedia to bridge (with retry — channel may not be ready yet)
+            for attempt in range(1, 6):
+                try:
+                    await bridge.addChannel(channel=self._ext_channel_id)
+                    if attempt > 1:
+                        logger.info(f"🌉 [{self.channel_id[:12]}] ExtMedia added on attempt {attempt}")
+                    break
+                except HTTPUnprocessableEntity:
+                    if attempt == 5:
+                        raise
+                    await asyncio.sleep(0.2)
+
+            # Connect to Azure Voice Live
             await self._connect_azure()
 
+            # Run all loops concurrently
             await asyncio.gather(
-                self._recv_rtp_loop(),
-                self._send_rtp_loop(),
+                self._rtp_recv_loop(),
+                self._rtp_send_loop(),
                 self._azure_recv_loop(),
                 self._azure_send_loop(),
                 return_exceptions=True,
@@ -542,83 +479,59 @@ class AzureVoiceLiveCallSession:
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.error(f"❌ [{self.channel_id[:12]}] Session run error: {e}", exc_info=True)
+            logger.error(f"❌ [{self.channel_id[:12]}] run() error: {e}", exc_info=True)
         finally:
             await self.close()
 
-    async def _add_channel_to_bridge_with_retry(self, bridge, channel_id,
-                                                  retries: int = 5, delay: float = 0.2):
-        last_err = None
-        for attempt in range(1, retries + 1):
-            try:
-                await bridge.addChannel(channel=channel_id)
-                if attempt > 1:
-                    logger.info(
-                        f"🌉 [{self.channel_id[:12]}] Channel {channel_id} "
-                        f"added to bridge on attempt {attempt}"
-                    )
-                return
-            except HTTPUnprocessableEntity as e:
-                last_err = e
-                await asyncio.sleep(delay)
-        logger.error(
-            f"❌ [{self.channel_id[:12]}] Could not add channel {channel_id} "
-            f"to bridge after {retries} attempts"
-        )
-        raise last_err
-
-    # ── Azure Voice Live WebSocket ─────────────────────────────────────────────
+    # ── Azure connection & session config ─────────────────────────────────────
 
     async def _connect_azure(self):
         self._azure_ws = await websockets.connect(
             self.azure_ws_url,
             ping_interval = 20,
             ping_timeout  = 30,
-            **_ws_header_kwargs({"api-key": self.azure_api_key}),
+            **_ws_connect_kwargs(self.azure_api_key),
         )
-        logger.info(f"🔗 [{self.channel_id[:12]}] Azure Voice Live WS connected")
-        logger.info(f"   URL: {self.azure_ws_url}")
+        logger.info(f"🔗 [{self.channel_id[:12]}] Azure WS connected")
+        logger.info(f"   {self.azure_ws_url}")
 
+        # Send session config — one message, only documented fields
         await self._azure_ws.send(json.dumps({
             "type": "session.update",
             "session": {
                 "instructions": self.system_prompt,
-                "modalities": ["text", "audio"],
-                # NOTE: "output_language" is NOT a valid Azure Voice Live field
-                # and causes an immediate session configuration failure.
-                # Language locking is handled entirely in the system prompt
-                # (instructions) which already enforces English-only output.
+                "modalities":   ["text", "audio"],
                 "voice": {
                     "name": self.voice_name,
                     "type": self.voice_type,
                 },
-                # Explicitly declare audio formats so Azure never guesses
+                # ── Audio formats ────────────────────────────────────────────
+                # Asterisk sends μ-law 8kHz. We decode to PCM16 and tell Azure
+                # it's 8kHz — no resampling needed on the inbound path.
+                # Azure always outputs PCM16 @ 24kHz; we resample on output.
                 "input_audio_format":        "pcm16",
                 "output_audio_format":       "pcm16",
-                "input_audio_sampling_rate": AZURE_SAMPLE_RATE,  # 24000
+                "input_audio_sampling_rate": AZURE_IN_RATE,   # 8000
+                # ── Noise & echo ─────────────────────────────────────────────
                 "input_audio_noise_reduction": {
                     "type": "azure_deep_noise_suppression"
                 },
                 "input_audio_echo_cancellation": {
                     "type": "server_echo_cancellation"
                 },
+                # ── STT ──────────────────────────────────────────────────────
+                # en-KE: best accuracy for Kenyan English accents.
+                # Do NOT leave blank — blank triggers multilingual mode which
+                # causes the model to mirror the detected language.
                 "input_audio_transcription": {
                     "model":    "azure-speech",
-                    # en-KE gives the best STT accuracy for Kenyan accents.
-                    # Do NOT set to "" (multilingual) — that causes the STT to
-                    # emit non-English text which the model then mirrors as
-                    # non-English audio output (Spanish, Swahili, etc.).
                     "language": "en-KE",
                 },
+                # ── VAD ──────────────────────────────────────────────────────
                 "turn_detection": {
-                    "type": "azure_semantic_vad",
-                    # 0.5 is Azure's recommended default — 0.4 was too eager,
-                    # causing background noise to trigger false speech detections
+                    "type":                "azure_semantic_vad",
                     "threshold":           0.5,
-                    # 500 ms gives callers time for natural mid-sentence pauses
-                    # (phone audio from Kenya often has brief gaps due to network)
                     "silence_duration_ms": 500,
-                    # 300 ms captures the start of the utterance cleanly
                     "prefix_padding_ms":   300,
                     "remove_filler_words": True,
                     "interrupt_response":  True,
@@ -627,194 +540,75 @@ class AzureVoiceLiveCallSession:
                 "temperature": 0.7,
             },
         }))
-        logger.info(f"⚙️  [{self.channel_id[:12]}] Azure Voice Live session configured")
-        logger.info(f"   Voice    : {self.voice_name} ({self.voice_type})")
-        logger.info(f"   Audio in : PCM16 @ {AZURE_SAMPLE_RATE} Hz (upsampled from 8kHz)")
-        logger.info(f"   Language : en-KE STT input → en output (locked)")
-        logger.info(f"   VAD      : azure_semantic_vad | threshold=0.5 | silence=500ms")
+        logger.info(f"⚙️  [{self.channel_id[:12]}] Session config sent")
+        logger.info(f"   Voice : {self.voice_name} | Audio in: PCM16 {AZURE_IN_RATE}Hz | VAD: semantic")
 
-    # ── RTP receive (Asterisk → queue) ────────────────────────────────────────
+    # ── RTP receive: Asterisk → Azure queue ───────────────────────────────────
 
-    async def _recv_rtp_loop(self):
-        """
-        Receive μ-law RTP from Asterisk, upsample 8 kHz → 24 kHz, push to Azure queue.
-
-        Uses a blocking socket with a short timeout so that:
-          - We yield to the event loop regularly (no busy-wait)
-          - We exit promptly when caller_hung_up / _closed is set
-          - We don't block the executor thread indefinitely
-        """
+    async def _rtp_recv_loop(self):
         loop = asyncio.get_running_loop()
-        # Switch to blocking with a short timeout so run_in_executor returns
-        # promptly and we can check the shutdown flags every ~50 ms.
-        self._udp_sock.setblocking(True)
-        self._udp_sock.settimeout(0.05)
-
-        while not self.caller_hung_up and not self._closed:
+        while not self._closed:
             try:
                 data, addr = await loop.run_in_executor(
                     None, self._udp_sock.recvfrom, 4096
                 )
             except OSError:
-                # Timeout or socket closed — just loop and check flags
+                # Socket timeout (every 50ms) or closed — check flags and loop
                 continue
             except Exception as e:
                 if not self._closed:
-                    logger.debug(f"RTP recv error: {e}")
+                    logger.debug(f"RTP recv: {e}")
                 break
 
-            if not self._asterisk_rtp_addr:
-                self._asterisk_rtp_addr = addr
-                logger.info(
-                    f"📻 [{self.channel_id[:12]}] "
-                    f"Asterisk RTP source: {addr[0]}:{addr[1]}"
-                )
+            if self._asterisk_addr is None:
+                self._asterisk_addr = addr
+                logger.info(f"📻 [{self.channel_id[:12]}] Asterisk RTP: {addr[0]}:{addr[1]}")
 
             if len(data) <= RTP_HEADER_SIZE:
                 continue
 
-            ulaw_payload = data[RTP_HEADER_SIZE:]
+            # μ-law → PCM16 (no resampling — 8kHz in, 8kHz declared to Azure)
             try:
-                pcm8 = audioop.ulaw2lin(ulaw_payload, 2)
-                # Upsample 8 kHz → 24 kHz to match Azure's expected sample rate
-                pcm24, self._ratecv_state_up = audioop.ratecv(
-                    pcm8, 2, 1,
-                    ASTERISK_SAMPLE_RATE, AZURE_SAMPLE_RATE,
-                    self._ratecv_state_up
-                )
-            except audioop.error as e:
-                logger.debug(f"Audio conversion error: {e}")
+                pcm16 = audioop.ulaw2lin(data[RTP_HEADER_SIZE:], 2)
+            except audioop.error:
                 continue
 
-            if not self._audio_to_azure.full():
-                self._audio_to_azure.put_nowait(pcm24)
-            # If the queue is full, drop the packet rather than blocking
+            if not self._to_azure.full():
+                self._to_azure.put_nowait(pcm16)
 
-    # ── Azure send (queue → WS) ───────────────────────────────────────────────
+    # ── Azure send: queue → WebSocket ─────────────────────────────────────────
 
     async def _azure_send_loop(self):
-        while not self.caller_hung_up and not self._closed:
+        while not self._closed:
             try:
-                chunk = await asyncio.wait_for(
-                    self._audio_to_azure.get(), timeout=0.5
-                )
-                if self._azure_ws and _ws_is_open(self._azure_ws):
-                    await self._azure_ws.send(json.dumps({
-                        "type":  "input_audio_buffer.append",
-                        "audio": base64.b64encode(chunk).decode(),
-                    }))
+                chunk = await asyncio.wait_for(self._to_azure.get(), timeout=0.1)
             except asyncio.TimeoutError:
                 continue
-            except Exception as e:
-                if not self._closed:
-                    logger.debug(f"Azure send error: {e}")
+            except Exception:
                 break
 
-    # ── Azure receive (WS → queue / events) ──────────────────────────────────
+            if not _ws_open(self._azure_ws):
+                break
+            try:
+                await self._azure_ws.send(json.dumps({
+                    "type":  "input_audio_buffer.append",
+                    "audio": base64.b64encode(chunk).decode(),
+                }))
+            except Exception as e:
+                if not self._closed:
+                    logger.debug(f"Azure send: {e}")
+                break
+
+    # ── Azure receive: events + audio back to Asterisk ────────────────────────
 
     async def _azure_recv_loop(self):
-        while not self.caller_hung_up and not self._closed:
+        while not self._closed:
+            if not _ws_open(self._azure_ws):
+                await asyncio.sleep(0.05)
+                continue
             try:
-                if not self._azure_ws:
-                    await asyncio.sleep(0.1)
-                    continue
-
                 raw   = await asyncio.wait_for(self._azure_ws.recv(), timeout=0.5)
                 event = json.loads(raw)
-                etype = event.get("type", "")
-
-                if etype == "response.audio.delta":
-                    delta_b64 = event.get("delta", "")
-                    if not delta_b64:
-                        continue
-                    pcm_out = base64.b64decode(delta_b64)
-                    pcm8, self._ratecv_state_down = audioop.ratecv(
-                        pcm_out, 2, 1,
-                        AZURE_OUTPUT_RATE, ASTERISK_SAMPLE_RATE,
-                        self._ratecv_state_down
-                    )
-                    ulaw = audioop.lin2ulaw(pcm8, 2)
-                    await self._audio_to_asterisk.put(ulaw)
-
-                elif etype == "conversation.item.input_audio_transcription.completed":
-                    transcript = event.get("transcript", "")
-                    logger.info(f"👤 [{self.channel_id[:12]}] Caller: {transcript}")
-                    self._db_log_transcript("caller", transcript, 1.0)
-                    if not self.escalated and self._detect_transfer_intent(transcript):
-                        logger.info(f"🔀 [{self.channel_id[:12]}] Caller requested transfer")
-                        await self._handle_escalation(transcript)
-
-                elif etype in ("response.audio_transcript.delta",
-                               "response.output_audio_transcript.delta"):
-                    self._ai_transcript_buf += event.get("delta", "")
-
-                elif etype in ("response.audio_transcript.done",
-                               "response.output_audio_transcript.done"):
-                    full = self._ai_transcript_buf.strip()
-                    self._ai_transcript_buf = ""
-                    if full:
-                        logger.info(f"🤖 [{self.channel_id[:12]}] AI said: {full}")
-                        self._db_log_transcript("agent", full, 1.0)
-                        if not self.escalated and any(
-                            phrase in full.lower() for phrase in self.AI_TRANSFER_PHRASES
-                        ):
-                            logger.info(
-                                f"🔀 [{self.channel_id[:12]}] "
-                                "AI announced transfer — scheduling in 2.5s"
-                            )
-                            asyncio.create_task(
-                                self._delayed_escalation(full, delay=2.5)
-                            )
-
-                elif etype == "response.done":
-                    usage = event.get("response", {}).get("usage", {})
-                    logger.debug(
-                        f"🤖 [{self.channel_id[:12]}] Response done "
-                        f"(tokens: {usage.get('total_tokens', '?')})"
-                    )
-
-                elif etype == "session.created":
-                    logger.info(
-                        f"✅ [{self.channel_id[:12]}] Azure session created: "
-                        f"{event.get('session', {}).get('id', '')}"
-                    )
-
-                elif etype == "session.updated":
-                    logger.info(f"⚙️  [{self.channel_id[:12]}] Session updated by server")
-                    if not self._greeting_sent:
-                        self._greeting_sent = True
-                        await asyncio.sleep(0.5)
-                        await self._azure_ws.send(json.dumps({
-                            "type": "response.create",
-                            "response": {
-                                "instructions": (
-                                    "Say ONLY: 'Thank you for calling Jubilee Insurance, "
-                                    "how can I help?' — nothing else."
-                                ),
-                            },
-                        }))
-                        logger.info(f"👋 [{self.channel_id[:12]}] Greeting triggered")
-
-                elif etype == "error":
-                    logger.error(
-                        f"❌ Azure Voice Live error: {event.get('error', event)}"
-                    )
-
-                elif etype == "input_audio_buffer.speech_started":
-                    logger.info(f"🎤 [{self.channel_id[:12]}] VAD: speech started")
-
-                elif etype == "input_audio_buffer.speech_stopped":
-                    logger.info(f"🔇 [{self.channel_id[:12]}] VAD: speech stopped")
-
-                elif etype == "input_audio_buffer.committed":
-                    logger.debug(f"📦 [{self.channel_id[:12]}] Audio buffer committed to model")
-
-                elif etype not in ("response.audio.delta", "response.content_part.added",
-                                   "response.content_part.done", "response.output_item.added",
-                                   "response.output_item.done", "response.created"):
-                    # Log any unexpected event types so we can see what Azure sends
-                    logger.debug(f"Azure event: {etype}")
-
             except asyncio.TimeoutError:
                 continue
             except websockets.exceptions.ConnectionClosed:
@@ -823,263 +617,240 @@ class AzureVoiceLiveCallSession:
                 break
             except Exception as e:
                 if not self._closed:
-                    logger.debug(f"Azure recv error: {e}")
+                    logger.debug(f"Azure recv: {e}")
                 break
 
-    # ── RTP send (queue → Asterisk) ───────────────────────────────────────────
+            await self._handle_azure_event(event)
 
-    async def _send_rtp_loop(self):
+    async def _handle_azure_event(self, event: dict):
+        etype = event.get("type", "")
+
+        if etype == "response.audio.delta":
+            # Azure outputs PCM16 @ 24kHz → downsample to 8kHz → μ-law → Asterisk
+            b64 = event.get("delta", "")
+            if not b64:
+                return
+            pcm24 = base64.b64decode(b64)
+            pcm8, self._ratecv_down = audioop.ratecv(
+                pcm24, 2, 1, AZURE_OUT_RATE, ASTERISK_RATE, self._ratecv_down
+            )
+            ulaw = audioop.lin2ulaw(pcm8, 2)
+            if not self._to_asterisk.full():
+                self._to_asterisk.put_nowait(ulaw)
+
+        elif etype == "session.created":
+            logger.info(f"✅ [{self.channel_id[:12]}] Azure session: {event.get('session', {}).get('id', '')}")
+
+        elif etype == "session.updated":
+            logger.info(f"⚙️  [{self.channel_id[:12]}] Session updated")
+            if not self._greeting_sent:
+                self._greeting_sent = True
+                await asyncio.sleep(0.3)
+                await self._azure_ws.send(json.dumps({
+                    "type": "response.create",
+                    "response": {
+                        "instructions": (
+                            "Say ONLY: 'Thank you for calling Jubilee Insurance, "
+                            "how can I help?' — nothing else."
+                        ),
+                    },
+                }))
+                logger.info(f"👋 [{self.channel_id[:12]}] Greeting triggered")
+
+        elif etype == "input_audio_buffer.speech_started":
+            logger.info(f"🎤 [{self.channel_id[:12]}] Speech started")
+
+        elif etype == "input_audio_buffer.speech_stopped":
+            logger.info(f"🔇 [{self.channel_id[:12]}] Speech stopped")
+
+        elif etype == "conversation.item.input_audio_transcription.completed":
+            text = event.get("transcript", "").strip()
+            if text:
+                logger.info(f"👤 [{self.channel_id[:12]}] Caller: {text}")
+                self._db_transcript("caller", text)
+                if not self.escalated and self._wants_transfer(text):
+                    await self._escalate(text)
+
+        elif etype in ("response.audio_transcript.delta",
+                       "response.output_audio_transcript.delta"):
+            self._ai_buf += event.get("delta", "")
+
+        elif etype in ("response.audio_transcript.done",
+                       "response.output_audio_transcript.done"):
+            full = self._ai_buf.strip()
+            self._ai_buf = ""
+            if full:
+                logger.info(f"🤖 [{self.channel_id[:12]}] AI: {full}")
+                self._db_transcript("agent", full)
+                if not self.escalated and any(p in full.lower() for p in self.AI_TRANSFER_PHRASES):
+                    logger.info(f"🔀 [{self.channel_id[:12]}] AI announced transfer — 2.5s delay")
+                    asyncio.create_task(self._delayed_escalate(full))
+
+        elif etype == "error":
+            logger.error(f"❌ Azure error: {event.get('error', event)}")
+
+        # All other events (response.created, response.done, content_part.*, etc.)
+        # are silently ignored — we only care about the ones above.
+
+    # ── RTP send: Asterisk ← Azure queue ─────────────────────────────────────
+
+    async def _rtp_send_loop(self):
         """
-        Pull μ-law audio from queue, re-packetise into 160-byte (20 ms) RTP
-        frames, and pace at 20 ms intervals to Asterisk.
+        Drain the to_asterisk queue, packetise into 160-byte μ-law frames,
+        and send at 20ms intervals. sendto() on a UDP socket is fast enough
+        to call directly without run_in_executor.
         """
         loop      = asyncio.get_running_loop()
         buf       = bytearray()
-        next_send = loop.time()
+        next_tick = loop.time()
 
-        while not self.caller_hung_up and not self._closed:
+        while not self._closed:
+            # Pull whatever is in the queue without blocking long
             try:
-                chunk = await asyncio.wait_for(
-                    self._audio_to_asterisk.get(), timeout=0.5
-                )
+                chunk = await asyncio.wait_for(self._to_asterisk.get(), timeout=0.1)
                 buf.extend(chunk)
             except asyncio.TimeoutError:
-                continue
-            except Exception as e:
-                if not self._closed:
-                    logger.debug(f"RTP send queue error: {e}")
+                pass
+            except Exception:
                 break
 
-            while True:
+            # Drain any additional queued chunks without awaiting
+            while not self._to_asterisk.empty():
                 try:
-                    buf.extend(self._audio_to_asterisk.get_nowait())
+                    buf.extend(self._to_asterisk.get_nowait())
                 except asyncio.QueueEmpty:
                     break
 
-            while len(buf) >= self.ULAW_PACKET_BYTES:
-                if not self._asterisk_rtp_addr or not self._udp_sock:
-                    break
+            # Send as many complete 20ms frames as we have
+            while len(buf) >= ULAW_FRAME_BYTES:
+                if not self._asterisk_addr or not self._udp_sock:
+                    del buf[:ULAW_FRAME_BYTES]
+                    continue
 
-                payload = bytes(buf[:self.ULAW_PACKET_BYTES])
-                del buf[:self.ULAW_PACKET_BYTES]
+                payload = bytes(buf[:ULAW_FRAME_BYTES])
+                del buf[:ULAW_FRAME_BYTES]
 
-                rtp_pkt       = self._build_rtp_packet(payload)
-                self._rtp_ts += self.ULAW_PACKET_BYTES
-                self._rtp_seq = (self._rtp_seq + 1) & 0xFFFF
+                # Build RTP packet
+                pkt = struct.pack(
+                    "!BBHII",
+                    0x80,           # V=2, no padding/ext/CC
+                    0x00,           # M=0, PT=0 (PCMU)
+                    self._rtp_seq,
+                    self._rtp_ts,
+                    self._rtp_ssrc,
+                ) + payload
+                self._rtp_seq  = (self._rtp_seq + 1) & 0xFFFF
+                self._rtp_ts  += ULAW_FRAME_BYTES
 
+                # Pace: wait until next_tick
                 now = loop.time()
-                if next_send > now:
-                    await asyncio.sleep(next_send - now)
-                next_send = max(loop.time(), next_send) + self.PACKET_INTERVAL_S
+                if next_tick > now:
+                    await asyncio.sleep(next_tick - now)
+                next_tick = max(loop.time(), next_tick) + FRAME_DURATION
 
                 try:
-                    await loop.run_in_executor(
-                        None,
-                        self._udp_sock.sendto,
-                        rtp_pkt,
-                        self._asterisk_rtp_addr,
-                    )
-                except Exception as e:
+                    self._udp_sock.sendto(pkt, self._asterisk_addr)
+                except OSError as e:
                     if not self._closed:
-                        logger.debug(f"RTP sendto error: {e}")
+                        logger.debug(f"RTP sendto: {e}")
                     return
-
-    def _build_rtp_packet(self, payload: bytes) -> bytes:
-        header = struct.pack(
-            "!BBHII",
-            0x80,
-            0x00,           # PT=0 = PCMU / μ-law
-            self._rtp_seq,
-            self._rtp_ts,
-            self._rtp_ssrc,
-        )
-        return header + payload
 
     # ── Transfer / escalation ─────────────────────────────────────────────────
 
-    def _detect_transfer_intent(self, text: str) -> bool:
+    def _wants_transfer(self, text: str) -> bool:
         lower = text.lower()
         return any(kw in lower for kw in self.TRANSFER_KEYWORDS)
 
-    async def _delayed_escalation(self, transcript: str, delay: float = 2.5):
+    async def _delayed_escalate(self, text: str, delay: float = 2.5):
         await asyncio.sleep(delay)
         if not self._closed and not self.escalated:
-            await self._handle_escalation(transcript)
+            await self._escalate(text)
 
-    async def _handle_escalation(self, transcript: str):
-        """
-        Transfer the caller to the appropriate department softphone.
-
-        1. Classify intent from transcript → pick department
-        2. Remove ExternalMedia from bridge (AI audio stops)
-        3. Close Azure WS and UDP socket
-        4. continueInDialplan → FreePBX routes to dept extension
-        """
+    async def _escalate(self, text: str):
         if self.escalated:
             return
+        self.escalated = True
+        self._closed   = True
 
-        intent    = self._classify_intent(transcript)
-        dept      = self._get_department_for_intent(intent)
+        intent    = self._classify_intent(text)
+        dept      = self._get_dept(intent)
         dept_name = dept.name      if dept else "Support"
         dept_ext  = dept.extension if dept else "1005"
 
-        logger.info(
-            f"🔀 [{self.channel_id[:12]}] "
-            f"Escalating → {dept_name} (ext {dept_ext}, intent: {intent})"
-        )
+        logger.info(f"🔀 [{self.channel_id[:12]}] → {dept_name} ext {dept_ext} (intent: {intent})")
 
-        self.escalated = True
-        self._closed   = True  # Stop audio pumps
-
-        # Remove ExternalMedia from bridge so AI audio stops immediately
+        # Remove ExternalMedia from bridge (stops AI audio immediately)
         if self._bridge_id and self._ext_channel_id:
             try:
                 bridge = await self.ari_client.bridges.get(bridgeId=self._bridge_id)
                 await bridge.removeChannel(channel=self._ext_channel_id)
-                logger.info(f"🔇 [{self.channel_id[:12]}] ExternalMedia removed from bridge")
-            except Exception as e:
-                logger.debug(f"removeChannel error (non-fatal): {e}")
-
-        # Close Azure WS
-        if self._azure_ws:
-            try:
-                await self._azure_ws.close()
-            except Exception:
-                pass
-            self._azure_ws = None
-
-        # Close UDP socket
-        if self._udp_sock:
-            try:
-                self._udp_sock.close()
-            except Exception:
-                pass
-            self._udp_sock = None
-
-        # Hang up ExternalMedia channel
-        if self._ext_channel_id:
-            try:
-                await self.ari_client.channels.hangup(channelId=self._ext_channel_id)
             except Exception:
                 pass
 
-        # Destroy bridge (caller channel exits bridge but stays alive)
-        if self._bridge_id:
-            try:
-                await self.ari_client.bridges.destroy(bridgeId=self._bridge_id)
-            except Exception:
-                pass
+        # Tear down Azure WS and UDP
+        await self._close_media()
 
-        # Send caller into FreePBX dialplan at the department extension.
-        # Adjust transfer_contexts to match your FreePBX dialplan.
-        transfer_contexts = ["from-internal", "default"]
-        transferred = False
-
-        for ctx in transfer_contexts:
+        # Transfer caller via dialplan
+        for ctx in ["from-internal", "default"]:
             try:
                 await self.channel.continueInDialplan(
-                    context   = ctx,
-                    extension = dept_ext,
-                    priority  = 1,
+                    context=ctx, extension=dept_ext, priority=1
                 )
-                logger.info(
-                    f"✅ [{self.channel_id[:12]}] Transfer sent → "
-                    f"{dept_name} ext {dept_ext} (context: {ctx})"
-                )
-                transferred = True
-                break
+                logger.info(f"✅ [{self.channel_id[:12]}] Transfer → {dept_ext} ({ctx})")
+                return
             except Exception as e:
-                logger.warning(f"continueInDialplan failed for context '{ctx}': {e}")
+                logger.warning(f"continueInDialplan ctx={ctx}: {e}")
 
-        if not transferred:
-            logger.error(
-                f"❌ [{self.channel_id[:12]}] All transfer attempts failed for ext {dept_ext}. "
-                f"Verify extension {dept_ext} exists in FreePBX and is reachable from 'from-internal'."
-            )
-            try:
-                await self.channel.hangup()
-            except Exception:
-                pass
+        logger.error(f"❌ [{self.channel_id[:12]}] All transfer attempts failed")
+        try:
+            await self.channel.hangup()
+        except Exception:
+            pass
 
     def _classify_intent(self, text: str) -> str:
-        """
-        Keyword-based intent classification to pick the transfer department.
-        Checks sales first so 'sales agent' doesn't fall through to support.
-        """
         lower = text.lower()
-        if any(w in lower for w in [
-            "buy", "quote", "new policy", "purchase", "sign up",
-            "sales", "sale", "sales agent", "sell", "enroll",
-        ]):
+        if any(w in lower for w in ["buy", "quote", "new policy", "purchase", "sign up",
+                                     "sales", "sale", "enroll"]):
             return "sales"
-        if any(w in lower for w in [
-            "claim", "accident", "damage", "report", "incident", "loss",
-        ]):
+        if any(w in lower for w in ["claim", "accident", "damage", "report", "incident", "loss"]):
             return "claims"
-        if any(w in lower for w in [
-            "bill", "payment", "pay", "invoice", "mpesa", "premium", "renew",
-        ]):
+        if any(w in lower for w in ["bill", "payment", "pay", "invoice", "mpesa",
+                                     "premium", "renew"]):
             return "billing"
         return "support"
 
-    def _get_department_for_intent(self, intent_type: str):
-        """
-        Look up Department for a given intent.
-        Tries RoutingRule first, then Department name, then highest-priority dept.
-        """
+    def _get_dept(self, intent: str):
         if not self.flask_app:
             return None
         try:
             with self.flask_app.app_context():
                 from models import Department, RoutingRule
-
                 rule = (
                     RoutingRule.query
-                    .filter_by(intent_type=intent_type, is_active=True)
+                    .filter_by(intent_type=intent, is_active=True)
                     .order_by(RoutingRule.priority.desc())
                     .first()
                 )
                 if rule and rule.department and rule.department.is_active:
-                    logger.info(
-                        f"🗂️  Routing rule matched: {intent_type} → "
-                        f"{rule.department.name} (ext {rule.department.extension})"
-                    )
                     return rule.department
-
-                name_map = {
-                    "sales":   "Sales",
-                    "claims":  "Claims",
-                    "billing": "Billing",
-                    "support": "Support",
-                }
-                dept_name = name_map.get(intent_type)
-                if dept_name:
-                    dept = Department.query.filter_by(
-                        name=dept_name, is_active=True
-                    ).first()
-                    if dept:
-                        logger.info(
-                            f"🗂️  Department matched: {dept_name} (ext {dept.extension})"
-                        )
-                        return dept
-
-                dept = (
-                    Department.query
-                    .filter_by(is_active=True)
-                    .order_by(Department.priority.desc())
-                    .first()
-                )
+                name_map = {"sales": "Sales", "claims": "Claims",
+                            "billing": "Billing", "support": "Support"}
+                dept = Department.query.filter_by(
+                    name=name_map.get(intent, "Support"), is_active=True
+                ).first()
                 if dept:
-                    logger.info(f"🗂️  Fallback department: {dept.name} (ext {dept.extension})")
-                return dept
-
+                    return dept
+                return (Department.query
+                        .filter_by(is_active=True)
+                        .order_by(Department.priority.desc())
+                        .first())
         except Exception as e:
-            logger.error(f"Department lookup error: {e}")
+            logger.error(f"Dept lookup: {e}")
             return None
 
-    # ── DB transcript logging ─────────────────────────────────────────────────
+    # ── DB transcript ─────────────────────────────────────────────────────────
 
-    def _db_log_transcript(self, speaker: str, text: str, confidence: float):
+    def _db_transcript(self, speaker: str, text: str):
         if not self.flask_app or not text:
             return
         try:
@@ -1088,26 +859,17 @@ class AzureVoiceLiveCallSession:
                 call = Call.query.filter_by(call_id=self.channel_id).first()
                 if call:
                     db.session.add(CallTranscript(
-                        call_id    = call.id,
-                        speaker    = speaker,
-                        text       = text,
-                        confidence = confidence,
-                        timestamp  = datetime.utcnow(),
+                        call_id=call.id, speaker=speaker, text=text,
+                        confidence=1.0, timestamp=datetime.utcnow(),
                     ))
                     db.session.commit()
         except Exception as e:
-            logger.error(f"DB transcript error: {e}")
+            logger.error(f"DB transcript: {e}")
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
-    async def close(self):
-        """
-        Clean up all resources. On escalation, the caller channel is left alive
-        (FreePBX is handling it), so we skip hanging it up.
-        """
-        if self._closed and not self.escalated:
-            return  # Already cleaned up on a non-escalation path
-
+    async def _close_media(self):
+        """Close Azure WS and UDP socket."""
         if self._azure_ws:
             try:
                 await self._azure_ws.close()
@@ -1121,6 +883,14 @@ class AzureVoiceLiveCallSession:
             except Exception:
                 pass
             self._udp_sock = None
+
+    async def close(self):
+        if self._closed and self.escalated:
+            # Escalation already cleaned up everything; caller channel is live with FreePBX
+            return
+
+        self._closed = True
+        await self._close_media()
 
         if self._ext_channel_id:
             try:
@@ -1142,5 +912,4 @@ class AzureVoiceLiveCallSession:
             except Exception:
                 pass
 
-        self._closed = True
         logger.info(f"🔒 [{self.channel_id[:12]}] Session closed")
