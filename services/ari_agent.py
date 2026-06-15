@@ -122,6 +122,46 @@ class ARIAgent:
         self.ari_client     = None
         self._config_ok     = bool(self.azure_resource and self.azure_api_key)
 
+    # ── Properties for admin dashboard compatibility ───────────────────────────
+
+    @property
+    def ai_client(self):
+        """
+        Alias for ari_client — keeps the admin dashboard's system-status
+        check (``ari_agent.ai_client``) working without modifying route code.
+        Returns the live aioari client, or None if not yet connected.
+        """
+        return self.ari_client
+
+    @property
+    def is_connected(self) -> bool:
+        """True when the ARI WebSocket is open and the agent is running."""
+        return self.running and self.ari_client is not None
+
+    @property
+    def active_call_count(self) -> int:
+        """Number of calls currently being handled."""
+        return len(self.active_calls)
+
+    def get_status(self) -> dict:
+        """
+        Return a status dict consumed by /admin/api/system-status.
+        Keeps all status logic in one place rather than scattered across routes.
+        """
+        return {
+            "connected":      self.is_connected,
+            "running":        self.running,
+            "config_ok":      self._config_ok,
+            "active_calls":   self.active_call_count,
+            "total_calls":    self.total_calls,
+            "azure_resource": self.azure_resource or "not set",
+            "voice_name":     self.azure_voice_name,
+            "voice_type":     self.azure_voice_type,
+            "model":          AZURE_VOICE_LIVE_MODEL,
+        }
+
+    # ── Default system prompt ─────────────────────────────────────────────────
+
     def _default_prompt(self):
         return (
             "You are Ari, a friendly and knowledgeable phone assistant for Jubilee Insurance Kenya. "

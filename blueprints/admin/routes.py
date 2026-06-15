@@ -12,6 +12,7 @@ import json
 import time
 
 from models import db, Call, CallTranscript, CallIntent, Department, RoutingRule, KnowledgeBase
+from app import get_ari_agent
 
 admin_bp = Blueprint('admin', __name__, url_prefix='/admin')
 
@@ -100,8 +101,11 @@ def system_status():
         'services': {}
     }
 
+    # Resolve agent via the module-level getter (works whether app was started
+    # via __main__ or a WSGI server / app factory).
+    ari_agent = get_ari_agent()
+
     # Check ARI Agent
-    ari_agent = getattr(current_app, 'ari_agent', None)
     if ari_agent and ari_agent.running:
         status['services']['ari'] = {
             'name': 'ARI Agent',
@@ -123,36 +127,40 @@ def system_status():
             'color': 'danger'
         }
 
-    # Check AI Service
-    if ari_agent and ari_agent.ai_client:
+    # Check AI Service — agent now uses Azure Voice Live (no separate ai_client).
+    # Use _config_ok which is True when both AZURE_VOICE_LIVE_RESOURCE and
+    # AZURE_SPEECH_KEY are set, and is_connected when the ARI WebSocket is up.
+    if ari_agent and ari_agent._config_ok:
+        resource = ari_agent.azure_resource
         status['services']['ai'] = {
-            'name': 'AI Assistant',
-            'status': 'connected',
+            'name': 'AI Assistant (Azure Voice Live)',
+            'status': 'connected' if ari_agent.is_connected else 'configured',
             'details': {
-                'provider': 'Azure OpenAI',
-                'model': ari_agent.azure_openai_deployment,
-                'endpoint': ari_agent.azure_openai_endpoint[:50] + '...' if len(ari_agent.azure_openai_endpoint) > 50 else ari_agent.azure_openai_endpoint
+                'provider': 'Azure Voice Live',
+                'model': 'gpt-realtime',
+                'resource': resource[:50] + '...' if len(resource) > 50 else resource,
+                'voice': ari_agent.azure_voice_name,
             },
             'icon': 'fa-brain',
-            'color': 'success'
+            'color': 'success' if ari_agent.is_connected else 'warning'
         }
     else:
         status['services']['ai'] = {
-            'name': 'AI Assistant',
+            'name': 'AI Assistant (Azure Voice Live)',
             'status': 'not_configured',
-            'details': {'message': 'Check AZURE_OPENAI_KEY and AZURE_OPENAI_ENDPOINT in .env'},
+            'details': {'message': 'Check AZURE_VOICE_LIVE_RESOURCE and AZURE_SPEECH_KEY in .env'},
             'icon': 'fa-brain',
             'color': 'danger'
         }
 
-    # Check Speech Service
-    if ari_agent and ari_agent.transcriber:
+    # Check Speech Service — handled by Azure Voice Live (same credential).
+    if ari_agent and ari_agent.azure_api_key:
         status['services']['speech'] = {
             'name': 'Speech Services',
             'status': 'connected',
             'details': {
-                'provider': 'Azure Cognitive Services',
-                'region': ari_agent.azure_speech_region
+                'provider': 'Azure Voice Live (built-in STT/TTS)',
+                'voice': ari_agent.azure_voice_name,
             },
             'icon': 'fa-microphone',
             'color': 'success'
@@ -164,39 +172,6 @@ def system_status():
             'details': {'message': 'Check AZURE_SPEECH_KEY in .env'},
             'icon': 'fa-microphone',
             'color': 'danger'
-        }
-
-    # Check File System Access (replaces SSH)
-    if ari_agent and ari_agent.file_access:
-        if ari_agent.file_access.can_write:
-            status['services']['filesystem'] = {
-                'name': 'Audio File System',
-                'status': 'connected',
-                'details': {
-                    'directory': ari_agent.asterisk_sounds_dir,
-                    'access': 'sudo' if ari_agent.file_access.use_sudo else 'direct'
-                },
-                'icon': 'fa-folder',
-                'color': 'success'
-            }
-        else:
-            status['services']['filesystem'] = {
-                'name': 'Audio File System',
-                'status': 'read_only',
-                'details': {
-                    'message': 'No write permission to /var/lib/asterisk/sounds/custom',
-                    'directory': ari_agent.asterisk_sounds_dir
-                },
-                'icon': 'fa-folder',
-                'color': 'warning'
-            }
-    else:
-        status['services']['filesystem'] = {
-            'name': 'Audio File System',
-            'status': 'not_configured',
-            'details': {'message': 'File system access not initialized'},
-            'icon': 'fa-folder',
-            'color': 'warning'
         }
 
     # Overall system health

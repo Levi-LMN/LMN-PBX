@@ -40,6 +40,15 @@ _agent_thread = None
 _shutdown_initiated = False
 
 
+def get_ari_agent() -> ARIAgent | None:
+    """
+    Return the global ARIAgent instance.
+    Route handlers import and call this instead of accessing app.ari_agent
+    directly, which avoids AttributeError if the agent hasn't started yet.
+    """
+    return _ari_agent
+
+
 def create_app(config_name='default'):
     """
     Application factory pattern.
