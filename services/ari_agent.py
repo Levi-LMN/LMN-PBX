@@ -789,7 +789,18 @@ class AzureVoiceLiveCallSession:
                 # ── AI response transcript (streamed) ──────────────────────
                 elif etype in ("response.audio_transcript.delta",
                                "response.output_audio_transcript.delta"):
-                    pass  # accumulate if needed for logging
+                    # Accumulate the AI's spoken text for logging
+                    delta = event.get("delta", "")
+                    if delta:
+                        self._ai_transcript_buf = getattr(self, "_ai_transcript_buf", "") + delta
+
+                elif etype in ("response.audio_transcript.done",
+                               "response.output_audio_transcript.done"):
+                    full = getattr(self, "_ai_transcript_buf", "").strip()
+                    if full:
+                        logger.info(f"🤖 [{self.channel_id[:12]}] AI said: {full}")
+                        self._db_log_transcript("agent", full, 1.0)
+                    self._ai_transcript_buf = ""
 
                 # ── Response finished ──────────────────────────────────────
                 elif etype == "response.done":
@@ -808,6 +819,22 @@ class AzureVoiceLiveCallSession:
 
                 elif etype == "session.updated":
                     logger.info(f"⚙️  [{self.channel_id[:12]}] Session updated by server")
+                    # Trigger the AI to speak a greeting immediately.
+                    # Without this, Azure waits for the caller to speak first,
+                    # leaving dead silence and confusing the caller.
+                    if not getattr(self, "_greeting_sent", False):
+                        self._greeting_sent = True
+                        await self._azure_ws.send(json.dumps({
+                            "type": "response.create",
+                            "response": {
+                                "instructions": (
+                                    "Greet the caller warmly and briefly. "
+                                    "Say something like: 'Thank you for calling Jubilee Insurance. "
+                                    "How can I help you today?' — keep it to one short sentence."
+                                ),
+                            },
+                        }))
+                        logger.info(f"👋 [{self.channel_id[:12]}] Greeting triggered")
 
                 # ── Errors ────────────────────────────────────────────────
                 elif etype == "error":
