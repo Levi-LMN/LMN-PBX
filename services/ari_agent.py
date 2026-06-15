@@ -5,24 +5,25 @@ ARI-based agent service using Azure Voice Live API for ultra-low latency voice.
 Architecture:
   Caller → Asterisk → ARI ExternalMedia → RTP UDP socket (this service)
          ↕ PCM audio (μ-law 8kHz)
-  This service ↔ Azure Voice Live WebSocket (PCM16 8kHz or 16kHz)
+  This service ↔ Azure Voice Live WebSocket (PCM16 16kHz)
   ↓ audio back → RTP → Asterisk → Caller
 
-Why Azure Voice Live API?
-  Old (OpenAI Realtime): stream RTP → OpenAI WS (PCM16 24kHz required) → stream back
-  New (Azure Voice Live): stream RTP → Azure WS (PCM16 8/16kHz, G.711 supported)
-                          → stream back with Azure neural voices + semantic VAD
+Escalation flow:
+  1. Caller says transfer keyword  OR  AI says it will transfer
+  2. _handle_escalation() fires
+  3. ExternalMedia channel removed from bridge (stops AI audio)
+  4. channel.continueInDialplan() sends caller back into FreePBX dialplan
+     at the department extension (e.g. 1000 → Sales ring group)
+  5. Softphone rings
 
-Key differences from OpenAI Realtime:
-  - WebSocket endpoint: wss://<resource>.services.ai.azure.com/voice-live/realtime?api-version=2025-10-01
-  - Auth header: "api-key: <key>"  OR  "Authorization: Bearer <token>"
-  - session.update shape is flatter (no nested audio.input/audio.output blocks)
-  - input_audio_sampling_rate: 16000 or 24000 (we upsample from 8kHz to 16kHz)
+Why Azure Voice Live API?
+  - WebSocket endpoint: wss://<resource>.services.ai.azure.com/voice-live/realtime
+  - Auth header: "api-key: <key>"
+  - session.update shape is FLAT (no nested audio.input/audio.output blocks)
+  - input_audio_sampling_rate: 16000 (we upsample from Asterisk's 8kHz)
   - voice is an object: {"name": "en-US-AvaNeural", "type": "azure-standard"}
-  - turn_detection type: "azure_semantic_vad" (superior to server_vad for telephony)
-  - Extra features: noise suppression, echo cancellation, filler-word removal
-  - Audio events: response.audio.delta (same as OpenAI) → PCM16 at output rate
-  - Transcript event: conversation.item.input_audio_transcription.completed (same key)
+  - turn_detection type: "azure_semantic_vad" — best for telephony
+  - Built-in noise suppression, echo cancellation, filler-word removal
 """
 
 import asyncio
@@ -44,8 +45,6 @@ from flask import Flask
 # Allow overriding the Azure host suffix via env var so that older
 # CognitiveServices resources (*.cognitiveservices.azure.com) work without
 # code changes.  AI-Foundry resources use the default below.
-# Set AZURE_VOICE_LIVE_HOST_SUFFIX=cognitiveservices.azure.com in .env for
-# legacy resources.
 AZURE_VOICE_LIVE_HOST_SUFFIX = os.getenv(
     "AZURE_VOICE_LIVE_HOST_SUFFIX", "services.ai.azure.com"
 )
@@ -56,11 +55,8 @@ logger = logging.getLogger(__name__)
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Azure Voice Live API endpoint template.
-# Substitute your AI Foundry resource name via env var AZURE_VOICE_LIVE_RESOURCE.
-# For older (CognitiveServices) resources use the .cognitiveservices.azure.com host.
 AZURE_VOICE_LIVE_API_VERSION = "2025-10-01"
-AZURE_VOICE_LIVE_MODEL       = "gpt-realtime"   # or "gpt-realtime-mini"
+AZURE_VOICE_LIVE_MODEL       = "gpt-realtime"
 
 def _build_azure_ws_url(resource_name: str, model: str) -> str:
     return (
@@ -72,23 +68,21 @@ def _build_azure_ws_url(resource_name: str, model: str) -> str:
 
 
 def _resolve_hostname(hostname: str) -> bool:
-    """
-    Return True if *hostname* resolves via DNS, False otherwise.
-    Used to give a clear error before attempting a WebSocket connect.
-    """
+    """Return True if hostname resolves via DNS."""
     try:
         socket.getaddrinfo(hostname, None)
         return True
     except socket.gaierror:
         return False
 
-# Audio parameters
-ASTERISK_SAMPLE_RATE  = 8000    # Asterisk sends μ-law 8 kHz
-AZURE_SAMPLE_RATE     = 16000   # Azure Voice Live minimum; 8000 also works but 16k is cleaner
-RTP_PACKET_MS         = 20      # 20 ms RTP packets from Asterisk (160 samples @ 8 kHz)
-RTP_HEADER_SIZE       = 12      # Standard RTP header
 
-# RTP port range for ExternalMedia channels
+# Audio parameters
+ASTERISK_SAMPLE_RATE = 8000   # Asterisk sends μ-law 8 kHz
+AZURE_SAMPLE_RATE    = 16000  # We upsample to 16 kHz for Azure
+AZURE_OUTPUT_RATE    = 24000  # Azure TTS always outputs PCM16 @ 24 kHz
+RTP_HEADER_SIZE      = 12     # Standard RTP header bytes
+
+# RTP port range for ExternalMedia channels (one pair per concurrent call)
 RTP_LISTEN_HOST = "0.0.0.0"
 RTP_PORT_START  = 20000
 RTP_PORT_END    = 20100
@@ -96,8 +90,7 @@ RTP_PORT_END    = 20100
 
 def _ws_header_kwargs(headers: dict) -> dict:
     """
-    Return the correct kwarg for passing extra headers to websockets.connect(),
-    compatible with both websockets < 14 (extra_headers) and >= 14 (additional_headers).
+    Compatible extra-headers kwarg for websockets < 14 and >= 14.
     """
     try:
         params = inspect.signature(websockets.connect).parameters
@@ -120,11 +113,14 @@ def _ws_is_open(ws) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ARIAgent — top-level service
+# ARIAgent — top-level service, one per process
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ARIAgent:
-    """Manages the ARI connection and spawns an AzureVoiceLiveCallSession per call."""
+    """
+    Manages the ARI WebSocket connection and spawns one
+    AzureVoiceLiveCallSession per inbound call.
+    """
 
     def __init__(self, app_config, flask_app=None):
         self.config    = app_config
@@ -133,53 +129,46 @@ class ARIAgent:
         self.active_calls: dict[str, "AzureVoiceLiveCallSession"] = {}
         self.total_calls = 0
 
-        # ARI
+        # ARI connection settings
         self.ari_url      = os.getenv("ARI_URL",      "http://localhost:8088/ari")
         self.ari_base     = os.getenv("ARI_BASE",     "http://localhost:8088")
         self.ari_username = os.getenv("ARI_USERNAME", "asterisk")
         self.ari_password = os.getenv("ARI_PASSWORD", "your_ari_password")
         self.ari_app      = os.getenv("ARI_APP",      "ai-agent")
 
-        # Azure Voice Live API
-        self.azure_resource  = os.getenv("AZURE_VOICE_LIVE_RESOURCE", "")
-        self.azure_api_key   = os.getenv("AZURE_SPEECH_KEY", "")
-        self.azure_voice_name= os.getenv("AZURE_VOICE_NAME", "en-US-AvaNeural")
-        self.azure_voice_type= os.getenv("AZURE_VOICE_TYPE", "azure-standard")
-        self.system_prompt   = os.getenv("DEFAULT_SYSTEM_PROMPT") or self._default_prompt()
+        # Azure Voice Live settings
+        self.azure_resource   = os.getenv("AZURE_VOICE_LIVE_RESOURCE", "")
+        self.azure_api_key    = os.getenv("AZURE_SPEECH_KEY", "")
+        self.azure_voice_name = os.getenv("AZURE_VOICE_NAME", "en-US-AvaNeural")
+        self.azure_voice_type = os.getenv("AZURE_VOICE_TYPE", "azure-standard")
+        self.system_prompt    = os.getenv("DEFAULT_SYSTEM_PROMPT") or self._default_prompt()
 
-        # Port allocator for ExternalMedia RTP sockets
+        # Port allocator — one UDP port pair per concurrent call
         self._next_rtp_port = RTP_PORT_START
         self._port_lock     = asyncio.Lock()
 
         self.ari_client = None
-
-        # Pre-validate Azure config so we can reject calls cleanly instead of
-        # surfacing a cryptic DNS error mid-call.
         self._config_ok = bool(self.azure_resource and self.azure_api_key)
 
         logger.info("ARIAgent (Azure Voice Live) initialised")
 
     def _default_prompt(self):
         return (
-            "You are a phone assistant for Jubilee Insurance. "
-            "CRITICAL RULES: "
-            "(1) Keep responses to 2-3 sentences — complete enough to actually help, but never rambling. "
-            "(2) When asked what services you offer, list ALL of them in one sentence: "
-            "life, health, motor, home, travel, and personal accident insurance. "
-            "Then ask which one interests them. Do NOT pick just one at random. "
-            "(3) If the caller's question is unclear, ask them to repeat it — do not guess. "
-            "(4) NEVER open with filler like Certainly, Of course, Great question. "
-            "(5) Be direct and conversational like a human on a phone call. "
+            "You are Ari, a friendly and knowledgeable phone assistant for Jubilee Insurance Kenya. "
+            "You have access to detailed information about our products: motor, medical, life, last expense, "
+            "home, travel insurance, claims processes, and payment methods. "
+            "RULES: "
+            "(1) Respond in 2-3 natural sentences — enough to be helpful, short enough for a phone call. "
+            "(2) Never read out lists or bullet points — weave information conversationally. "
+            "(3) Be warm but efficient, like a knowledgeable human agent. "
+            "(4) If asked about products broadly, mention the relevant category and invite them to ask more. "
+            "(5) Use specific details from what you know — KES amounts, timelines, M-PESA paybill numbers — when relevant. "
             "(6) Never say you are an AI. "
-            "(7) ONLY transfer to a human if the caller EXPLICITLY says they want to speak to a human, agent, or manager. "
-            "The word management or confirm alone does NOT mean they want a transfer. "
-            "(8) Use the knowledge base information provided to give accurate, specific answers. "
-            "If you genuinely do not know a specific detail, say so honestly — do NOT transfer. "
-            "Jubilee Insurance products: life insurance, health insurance (covers inpatient, outpatient, "
-            "dental, optical, braces, maternity), motor insurance (comprehensive and third-party), "
-            "home insurance, travel insurance, personal accident cover. "
-            "GOOD: We offer life, health, motor, home, travel, and personal accident cover — which interests you? "
-            "BAD: We've got solid motor coverage — are you looking for private or commercial?"
+            "(7) Never use filler like Certainly, Of course, or Great question. "
+            "(8) ONLY transfer to a human if the caller EXPLICITLY says they want to speak to a human, agent, or manager. "
+            "(9) If you cannot help or the caller requests a human, say: 'Let me transfer you to one of our agents right away.' "
+            "GOOD example: We cover your home structure and contents against fire, theft, and natural disasters, "
+            "up to KES 10 million. Premiums are based on your property value — do you own or rent?"
         )
 
     async def _alloc_rtp_port(self) -> int:
@@ -190,7 +179,7 @@ class ARIAgent:
                 self._next_rtp_port = RTP_PORT_START
             return port
 
-    # ── lifecycle ─────────────────────────────────────────────────────────────
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self):
         self.running = True
@@ -203,36 +192,20 @@ class ARIAgent:
 
         if not self.azure_resource:
             logger.error("❌ AZURE_VOICE_LIVE_RESOURCE not set — cannot start")
-            logger.error("   Set AZURE_VOICE_LIVE_RESOURCE=<your-resource-name> in .env")
             return
         if not self.azure_api_key:
             logger.error("❌ AZURE_SPEECH_KEY not set — cannot start")
-            logger.error("   Set AZURE_SPEECH_KEY=<your-api-key> in .env")
             return
 
-        # Build and log the full WS URL so it can be verified at startup.
         _ws_url = _build_azure_ws_url(self.azure_resource, AZURE_VOICE_LIVE_MODEL)
         logger.info(f"   WS URL   : {_ws_url}")
 
-        # DNS pre-check — fail fast with a clear message rather than surfacing
-        # a cryptic socket.gaierror when the first call arrives.
         _azure_hostname = f"{self.azure_resource}.{AZURE_VOICE_LIVE_HOST_SUFFIX}"
         logger.info(f"   Checking DNS for {_azure_hostname} …")
         if not _resolve_hostname(_azure_hostname):
             logger.error(f"❌ Cannot resolve '{_azure_hostname}'")
-            logger.error("   Possible causes:")
-            logger.error("     1. AZURE_VOICE_LIVE_RESOURCE is misspelled "
-                         f"(currently: '{self.azure_resource}')")
-            logger.error("     2. This server has no outbound internet DNS "
-                         "(check /etc/resolv.conf and firewall rules)")
-            logger.error("     3. The resource lives under cognitiveservices.azure.com "
-                         "— set AZURE_VOICE_LIVE_HOST_SUFFIX=cognitiveservices.azure.com "
-                         "in .env")
-            logger.error("   Agent will start but all calls will be rejected until "
-                         "connectivity is restored.")
+            logger.error("   Check AZURE_VOICE_LIVE_RESOURCE spelling, DNS, and firewall.")
             self._config_ok = False
-            # Don't return — keep the ARI listener running so calls get a
-            # polite rejection rather than ringing forever.
 
         try:
             logger.info(f"Connecting to ARI at {self.ari_base} …")
@@ -241,9 +214,9 @@ class ARIAgent:
             )
             logger.info("✅ ARI connected")
 
-            self.ari_client.on_event("StasisStart",           self._handle_stasis_start)
-            self.ari_client.on_event("StasisEnd",             self._handle_stasis_end)
-            self.ari_client.on_event("ChannelHangupRequest",  self._handle_hangup_request)
+            self.ari_client.on_event("StasisStart",          self._handle_stasis_start)
+            self.ari_client.on_event("StasisEnd",            self._handle_stasis_end)
+            self.ari_client.on_event("ChannelHangupRequest", self._handle_hangup_request)
 
             logger.info("🎙️  READY — waiting for calls")
             logger.info("=" * 60)
@@ -267,10 +240,9 @@ class ARIAgent:
     # ── ARI event handlers ────────────────────────────────────────────────────
 
     def _handle_stasis_start(self, event):
-        channel      = event.get("channel", {})
-        channel_name = channel.get("name", "")
+        channel_name = event.get("channel", {}).get("name", "")
         if channel_name.startswith("UnicastRTP/"):
-            logger.debug(f"StasisStart for ExternalMedia channel — ignoring")
+            logger.debug("StasisStart for ExternalMedia channel — ignoring")
             return
         asyncio.create_task(self._process_call(event))
 
@@ -302,13 +274,10 @@ class ARIAgent:
         if not self._config_ok:
             logger.error(
                 f"❌ Rejecting call from {caller_number} — "
-                "Azure Voice Live is not reachable (check DNS / credentials). "
-                "See startup logs for details."
+                "Azure Voice Live not reachable. See startup logs."
             )
             try:
                 await channel.answer()
-                # Give Asterisk a moment then hang up so the caller hears
-                # a busy/disconnect tone rather than ringing indefinitely.
                 await asyncio.sleep(0.5)
                 await channel.hangup()
             except Exception:
@@ -316,11 +285,9 @@ class ARIAgent:
             return
 
         rtp_port = await self._alloc_rtp_port()
+        ws_url   = _build_azure_ws_url(self.azure_resource, AZURE_VOICE_LIVE_MODEL)
 
-        ws_url = _build_azure_ws_url(self.azure_resource, AZURE_VOICE_LIVE_MODEL)
-
-        # Inject knowledge base into the system prompt so the AI has
-        # real product/policy details instead of relying on training data.
+        # Enrich the system prompt with live KB content
         enriched_prompt = self.system_prompt + self._load_knowledge_context()
 
         session = AzureVoiceLiveCallSession(
@@ -355,16 +322,12 @@ class ARIAgent:
     # ── Knowledge base loader ─────────────────────────────────────────────────
 
     def _load_knowledge_context(self) -> str:
-        """
-        Load all active knowledge base entries and return them as a formatted
-        string to append to the system prompt.  Called once per inbound call.
-        Returns an empty string if the DB is unavailable or the KB is empty.
-        """
+        """Load active KB entries and return as a formatted string for the system prompt."""
         if not self.flask_app:
             return ""
         try:
             with self.flask_app.app_context():
-                from models import KnowledgeBase
+                from models import KnowledgeBase, db
                 entries = (
                     KnowledgeBase.query
                     .filter_by(is_active=True)
@@ -374,11 +337,10 @@ class ARIAgent:
                 if not entries:
                     return ""
 
-                parts = ["\n\nKNOWLEDGE BASE — use this information to answer callers accurately:"]
+                parts = ["\n\nKNOWLEDGE BASE — use this to answer callers accurately:"]
                 for e in entries:
                     parts.append(f"\n[{e.category.upper()}] {e.title}:\n{e.content}")
                     e.increment_usage()
-                from models import db
                 db.session.commit()
 
                 logger.info(f"📚 Loaded {len(entries)} knowledge base entries into session prompt")
@@ -417,7 +379,7 @@ class ARIAgent:
                     c.ended_at = datetime.utcnow()
                     db.session.commit()
         except Exception as e:
-            logger.error(f"DB log error error: {e}")
+            logger.error(f"DB log error: {e}")
 
     def _db_log_call_end(self, session: "AzureVoiceLiveCallSession"):
         if not self.flask_app:
@@ -440,37 +402,38 @@ class ARIAgent:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AzureVoiceLiveCallSession
+# AzureVoiceLiveCallSession — one per inbound call
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AzureVoiceLiveCallSession:
     """
-    One session per inbound call using Azure Voice Live API.
-
-    Audio pipeline:
-      Asterisk (μ-law 8kHz RTP) → ulaw2lin → ratecv 8→16kHz → base64
-        → Azure Voice Live WS (input_audio_buffer.append)
-      Azure Voice Live WS (response.audio.delta, PCM16 16kHz) → base64 decode
-        → ratecv 16→8kHz → lin2ulaw → RTP → Asterisk
-
-    Key Azure Voice Live differences vs OpenAI Realtime:
-      - Auth: "api-key" header (or Bearer token)
-      - No "OpenAI-Beta" header needed
-      - session.update is flatter: instructions, voice{}, turn_detection{},
-        input_audio_sampling_rate, input_audio_noise_reduction, etc.
-        at session root — NOT nested under audio.input / audio.output
-      - turn_detection.type = "azure_semantic_vad" for best telephony results
-      - voice = {"name": "en-US-AvaNeural", "type": "azure-standard"}
-      - Audio delta event: "response.audio.delta"  (not response.output_audio.delta)
-      - All other events (session.created, response.done, error,
-        conversation.item.input_audio_transcription.completed) are identical
+    Manages a single call:
+      - Asterisk RTP ↔ Azure Voice Live WebSocket (audio bridge)
+      - Escalation detection on both caller and AI transcripts
+      - Transfer via continueInDialplan → FreePBX softphone ring group
     """
 
+    # Keywords in the CALLER's speech that trigger a transfer
     TRANSFER_KEYWORDS = {
-        "speak", "talk", "human", "person", "agent",
-        "representative", "manager", "supervisor", "someone",
-        "transfer", "escalate", "real person",
+        "speak to", "talk to", "human", "person", "agent",
+        "representative", "manager", "supervisor", "someone else",
+        "transfer", "escalate", "real person", "actual person",
     }
+
+    # Phrases in the AI's speech that mean it has committed to a transfer
+    AI_TRANSFER_PHRASES = [
+        "transfer you",
+        "transferring you",
+        "connect you",
+        "put you through",
+        "one of our agents",
+        "speak to an agent",
+        "right away",            # e.g. "Let me transfer you to an agent right away"
+    ]
+
+    # RTP pacing constants — Asterisk needs exactly 160 μ-law bytes per packet
+    ULAW_PACKET_BYTES = 160       # 20 ms @ 8 kHz, 1 byte/sample (μ-law)
+    PACKET_INTERVAL_S = 0.020     # 20 ms between packets
 
     def __init__(self, *, channel, ari_client, azure_api_key, azure_ws_url,
                  voice_name, voice_type, system_prompt, rtp_port,
@@ -489,21 +452,24 @@ class AzureVoiceLiveCallSession:
         self.ari_password   = ari_password
         self.flask_app      = flask_app
 
+        # State flags
         self.caller_hung_up = False
         self.escalated      = False
         self._closed        = False
+        self._greeting_sent = False
+        self._ai_transcript_buf = ""
 
-        # RTP state
-        self._udp_sock: socket.socket | None = None
-        self._asterisk_rtp_addr: tuple | None = None
+        # RTP socket state
+        self._udp_sock:           socket.socket | None = None
+        self._asterisk_rtp_addr:  tuple | None         = None
         self._rtp_seq  = 0
         self._rtp_ts   = 0
         self._rtp_ssrc = 0xDEADBEEF
 
-        # Azure Voice Live WS
+        # Azure WebSocket
         self._azure_ws = None
 
-        # Bridge & external media channel IDs
+        # Bridge and ExternalMedia channel IDs (needed for cleanup/transfer)
         self._bridge_id      = None
         self._ext_channel_id = None
 
@@ -511,36 +477,33 @@ class AzureVoiceLiveCallSession:
         self._audio_to_azure:    asyncio.Queue[bytes] = asyncio.Queue(maxsize=500)
         self._audio_to_asterisk: asyncio.Queue[bytes] = asyncio.Queue(maxsize=500)
 
-        # For ratecv state (stateful sample-rate conversion)
-        self._ratecv_state_up   = None   # 8→16 kHz converter state
-        self._ratecv_state_down = None   # 16→8 kHz converter state
+        # Stateful sample-rate converters (audioop.ratecv)
+        self._ratecv_state_up   = None  # 8 kHz → 16 kHz
+        self._ratecv_state_down = None  # 24 kHz → 8 kHz
 
-        # Logged once when first TTS audio is received from Azure
-        self._first_audio_received = False
-
-    # ── main run ──────────────────────────────────────────────────────────────
+    # ── Main entry point ──────────────────────────────────────────────────────
 
     async def run(self):
-        """Answer → bridge → ExternalMedia → Azure Voice Live WS → pump."""
+        """Answer call → set up bridge → connect Azure WS → pump audio."""
         try:
             # 1. Answer
             await self.channel.answer()
             logger.info(f"✅ [{self.channel_id[:12]}] Call answered")
             await asyncio.sleep(0.3)
 
-            # 2. Create bridge
+            # 2. Create mixing bridge
             bridge = await self.ari_client.bridges.create(type="mixing")
             self._bridge_id = bridge.id
             await bridge.addChannel(channel=self.channel_id)
             logger.info(f"🌉 [{self.channel_id[:12]}] Bridge created: {self._bridge_id}")
 
-            # 3. Open UDP socket BEFORE creating ExternalMedia
+            # 3. Bind UDP socket BEFORE creating ExternalMedia
             self._udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._udp_sock.bind((RTP_LISTEN_HOST, self.rtp_port))
             self._udp_sock.setblocking(False)
             logger.info(f"🔌 [{self.channel_id[:12]}] UDP RTP listening on port {self.rtp_port}")
 
-            # 4. Create ExternalMedia channel
+            # 4. Create ExternalMedia channel — Asterisk streams caller audio to our port
             ext_channel = await self.ari_client.channels.externalMedia(
                 app             = os.getenv("ARI_APP", "ai-agent"),
                 external_host   = f"127.0.0.1:{self.rtp_port}",
@@ -555,10 +518,10 @@ class AzureVoiceLiveCallSession:
 
             await self._add_channel_to_bridge_with_retry(bridge, self._ext_channel_id)
 
-            # 5. Connect to Azure Voice Live API
+            # 5. Connect to Azure Voice Live
             await self._connect_azure()
 
-            # 6. Run all pumps concurrently until call ends
+            # 6. Run all pumps concurrently until call ends or escalation fires
             await asyncio.gather(
                 self._recv_rtp_loop(),
                 self._send_rtp_loop(),
@@ -577,6 +540,7 @@ class AzureVoiceLiveCallSession:
     async def _add_channel_to_bridge_with_retry(self, bridge, channel_id,
                                                   retries: int = 5,
                                                   delay: float = 0.2):
+        """Retry addChannel because ExternalMedia may not be ready immediately."""
         last_err = None
         for attempt in range(1, retries + 1):
             try:
@@ -605,102 +569,76 @@ class AzureVoiceLiveCallSession:
 
     async def _connect_azure(self):
         """
-        Connect to Azure Voice Live API.
+        Connect to Azure Voice Live API and configure the session.
 
-        Authentication: api-key header (simplest; use Bearer token for prod).
-        The session.update shape for Voice Live API is FLAT — properties like
-        `input_audio_sampling_rate`, `voice`, `turn_detection`, and
-        `input_audio_noise_reduction` all sit directly under `session`, not
-        nested inside audio.input / audio.output blocks (which is the old OpenAI
-        Realtime Beta shape).
+        The session.update payload for Azure Voice Live is FLAT — all properties
+        sit directly under "session", not nested inside audio.input/audio.output
+        blocks like the old OpenAI Realtime Beta format.
         """
-        # Extract the hostname from the WS URL for pre-flight DNS check.
-        # e.g. "wss://myresource.services.ai.azure.com/..." → "myresource.services.ai.azure.com"
         try:
             from urllib.parse import urlparse
-            _parsed_host = urlparse(self.azure_ws_url).hostname or ""
+            _host = urlparse(self.azure_ws_url).hostname or ""
         except Exception:
-            _parsed_host = ""
+            _host = ""
 
-        if _parsed_host and not _resolve_hostname(_parsed_host):
+        if _host and not _resolve_hostname(_host):
             raise ConnectionError(
-                f"Cannot resolve Azure Voice Live hostname '{_parsed_host}'. "
-                "Check AZURE_VOICE_LIVE_RESOURCE (currently "
-                f"'{_parsed_host.split('.')[0]}') and outbound DNS/firewall. "
-                "If this is a CognitiveServices resource, set "
-                "AZURE_VOICE_LIVE_HOST_SUFFIX=cognitiveservices.azure.com in .env"
+                f"Cannot resolve Azure Voice Live hostname '{_host}'. "
+                "Check AZURE_VOICE_LIVE_RESOURCE and DNS/firewall."
             )
 
-        headers = {
-            "api-key": self.azure_api_key,
-        }
         self._azure_ws = await websockets.connect(
             self.azure_ws_url,
-            ping_interval=20,
-            ping_timeout=30,
-            **_ws_header_kwargs(headers),
+            ping_interval = 20,
+            ping_timeout  = 30,
+            **_ws_header_kwargs({"api-key": self.azure_api_key}),
         )
         logger.info(f"🔗 [{self.channel_id[:12]}] Azure Voice Live WS connected")
         logger.info(f"   URL: {self.azure_ws_url}")
 
-        # Configure session with Azure Voice Live API shape.
-        #
-        # Notable differences from OpenAI Realtime:
-        #   - `voice` is an object, not a string
-        #   - `input_audio_sampling_rate` replaces nested audio.input.format.rate
-        #   - `turn_detection.type` = "azure_semantic_vad" for semantic EOU
-        #     (handles natural pauses better than server_vad — ideal for telephony)
-        #   - `input_audio_noise_reduction` enables server-side noise suppression
-        #   - `input_audio_echo_cancellation` prevents the mic picking up AI voice
-        #   - `modalities` uses ["text", "audio"] (same as OpenAI)
         await self._azure_ws.send(json.dumps({
             "type": "session.update",
             "session": {
-                "instructions": self.system_prompt + " CRITICAL: You MUST respond in English only, regardless of any ambiguity in the caller's speech. Never switch to any other language.",
-                "modalities":   ["text", "audio"],
+                "instructions": (
+                    self.system_prompt
+                    + " CRITICAL: Always respond in English only."
+                ),
+                "modalities": ["text", "audio"],
 
-                # ── Voice (Azure TTS) ──────────────────────────────────────
+                # Azure TTS voice
                 "voice": {
-                    "name": self.voice_name,   # e.g. "en-US-AvaNeural"
-                    "type": self.voice_type,   # "azure-standard" or "azure-custom"
+                    "name": self.voice_name,
+                    "type": self.voice_type,
                 },
 
-                # ── Input audio ────────────────────────────────────────────
-                # We upsample μ-law 8kHz → PCM16 16kHz before sending.
-                # Azure Voice Live supports 16000 and 24000; 16kHz halves
-                # bandwidth vs 24kHz while remaining well above telephony quality.
+                # We upsample μ-law 8 kHz → PCM16 16 kHz before sending
                 "input_audio_sampling_rate": AZURE_SAMPLE_RATE,
 
-                # Azure deep noise suppression — removes call background noise
+                # Server-side noise suppression (removes background noise)
                 "input_audio_noise_reduction": {
                     "type": "azure_deep_noise_suppression"
                 },
 
-                # Server-side echo cancellation — prevents AI audio loopback
+                # Server-side echo cancellation (prevents AI audio loopback)
                 "input_audio_echo_cancellation": {
                     "type": "server_echo_cancellation"
                 },
 
-                # ── Transcription (for DB logging & escalation detection) ──
-                # en-US has the most robust acoustic model. Azure Speech does not
-                # have an en-KE locale — using it likely caused silent fallback to
-                # a weaker generic model. en-US handles a wide range of accents well.
+                # Transcription — used for escalation detection and DB logging
                 "input_audio_transcription": {
-                    "model": "azure-speech",
+                    "model":    "azure-speech",
                     "language": "en-US",
                 },
 
-                # ── Turn detection ─────────────────────────────────────────
-                # "azure_semantic_vad" understands natural speech pauses and
-                # filler words — much better than volume-based "server_vad"
-                # for real phone calls. Works with all models (not just gpt-realtime).
+                # Semantic VAD — understands natural speech pauses better than
+                # volume-based server_vad; ideal for telephony
                 "turn_detection": {
                     "type":                "azure_semantic_vad",
-                    "threshold":           0.4,    # lower = more sensitive to barge-in
-                    "silence_duration_ms": 300,    # faster response after caller stops
+                    "threshold":           0.4,
+                    "silence_duration_ms": 400,
                     "prefix_padding_ms":   200,
-                    "remove_filler_words": True,   # ignore "umm", "uh", etc.
-                    "interrupt_response":  True,   # allow caller to barge in mid-response
+                    "remove_filler_words": True,
+                    "interrupt_response":  True,
                     "create_response":     True,
                 },
             },
@@ -709,12 +647,12 @@ class AzureVoiceLiveCallSession:
         logger.info(f"   Voice : {self.voice_name} ({self.voice_type})")
         logger.info(f"   VAD   : azure_semantic_vad | noise suppression ON | echo cancel ON")
 
-    # ── RTP receive (Asterisk → queue → Azure) ────────────────────────────────
+    # ── RTP receive (Asterisk → queue) ────────────────────────────────────────
 
     async def _recv_rtp_loop(self):
         """
-        Read μ-law RTP from Asterisk, convert to PCM16 16kHz, enqueue for Azure.
-        Uses stateful ratecv for smooth resampling across packet boundaries.
+        Read μ-law RTP packets from Asterisk, convert to PCM16 16 kHz,
+        enqueue for Azure.  Uses stateful ratecv for smooth resampling.
         """
         loop = asyncio.get_running_loop()
         while not self.caller_hung_up and not self._closed:
@@ -737,7 +675,7 @@ class AzureVoiceLiveCallSession:
                 # μ-law → PCM16 @ 8 kHz
                 pcm8 = audioop.ulaw2lin(ulaw_payload, 2)
 
-                # Upsample 8 kHz → 16 kHz (stateful for smooth interpolation)
+                # Upsample 8 kHz → 16 kHz (stateful for smooth resampling)
                 pcm16, self._ratecv_state_up = audioop.ratecv(
                     pcm8, 2, 1,
                     ASTERISK_SAMPLE_RATE, AZURE_SAMPLE_RATE,
@@ -756,7 +694,7 @@ class AzureVoiceLiveCallSession:
     # ── Azure send (queue → WS) ───────────────────────────────────────────────
 
     async def _azure_send_loop(self):
-        """Pull PCM16 chunks from queue and send to Azure Voice Live as base64."""
+        """Pull PCM16 chunks from the queue and stream to Azure as base64."""
         while not self.caller_hung_up and not self._closed:
             try:
                 chunk = await asyncio.wait_for(
@@ -780,24 +718,21 @@ class AzureVoiceLiveCallSession:
         """
         Receive events from Azure Voice Live API.
 
-        Key events:
+        Events handled:
           response.audio.delta
-              PCM16 audio from Azure TTS — convert back to μ-law 8kHz for Asterisk.
-              NOTE: Azure uses "response.audio.delta" (not "response.output_audio.delta"
-              which was the OpenAI Realtime Beta name).
+              TTS audio from Azure — PCM16 24 kHz, convert to μ-law 8 kHz for Asterisk.
 
           conversation.item.input_audio_transcription.completed
-              Caller speech transcript — same event name as OpenAI Realtime.
-              Used for escalation detection and DB logging.
+              Caller's speech transcript — check for transfer keywords.
 
-          session.created / session.updated
-              Lifecycle events — logged only.
+          response.audio_transcript.done / response.output_audio_transcript.done
+              AI's full spoken response — check if AI announced a transfer.
 
-          response.done
-              Response finished — log token usage.
+          session.updated
+              Trigger greeting on first fire.
 
-          error
-              API error — log and continue.
+          response.done, session.created, error
+              Logged only.
         """
         while not self.caller_hung_up and not self._closed:
             try:
@@ -809,28 +744,20 @@ class AzureVoiceLiveCallSession:
                 event = json.loads(raw)
                 etype = event.get("type", "")
 
-                # ── TTS audio from Azure ───────────────────────────────────
+                # ── TTS audio from Azure → Asterisk ───────────────────────
                 if etype == "response.audio.delta":
                     delta_b64 = event.get("delta", "")
                     if not delta_b64:
                         continue
                     pcm_out = base64.b64decode(delta_b64)
 
-                    # Azure Voice Live TTS output is PCM16 at 24 kHz regardless
-                    # of the input_audio_sampling_rate we requested.
-                    # Downsample 24 kHz → 8 kHz for Asterisk μ-law.
-                    # (If Azure ever returns 16 kHz the ratecv still works fine;
-                    #  the only effect is a slight pitch shift.  To be safe we
-                    #  always convert from 24 kHz since that is the documented
-                    #  default output rate for gpt-realtime.)
-                    AZURE_OUTPUT_RATE = 24000
+                    # Azure TTS always outputs PCM16 @ 24 kHz
+                    # Downsample 24 kHz → 8 kHz for Asterisk
                     pcm8, self._ratecv_state_down = audioop.ratecv(
                         pcm_out, 2, 1,
                         AZURE_OUTPUT_RATE, ASTERISK_SAMPLE_RATE,
                         self._ratecv_state_down
                     )
-
-                    # PCM16 → μ-law
                     ulaw = audioop.lin2ulaw(pcm8, 2)
                     await self._audio_to_asterisk.put(ulaw)
 
@@ -839,25 +766,41 @@ class AzureVoiceLiveCallSession:
                     transcript = event.get("transcript", "")
                     logger.info(f"👤 [{self.channel_id[:12]}] Caller: {transcript}")
                     self._db_log_transcript("caller", transcript, 1.0)
-                    if self._detect_transfer_intent(transcript):
-                        logger.info(f"🔀 [{self.channel_id[:12]}] Transfer intent detected")
+
+                    # Check if caller explicitly asked for a human
+                    if not self.escalated and self._detect_transfer_intent(transcript):
+                        logger.info(f"🔀 [{self.channel_id[:12]}] Caller requested transfer")
                         await self._handle_escalation(transcript)
 
-                # ── AI response transcript (streamed) ──────────────────────
+                # ── AI response transcript (streamed delta) ────────────────
                 elif etype in ("response.audio_transcript.delta",
                                "response.output_audio_transcript.delta"):
-                    # Accumulate the AI's spoken text for logging
                     delta = event.get("delta", "")
                     if delta:
-                        self._ai_transcript_buf = getattr(self, "_ai_transcript_buf", "") + delta
+                        self._ai_transcript_buf += delta
 
+                # ── AI response transcript complete ────────────────────────
                 elif etype in ("response.audio_transcript.done",
                                "response.output_audio_transcript.done"):
-                    full = getattr(self, "_ai_transcript_buf", "").strip()
+                    full = self._ai_transcript_buf.strip()
+                    self._ai_transcript_buf = ""
+
                     if full:
                         logger.info(f"🤖 [{self.channel_id[:12]}] AI said: {full}")
                         self._db_log_transcript("agent", full, 1.0)
-                    self._ai_transcript_buf = ""
+
+                        # If the AI announced a transfer, execute it after a short delay
+                        # so the caller hears the complete sentence before being transferred
+                        if not self.escalated and any(
+                            phrase in full.lower() for phrase in self.AI_TRANSFER_PHRASES
+                        ):
+                            logger.info(
+                                f"🔀 [{self.channel_id[:12]}] "
+                                "AI announced transfer — scheduling in 2.5s"
+                            )
+                            asyncio.create_task(
+                                self._delayed_escalation(full, delay=2.5)
+                            )
 
                 # ── Response finished ──────────────────────────────────────
                 elif etype == "response.done":
@@ -867,33 +810,31 @@ class AzureVoiceLiveCallSession:
                         f"(tokens: {usage.get('total_tokens', '?')})"
                     )
 
-                # ── Session lifecycle ──────────────────────────────────────
+                # ── Session created ────────────────────────────────────────
                 elif etype == "session.created":
                     logger.info(
-                        f"✅ [{self.channel_id[:12]}] Azure Voice Live session created: "
+                        f"✅ [{self.channel_id[:12]}] Azure session created: "
                         f"{event.get('session', {}).get('id', '')}"
                     )
 
+                # ── Session updated → send greeting ────────────────────────
                 elif etype == "session.updated":
                     logger.info(f"⚙️  [{self.channel_id[:12]}] Session updated by server")
-                    # Trigger the AI to speak a greeting immediately.
-                    # Without this, Azure waits for the caller to speak first,
-                    # leaving dead silence and confusing the caller.
-                    if not getattr(self, "_greeting_sent", False):
+                    if not self._greeting_sent:
                         self._greeting_sent = True
                         await asyncio.sleep(0.5)
                         await self._azure_ws.send(json.dumps({
                             "type": "response.create",
                             "response": {
                                 "instructions": (
-                                    "Say ONLY: 'Thank you for calling Jubilee Insurance, how can I help?' "
-                                    "Nothing else. One sentence maximum."
+                                    "Say ONLY: 'Thank you for calling Jubilee Insurance, "
+                                    "how can I help?' — nothing else."
                                 ),
                             },
                         }))
                         logger.info(f"👋 [{self.channel_id[:12]}] Greeting triggered")
 
-                # ── Errors ────────────────────────────────────────────────
+                # ── API errors ────────────────────────────────────────────
                 elif etype == "error":
                     logger.error(
                         f"❌ Azure Voice Live error: {event.get('error', event)}"
@@ -912,37 +853,26 @@ class AzureVoiceLiveCallSession:
 
     # ── RTP send (queue → Asterisk) ───────────────────────────────────────────
 
-    # Asterisk expects exactly 160 μ-law samples (= 20 ms @ 8 kHz) per RTP
-    # packet.  Azure Voice Live returns audio in large, variable-size bursts
-    # (often 100–500 ms at once).  Sending those bursts as a single oversized
-    # RTP packet causes Asterisk's jitter-buffer to discard or distort the
-    # audio — the caller hears breaking / robot voice / silence.
-    #
-    # Fix: accumulate raw μ-law bytes in a local buffer and drain it in
-    # exactly ULAW_PACKET_BYTES-sized chunks, pacing one packet every
-    # PACKET_INTERVAL_S seconds so Asterisk's playout clock stays smooth.
-    ULAW_PACKET_BYTES  = 160          # 20 ms @ 8 kHz, 1 byte/sample
-    PACKET_INTERVAL_S  = 0.020        # 20 ms between packets
-
     async def _send_rtp_loop(self):
         """
         Pull μ-law audio from the queue, re-packetise into strict 160-byte
-        (20 ms) RTP frames, and pace them at 20 ms intervals to Asterisk.
+        (20 ms) RTP frames, and pace at 20 ms intervals to Asterisk.
+
+        Azure returns audio in large bursts (100-500 ms at a time).  Sending
+        those bursts as one oversized packet causes Asterisk's jitter buffer to
+        discard or distort them.  We re-chunk into exactly 160-byte packets.
         """
-        loop       = asyncio.get_running_loop()
-        buf        = bytearray()          # accumulation buffer
-        next_send  = loop.time()          # absolute send deadline
+        loop      = asyncio.get_running_loop()
+        buf       = bytearray()
+        next_send = loop.time()
 
         while not self.caller_hung_up and not self._closed:
-            # ── drain the queue into our buffer (non-blocking after first) ──
             try:
                 chunk = await asyncio.wait_for(
                     self._audio_to_asterisk.get(), timeout=0.5
                 )
                 buf.extend(chunk)
             except asyncio.TimeoutError:
-                # Nothing arrived — if we have a partial buffer keep waiting,
-                # but don't spin; just loop back.
                 continue
             except Exception as e:
                 if not self._closed:
@@ -956,19 +886,18 @@ class AzureVoiceLiveCallSession:
                 except asyncio.QueueEmpty:
                     break
 
-            # ── emit as many complete 160-byte packets as we can ────────────
+            # Emit as many complete 160-byte packets as we have data for
             while len(buf) >= self.ULAW_PACKET_BYTES:
                 if not self._asterisk_rtp_addr or not self._udp_sock:
                     break
 
-                payload  = bytes(buf[:self.ULAW_PACKET_BYTES])
+                payload = bytes(buf[:self.ULAW_PACKET_BYTES])
                 del buf[:self.ULAW_PACKET_BYTES]
 
-                rtp_pkt          = self._build_rtp_packet(payload)
-                self._rtp_ts    += self.ULAW_PACKET_BYTES   # 1 sample = 1 byte for μ-law
-                self._rtp_seq    = (self._rtp_seq + 1) & 0xFFFF
+                rtp_pkt       = self._build_rtp_packet(payload)
+                self._rtp_ts += self.ULAW_PACKET_BYTES
+                self._rtp_seq = (self._rtp_seq + 1) & 0xFFFF
 
-                # Pace: sleep until the next scheduled send time
                 now = loop.time()
                 if next_send > now:
                     await asyncio.sleep(next_send - now)
@@ -987,7 +916,7 @@ class AzureVoiceLiveCallSession:
                     return
 
     def _build_rtp_packet(self, payload: bytes) -> bytes:
-        """Minimal RTP/AVP header (RFC 3550) + μ-law payload (PT=0)."""
+        """Build a minimal RTP/AVP header (RFC 3550) with μ-law payload (PT=0)."""
         header = struct.pack(
             "!BBHII",
             0x80,
@@ -1001,69 +930,198 @@ class AzureVoiceLiveCallSession:
     # ── Transfer / escalation ─────────────────────────────────────────────────
 
     def _detect_transfer_intent(self, text: str) -> bool:
+        """Return True if the caller's text contains an explicit transfer request."""
         lower = text.lower()
         return any(kw in lower for kw in self.TRANSFER_KEYWORDS)
 
+    async def _delayed_escalation(self, transcript: str, delay: float = 2.5):
+        """
+        Wait for the AI to finish speaking its transfer announcement,
+        then execute the actual transfer.
+        """
+        await asyncio.sleep(delay)
+        if not self._closed and not self.escalated:
+            await self._handle_escalation(transcript)
+
     async def _handle_escalation(self, transcript: str):
+        """
+        Transfer the caller to the appropriate department softphone.
+
+        Steps:
+          1. Classify intent from transcript to pick the right department
+          2. Remove ExternalMedia from bridge (stops AI audio immediately)
+          3. Close Azure WS and UDP socket
+          4. Call continueInDialplan → FreePBX routes to dept extension
+             (e.g. extension 1000 → Sales ring group → softphone rings)
+        """
+        if self.escalated:
+            return  # Prevent double-transfer
+
         intent = self._classify_intent(transcript)
         dept   = self._get_department_for_intent(intent)
 
-        if dept:
-            logger.info(
-                f"🔀 [{self.channel_id[:12]}] "
-                f"Transferring to {dept.name} (ext {dept.extension})"
-            )
-            self.escalated = True
+        dept_name = dept.name      if dept else "Support"
+        dept_ext  = dept.extension if dept else "1005"
+
+        logger.info(
+            f"🔀 [{self.channel_id[:12]}] "
+            f"Escalating → {dept_name} (ext {dept_ext}, intent: {intent})"
+        )
+
+        self.escalated = True
+
+        # Step 1: Stop audio pumps by marking closed (they check this flag)
+        self._closed = True
+
+        # Step 2: Remove ExternalMedia from bridge so AI audio stops immediately
+        if self._bridge_id and self._ext_channel_id:
+            try:
+                bridge = await self.ari_client.bridges.get(bridgeId=self._bridge_id)
+                await bridge.removeChannel(channel=self._ext_channel_id)
+                logger.info(f"🔇 [{self.channel_id[:12]}] ExternalMedia removed from bridge")
+            except Exception as e:
+                logger.debug(f"removeChannel error (non-fatal): {e}")
+
+        # Step 3: Close Azure WS and UDP socket
+        if self._azure_ws:
+            try:
+                await self._azure_ws.close()
+            except Exception:
+                pass
+            self._azure_ws = None
+
+        if self._udp_sock:
+            try:
+                self._udp_sock.close()
+            except Exception:
+                pass
+            self._udp_sock = None
+
+        # Step 4: Hang up ExternalMedia channel
+        if self._ext_channel_id:
+            try:
+                await self.ari_client.channels.hangup(channelId=self._ext_channel_id)
+            except Exception:
+                pass
+
+        # Step 5: Destroy bridge (caller channel exits bridge, stays alive)
+        if self._bridge_id:
+            try:
+                await self.ari_client.bridges.destroy(bridgeId=self._bridge_id)
+            except Exception:
+                pass
+
+        # Step 6: Send caller into FreePBX dialplan at the department extension
+        # from-internal is FreePBX's standard context for internal extension dialling.
+        # Your ring groups / queues / softphones must be reachable at dept_ext in this context.
+        transfer_contexts = ["from-internal", "default"]
+        transferred = False
+
+        for ctx in transfer_contexts:
             try:
                 await self.channel.continueInDialplan(
-                    context   = "from-internal",
-                    extension = dept.extension,
+                    context   = ctx,
+                    extension = dept_ext,
                     priority  = 1,
                 )
+                logger.info(
+                    f"✅ [{self.channel_id[:12]}] Transfer sent → "
+                    f"{dept_name} ext {dept_ext} (context: {ctx})"
+                )
+                transferred = True
+                break
             except Exception as e:
-                logger.error(f"Transfer error: {e}")
-        else:
-            logger.warning(f"⚠️  [{self.channel_id[:12]}] No department found for intent '{intent}'")
+                logger.warning(f"continueInDialplan failed for context '{ctx}': {e}")
+
+        if not transferred:
+            logger.error(
+                f"❌ [{self.channel_id[:12]}] All transfer attempts failed for ext {dept_ext}. "
+                f"Check that extension {dept_ext} exists in FreePBX "
+                f"and is reachable from context 'from-internal'."
+            )
+            # Last resort: hang up cleanly rather than leave caller in silence
+            try:
+                await self.channel.hangup()
+            except Exception:
+                pass
 
     def _classify_intent(self, text: str) -> str:
+        """
+        Keyword-based intent classification.
+        Used to pick which department to transfer to.
+        """
         lower = text.lower()
-        if any(w in lower for w in ["buy", "quote", "new policy", "coverage"]):
+        if any(w in lower for w in ["buy", "quote", "new policy", "purchase", "sign up"]):
             return "sales"
-        if any(w in lower for w in ["claim", "accident", "damage"]):
+        if any(w in lower for w in ["claim", "accident", "damage", "report", "incident"]):
             return "claims"
-        if any(w in lower for w in ["bill", "payment", "pay", "invoice"]):
+        if any(w in lower for w in ["bill", "payment", "pay", "invoice", "mpesa", "premium"]):
             return "billing"
         return "support"
 
     def _get_department_for_intent(self, intent_type: str):
+        """
+        Look up the Department for a given intent.
+        Tries RoutingRule first, then Department name, then highest-priority dept.
+        Returns None if DB is unavailable.
+        """
         if not self.flask_app:
             return None
         try:
             with self.flask_app.app_context():
                 from models import Department, RoutingRule
-                rule = RoutingRule.query.filter_by(
-                    intent_type=intent_type, is_active=True
-                ).order_by(RoutingRule.priority.desc()).first()
-                if rule and rule.department:
+
+                # 1. Try routing rules (allows admin to configure custom mappings)
+                rule = (
+                    RoutingRule.query
+                    .filter_by(intent_type=intent_type, is_active=True)
+                    .order_by(RoutingRule.priority.desc())
+                    .first()
+                )
+                if rule and rule.department and rule.department.is_active:
+                    logger.info(
+                        f"🗂️  Routing rule matched: {intent_type} → "
+                        f"{rule.department.name} (ext {rule.department.extension})"
+                    )
                     return rule.department
+
+                # 2. Fall back to department name matching
                 name_map = {
-                    "sales": "Sales", "claims": "Claims",
-                    "billing": "Billing", "support": "Support",
+                    "sales":   "Sales",
+                    "claims":  "Claims",
+                    "billing": "Billing",
+                    "support": "Support",
                 }
-                if intent_type in name_map:
-                    d = Department.query.filter_by(
-                        name=name_map[intent_type], is_active=True
+                dept_name = name_map.get(intent_type)
+                if dept_name:
+                    dept = Department.query.filter_by(
+                        name=dept_name, is_active=True
                     ).first()
-                    if d:
-                        return d
-                return Department.query.filter_by(is_active=True).order_by(
-                    Department.priority.desc()
-                ).first()
+                    if dept:
+                        logger.info(
+                            f"🗂️  Department name matched: {dept_name} "
+                            f"(ext {dept.extension})"
+                        )
+                        return dept
+
+                # 3. Fall back to highest-priority active department
+                dept = (
+                    Department.query
+                    .filter_by(is_active=True)
+                    .order_by(Department.priority.desc())
+                    .first()
+                )
+                if dept:
+                    logger.info(
+                        f"🗂️  Fallback department: {dept.name} (ext {dept.extension})"
+                    )
+                return dept
+
         except Exception as e:
-            logger.error(f"Dept lookup error: {e}")
+            logger.error(f"Department lookup error: {e}")
             return None
 
-    # ── DB transcript helper ──────────────────────────────────────────────────
+    # ── DB transcript logging ─────────────────────────────────────────────────
 
     def _db_log_transcript(self, speaker: str, text: str, confidence: float):
         if not self.flask_app or not text:
@@ -1084,48 +1142,65 @@ class AzureVoiceLiveCallSession:
         except Exception as e:
             logger.error(f"DB transcript error: {e}")
 
-    # ── cleanup ───────────────────────────────────────────────────────────────
+    # ── Cleanup ───────────────────────────────────────────────────────────────
 
     async def close(self):
-        if self._closed:
-            return
-        self._closed = True
+        """
+        Clean up all resources for this session.
+        Called both on normal call end and after escalation.
+        After a successful escalation, the caller channel is left alive
+        (it's being handled by FreePBX), so we skip hanging it up.
+        """
+        if self._closed and not self.escalated:
+            # Already cleaned up (escalation handles its own teardown)
+            # Only skip if we truly already ran close() non-escalation path
+            pass
 
+        # Close Azure WS
         if self._azure_ws:
             try:
                 await self._azure_ws.close()
             except Exception:
                 pass
+            self._azure_ws = None
 
+        # Close UDP socket
         if self._udp_sock:
             try:
                 self._udp_sock.close()
             except Exception:
                 pass
+            self._udp_sock = None
 
+        # Hang up ExternalMedia channel
         if self._ext_channel_id:
             try:
                 await self.ari_client.channels.hangup(channelId=self._ext_channel_id)
             except Exception:
                 pass
+            self._ext_channel_id = None
 
+        # Destroy bridge
         if self._bridge_id:
             try:
                 await self.ari_client.bridges.destroy(bridgeId=self._bridge_id)
             except Exception:
                 pass
+            self._bridge_id = None
 
+        # Hang up caller only if we're not escalating (escalation keeps caller alive)
         if not self.escalated and not self.caller_hung_up:
             try:
                 await self.channel.hangup()
             except Exception:
                 pass
 
+        self._closed = True
         logger.info(f"🔒 [{self.channel_id[:12]}] Session closed")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Backward-compat stubs
+# Backward-compat stubs (no longer used)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SoundCache:
