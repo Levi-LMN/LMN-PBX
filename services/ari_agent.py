@@ -163,7 +163,7 @@ class ARIAgent:
         return (
             "You are a phone assistant for Jubilee Insurance. "
             "CRITICAL RULES: "
-            "(1) MAXIMUM 1-2 SHORT SENTENCES per response — never more. "
+            "(1) Keep responses to 2-3 sentences — complete enough to actually help, but never rambling. "
             "(2) When asked what services you offer, list ALL of them in one sentence: "
             "life, health, motor, home, travel, and personal accident insurance. "
             "Then ask which one interests them. Do NOT pick just one at random. "
@@ -173,7 +173,8 @@ class ARIAgent:
             "(6) Never say you are an AI. "
             "(7) ONLY transfer to a human if the caller EXPLICITLY says they want to speak to a human, agent, or manager. "
             "The word management or confirm alone does NOT mean they want a transfer. "
-            "(8) If you do not know a specific detail, say so honestly — do NOT transfer. "
+            "(8) Use the knowledge base information provided to give accurate, specific answers. "
+            "If you genuinely do not know a specific detail, say so honestly — do NOT transfer. "
             "Jubilee Insurance products: life insurance, health insurance (covers inpatient, outpatient, "
             "dental, optical, braces, maternity), motor insurance (comprehensive and third-party), "
             "home insurance, travel insurance, personal accident cover. "
@@ -318,6 +319,10 @@ class ARIAgent:
 
         ws_url = _build_azure_ws_url(self.azure_resource, AZURE_VOICE_LIVE_MODEL)
 
+        # Inject knowledge base into the system prompt so the AI has
+        # real product/policy details instead of relying on training data.
+        enriched_prompt = self.system_prompt + self._load_knowledge_context()
+
         session = AzureVoiceLiveCallSession(
             channel       = channel,
             ari_client    = self.ari_client,
@@ -325,7 +330,7 @@ class ARIAgent:
             azure_ws_url  = ws_url,
             voice_name    = self.azure_voice_name,
             voice_type    = self.azure_voice_type,
-            system_prompt = self.system_prompt,
+            system_prompt = enriched_prompt,
             rtp_port      = rtp_port,
             ari_url       = self.ari_url,
             ari_username  = self.ari_username,
@@ -346,6 +351,41 @@ class ARIAgent:
             self.active_calls.pop(channel.id, None)
             await session.close()
             self._db_log_call_end(session)
+
+    # ── Knowledge base loader ─────────────────────────────────────────────────
+
+    def _load_knowledge_context(self) -> str:
+        """
+        Load all active knowledge base entries and return them as a formatted
+        string to append to the system prompt.  Called once per inbound call.
+        Returns an empty string if the DB is unavailable or the KB is empty.
+        """
+        if not self.flask_app:
+            return ""
+        try:
+            with self.flask_app.app_context():
+                from models import KnowledgeBase
+                entries = (
+                    KnowledgeBase.query
+                    .filter_by(is_active=True)
+                    .order_by(KnowledgeBase.priority.desc())
+                    .all()
+                )
+                if not entries:
+                    return ""
+
+                parts = ["\n\nKNOWLEDGE BASE — use this information to answer callers accurately:"]
+                for e in entries:
+                    parts.append(f"\n[{e.category.upper()}] {e.title}:\n{e.content}")
+                    e.increment_usage()
+                from models import db
+                db.session.commit()
+
+                logger.info(f"📚 Loaded {len(entries)} knowledge base entries into session prompt")
+                return "\n".join(parts)
+        except Exception as exc:
+            logger.error(f"KB load error: {exc}")
+            return ""
 
     # ── DB helpers ────────────────────────────────────────────────────────────
 
