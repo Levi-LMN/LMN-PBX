@@ -567,13 +567,10 @@ class AzureVoiceLiveCallSession:
             "session": {
                 "instructions": self.system_prompt,
                 "modalities": ["text", "audio"],
-                # ── FIX: session-level output language lock ────────────────────
-                # This tells the realtime model to generate responses in English
-                # regardless of what language it detects in the caller's audio.
-                # Without this, the model mirrors the detected input language
-                # (e.g. responds in Spanish when STT mis-detects audio as Spanish,
-                # or in Swahili when the caller code-switches mid-sentence).
-                "output_language": "en",
+                # NOTE: "output_language" is NOT a valid Azure Voice Live field
+                # and causes an immediate session configuration failure.
+                # Language locking is handled entirely in the system prompt
+                # (instructions) which already enforces English-only output.
                 "voice": {
                     "name": self.voice_name,
                     "type": self.voice_type,
