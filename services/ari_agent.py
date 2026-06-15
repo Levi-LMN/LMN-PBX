@@ -167,11 +167,13 @@ class ARIAgent:
             "You are Ari, a friendly and knowledgeable phone assistant for Jubilee Insurance Kenya. "
             "You have detailed knowledge of our products: motor, medical, life, last expense, "
             "home, and travel insurance, plus claims processes and payment methods. "
-            "LANGUAGE RULE — THIS IS ABSOLUTE AND NON-NEGOTIABLE: "
-            "You MUST respond in English at ALL times, no matter what language or mix of languages "
-            "the caller uses. Even if the caller speaks Swahili, Sheng, or any other language, "
-            "your reply must always be in English. Never switch to Swahili or any other language. "
-            "Never mirror the caller's language. English only, every single turn, no exceptions. "
+            "OUTPUT LANGUAGE — ABSOLUTE RULE, HIGHEST PRIORITY, OVERRIDES EVERYTHING ELSE: "
+            "Your output language is ENGLISH. Always. Every single response. No exceptions. "
+            "Even if the caller speaks Swahili, Sheng, Spanish, or any other language — "
+            "your reply is always in English. Even if the transcription you receive is in another "
+            "language — your reply is always in English. Never produce a single word in any "
+            "language other than English. Do not mirror, echo, or match the caller's language. "
+            "If you ever feel tempted to respond in another language, respond in English instead. "
             "RULES: "
             "(1) Give complete, helpful answers — 3 to 6 sentences is ideal. Never cut an answer short. "
             "If a topic needs more detail to be useful, provide it. "
@@ -565,6 +567,13 @@ class AzureVoiceLiveCallSession:
             "session": {
                 "instructions": self.system_prompt,
                 "modalities": ["text", "audio"],
+                # ── FIX: session-level output language lock ────────────────────
+                # This tells the realtime model to generate responses in English
+                # regardless of what language it detects in the caller's audio.
+                # Without this, the model mirrors the detected input language
+                # (e.g. responds in Spanish when STT mis-detects audio as Spanish,
+                # or in Swahili when the caller code-switches mid-sentence).
+                "output_language": "en",
                 "voice": {
                     "name": self.voice_name,
                     "type": self.voice_type,
@@ -581,12 +590,10 @@ class AzureVoiceLiveCallSession:
                 },
                 "input_audio_transcription": {
                     "model":    "azure-speech",
-                    # Locked to English — callers may mix in Swahili/Sheng words but
-                    # the AI must always respond in English.  The en-KE locale gives
-                    # the best recognition of Kenyan accents while keeping English as
-                    # the output language.  Do NOT set to "" (multilingual) because
-                    # that causes the model to mirror the detected language, resulting
-                    # in Swahili responses when the caller code-switches mid-sentence.
+                    # en-KE gives the best STT accuracy for Kenyan accents.
+                    # Do NOT set to "" (multilingual) — that causes the STT to
+                    # emit non-English text which the model then mirrors as
+                    # non-English audio output (Spanish, Swahili, etc.).
                     "language": "en-KE",
                 },
                 "turn_detection": {
@@ -609,7 +616,7 @@ class AzureVoiceLiveCallSession:
         logger.info(f"⚙️  [{self.channel_id[:12]}] Azure Voice Live session configured")
         logger.info(f"   Voice    : {self.voice_name} ({self.voice_type})")
         logger.info(f"   Audio in : PCM16 @ {AZURE_SAMPLE_RATE} Hz (upsampled from 8kHz)")
-        logger.info(f"   Language : en-KE (English, Kenyan accent)")
+        logger.info(f"   Language : en-KE STT input → en output (locked)")
         logger.info(f"   VAD      : azure_semantic_vad | threshold=0.5 | silence=500ms")
 
     # ── RTP receive (Asterisk → queue) ────────────────────────────────────────
