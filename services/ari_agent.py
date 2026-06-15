@@ -167,6 +167,11 @@ class ARIAgent:
             "You are Ari, a friendly and knowledgeable phone assistant for Jubilee Insurance Kenya. "
             "You have detailed knowledge of our products: motor, medical, life, last expense, "
             "home, and travel insurance, plus claims processes and payment methods. "
+            "LANGUAGE RULE — THIS IS ABSOLUTE AND NON-NEGOTIABLE: "
+            "You MUST respond in English at ALL times, no matter what language or mix of languages "
+            "the caller uses. Even if the caller speaks Swahili, Sheng, or any other language, "
+            "your reply must always be in English. Never switch to Swahili or any other language. "
+            "Never mirror the caller's language. English only, every single turn, no exceptions. "
             "RULES: "
             "(1) Give complete, helpful answers — 3 to 6 sentences is ideal. Never cut an answer short. "
             "If a topic needs more detail to be useful, provide it. "
@@ -576,9 +581,13 @@ class AzureVoiceLiveCallSession:
                 },
                 "input_audio_transcription": {
                     "model":    "azure-speech",
-                    # Empty string = Azure multilingual model — handles Kenyan/East-African
-                    # English accents far better than locking to "en-US"
-                    "language": "",
+                    # Locked to English — callers may mix in Swahili/Sheng words but
+                    # the AI must always respond in English.  The en-KE locale gives
+                    # the best recognition of Kenyan accents while keeping English as
+                    # the output language.  Do NOT set to "" (multilingual) because
+                    # that causes the model to mirror the detected language, resulting
+                    # in Swahili responses when the caller code-switches mid-sentence.
+                    "language": "en-KE",
                 },
                 "turn_detection": {
                     "type": "azure_semantic_vad",
@@ -600,7 +609,7 @@ class AzureVoiceLiveCallSession:
         logger.info(f"⚙️  [{self.channel_id[:12]}] Azure Voice Live session configured")
         logger.info(f"   Voice    : {self.voice_name} ({self.voice_type})")
         logger.info(f"   Audio in : PCM16 @ {AZURE_SAMPLE_RATE} Hz (upsampled from 8kHz)")
-        logger.info(f"   Language : multilingual (accent-aware)")
+        logger.info(f"   Language : en-KE (English, Kenyan accent)")
         logger.info(f"   VAD      : azure_semantic_vad | threshold=0.5 | silence=500ms")
 
     # ── RTP receive (Asterisk → queue) ────────────────────────────────────────
