@@ -45,7 +45,7 @@ AZURE_VOICE_LIVE_API_VERSION = "2025-10-01"
 AZURE_VOICE_LIVE_MODEL       = "gpt-realtime"
 
 ASTERISK_SAMPLE_RATE = 8000
-AZURE_SAMPLE_RATE    = 16000
+AZURE_SAMPLE_RATE    = 24000   # Azure Voice Live processes at 24 kHz internally
 AZURE_OUTPUT_RATE    = 24000
 RTP_HEADER_SIZE      = 12
 
@@ -554,13 +554,16 @@ class AzureVoiceLiveCallSession:
         await self._azure_ws.send(json.dumps({
             "type": "session.update",
             "session": {
-                "instructions": self.system_prompt + " CRITICAL: Always respond in English only.",
+                "instructions": self.system_prompt,
                 "modalities": ["text", "audio"],
                 "voice": {
                     "name": self.voice_name,
                     "type": self.voice_type,
                 },
-                "input_audio_sampling_rate": AZURE_SAMPLE_RATE,
+                # Explicitly declare audio formats so Azure never guesses
+                "input_audio_format":        "pcm16",
+                "output_audio_format":       "pcm16",
+                "input_audio_sampling_rate": AZURE_SAMPLE_RATE,  # 24000
                 "input_audio_noise_reduction": {
                     "type": "azure_deep_noise_suppression"
                 },
@@ -569,22 +572,32 @@ class AzureVoiceLiveCallSession:
                 },
                 "input_audio_transcription": {
                     "model":    "azure-speech",
-                    "language": "en-US",
+                    # Empty string = Azure multilingual model — handles Kenyan/East-African
+                    # English accents far better than locking to "en-US"
+                    "language": "",
                 },
                 "turn_detection": {
-                    "type":                "azure_semantic_vad",
-                    "threshold":           0.4,
-                    "silence_duration_ms": 400,
-                    "prefix_padding_ms":   200,
+                    "type": "azure_semantic_vad",
+                    # 0.5 is Azure's recommended default — 0.4 was too eager,
+                    # causing background noise to trigger false speech detections
+                    "threshold":           0.5,
+                    # 500 ms gives callers time for natural mid-sentence pauses
+                    # (phone audio from Kenya often has brief gaps due to network)
+                    "silence_duration_ms": 500,
+                    # 300 ms captures the start of the utterance cleanly
+                    "prefix_padding_ms":   300,
                     "remove_filler_words": True,
                     "interrupt_response":  True,
                     "create_response":     True,
                 },
+                "temperature": 0.7,
             },
         }))
         logger.info(f"⚙️  [{self.channel_id[:12]}] Azure Voice Live session configured")
-        logger.info(f"   Voice : {self.voice_name} ({self.voice_type})")
-        logger.info(f"   VAD   : azure_semantic_vad | noise suppression ON | echo cancel ON")
+        logger.info(f"   Voice    : {self.voice_name} ({self.voice_type})")
+        logger.info(f"   Audio in : PCM16 @ {AZURE_SAMPLE_RATE} Hz (upsampled from 8kHz)")
+        logger.info(f"   Language : multilingual (accent-aware)")
+        logger.info(f"   VAD      : azure_semantic_vad | threshold=0.5 | silence=500ms")
 
     # ── RTP receive (Asterisk → queue) ────────────────────────────────────────
 
@@ -607,6 +620,7 @@ class AzureVoiceLiveCallSession:
 
                 ulaw_payload = data[RTP_HEADER_SIZE:]
                 pcm8 = audioop.ulaw2lin(ulaw_payload, 2)
+                # Upsample 8 kHz → 24 kHz to match AZURE_SAMPLE_RATE
                 pcm16, self._ratecv_state_up = audioop.ratecv(
                     pcm8, 2, 1,
                     ASTERISK_SAMPLE_RATE, AZURE_SAMPLE_RATE,
