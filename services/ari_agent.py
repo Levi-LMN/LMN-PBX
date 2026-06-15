@@ -355,12 +355,16 @@ class ARIAgent:
             "home, and travel insurance, plus claims processes and payment methods. "
             "OUTPUT LANGUAGE — ABSOLUTE RULE: Your output is ALWAYS English. No exceptions. "
             "Even if the caller speaks Swahili or any other language, reply in English only. "
+            "RESPONSE LENGTH — CRITICAL FOR PHONE: "
+            "Keep every response to 2 sentences maximum — roughly 30 to 50 words, hard limit 60. "
+            "This is a phone call: give one clear piece of information, then ask ONE short follow-up question. "
+            "Never dump everything you know at once. Reveal information one layer at a time across turns. "
             "RULES: "
-            "(1) Give complete helpful answers — 3 to 6 sentences. "
-            "(2) Never read bullet points — speak conversationally. "
-            "(3) Be warm and natural, like a Kenyan insurance agent on the phone. "
-            "(4) If asked broadly about products, name ALL: motor, medical, life, last expense, home, travel. "
-            "(5) Use specific details — KES amounts, M-PESA paybill numbers — when relevant. "
+            "(1) 2 sentences max. 30–50 words. Hard limit: 60 words. "
+            "(2) Never read bullet points — one fact at a time, spoken naturally. "
+            "(3) Be warm and conversational, like a Kenyan insurance agent on the phone. "
+            "(4) If asked broadly about products, name them in one sentence and ask which they want to know more about. "
+            "(5) Use specific details — KES amounts, M-PESA paybill numbers — one detail per turn only. "
             "(6) Never say you are an AI. "
             "(7) Never use filler like 'Certainly', 'Of course', 'Absolutely', or 'Great question'. "
             "(8) Only transfer if the caller EXPLICITLY asks to speak to a person or agent. "
@@ -425,7 +429,7 @@ class CallSession:
         try:
             await self.channel.answer()
             logger.info(f"✅ [{self.channel_id[:12]}] Answered")
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.1)  # reduced: just enough for channel to settle
 
             # Create bridge
             bridge = await self.ari_client.bridges.create(type="mixing")
@@ -642,10 +646,11 @@ class CallSession:
             logger.info(f"✅ [{self.channel_id[:12]}] Azure session: {event.get('session', {}).get('id', '')}")
 
         elif etype == "session.updated":
+            # Trigger greeting immediately — no extra sleep.
+            # session.updated confirms Azure accepted the config, so it's ready.
             logger.info(f"⚙️  [{self.channel_id[:12]}] Session updated")
             if not self._greeting_sent:
                 self._greeting_sent = True
-                await asyncio.sleep(0.3)
                 await self._azure_ws.send(json.dumps({
                     "type": "response.create",
                     "response": {
