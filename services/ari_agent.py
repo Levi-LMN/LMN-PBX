@@ -608,9 +608,7 @@ class AzureVoiceLiveCallSession:
         await self._azure_ws.send(json.dumps({
             "type": "session.update",
             "session": {
-                "instructions": self.system_prompt + "
-
-CRITICAL: You MUST respond in English only, regardless of any ambiguity in the caller's speech. Never switch to any other language.",
+                "instructions": self.system_prompt + " CRITICAL: You MUST respond in English only, regardless of any ambiguity in the caller's speech. Never switch to any other language.",
                 "modalities":   ["text", "audio"],
 
                 # ── Voice (Azure TTS) ──────────────────────────────────────
