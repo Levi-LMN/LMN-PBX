@@ -41,6 +41,15 @@ import websockets
 from datetime import datetime
 from flask import Flask
 
+# Allow overriding the Azure host suffix via env var so that older
+# CognitiveServices resources (*.cognitiveservices.azure.com) work without
+# code changes.  AI-Foundry resources use the default below.
+# Set AZURE_VOICE_LIVE_HOST_SUFFIX=cognitiveservices.azure.com in .env for
+# legacy resources.
+AZURE_VOICE_LIVE_HOST_SUFFIX = os.getenv(
+    "AZURE_VOICE_LIVE_HOST_SUFFIX", "services.ai.azure.com"
+)
+
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -55,11 +64,23 @@ AZURE_VOICE_LIVE_MODEL       = "gpt-realtime"   # or "gpt-realtime-mini"
 
 def _build_azure_ws_url(resource_name: str, model: str) -> str:
     return (
-        f"wss://{resource_name}.services.ai.azure.com"
+        f"wss://{resource_name}.{AZURE_VOICE_LIVE_HOST_SUFFIX}"
         f"/voice-live/realtime"
         f"?api-version={AZURE_VOICE_LIVE_API_VERSION}"
         f"&model={model}"
     )
+
+
+def _resolve_hostname(hostname: str) -> bool:
+    """
+    Return True if *hostname* resolves via DNS, False otherwise.
+    Used to give a clear error before attempting a WebSocket connect.
+    """
+    try:
+        socket.getaddrinfo(hostname, None)
+        return True
+    except socket.gaierror:
+        return False
 
 # Audio parameters
 ASTERISK_SAMPLE_RATE  = 8000    # Asterisk sends μ-law 8 kHz
@@ -131,6 +152,11 @@ class ARIAgent:
         self._port_lock     = asyncio.Lock()
 
         self.ari_client = None
+
+        # Pre-validate Azure config so we can reject calls cleanly instead of
+        # surfacing a cryptic DNS error mid-call.
+        self._config_ok = bool(self.azure_resource and self.azure_api_key)
+
         logger.info("ARIAgent (Azure Voice Live) initialised")
 
     def _default_prompt(self):
@@ -162,10 +188,36 @@ class ARIAgent:
 
         if not self.azure_resource:
             logger.error("❌ AZURE_VOICE_LIVE_RESOURCE not set — cannot start")
+            logger.error("   Set AZURE_VOICE_LIVE_RESOURCE=<your-resource-name> in .env")
             return
         if not self.azure_api_key:
             logger.error("❌ AZURE_SPEECH_KEY not set — cannot start")
+            logger.error("   Set AZURE_SPEECH_KEY=<your-api-key> in .env")
             return
+
+        # Build and log the full WS URL so it can be verified at startup.
+        _ws_url = _build_azure_ws_url(self.azure_resource, AZURE_VOICE_LIVE_MODEL)
+        logger.info(f"   WS URL   : {_ws_url}")
+
+        # DNS pre-check — fail fast with a clear message rather than surfacing
+        # a cryptic socket.gaierror when the first call arrives.
+        _azure_hostname = f"{self.azure_resource}.{AZURE_VOICE_LIVE_HOST_SUFFIX}"
+        logger.info(f"   Checking DNS for {_azure_hostname} …")
+        if not _resolve_hostname(_azure_hostname):
+            logger.error(f"❌ Cannot resolve '{_azure_hostname}'")
+            logger.error("   Possible causes:")
+            logger.error("     1. AZURE_VOICE_LIVE_RESOURCE is misspelled "
+                         f"(currently: '{self.azure_resource}')")
+            logger.error("     2. This server has no outbound internet DNS "
+                         "(check /etc/resolv.conf and firewall rules)")
+            logger.error("     3. The resource lives under cognitiveservices.azure.com "
+                         "— set AZURE_VOICE_LIVE_HOST_SUFFIX=cognitiveservices.azure.com "
+                         "in .env")
+            logger.error("   Agent will start but all calls will be rejected until "
+                         "connectivity is restored.")
+            self._config_ok = False
+            # Don't return — keep the ARI listener running so calls get a
+            # polite rejection rather than ringing forever.
 
         try:
             logger.info(f"Connecting to ARI at {self.ari_base} …")
@@ -231,6 +283,22 @@ class ARIAgent:
     async def _handle_call(self, channel):
         caller_number = channel.json.get("caller", {}).get("number", "Unknown")
         logger.info(f"📞 Incoming call from {caller_number}")
+
+        if not self._config_ok:
+            logger.error(
+                f"❌ Rejecting call from {caller_number} — "
+                "Azure Voice Live is not reachable (check DNS / credentials). "
+                "See startup logs for details."
+            )
+            try:
+                await channel.answer()
+                # Give Asterisk a moment then hang up so the caller hears
+                # a busy/disconnect tone rather than ringing indefinitely.
+                await asyncio.sleep(0.5)
+                await channel.hangup()
+            except Exception:
+                pass
+            return
 
         rtp_port = await self._alloc_rtp_port()
 
@@ -393,6 +461,9 @@ class AzureVoiceLiveCallSession:
         self._ratecv_state_up   = None   # 8→16 kHz converter state
         self._ratecv_state_down = None   # 16→8 kHz converter state
 
+        # Logged once when first TTS audio is received from Azure
+        self._first_audio_received = False
+
     # ── main run ──────────────────────────────────────────────────────────────
 
     async def run(self):
@@ -489,6 +560,23 @@ class AzureVoiceLiveCallSession:
         nested inside audio.input / audio.output blocks (which is the old OpenAI
         Realtime Beta shape).
         """
+        # Extract the hostname from the WS URL for pre-flight DNS check.
+        # e.g. "wss://myresource.services.ai.azure.com/..." → "myresource.services.ai.azure.com"
+        try:
+            from urllib.parse import urlparse
+            _parsed_host = urlparse(self.azure_ws_url).hostname or ""
+        except Exception:
+            _parsed_host = ""
+
+        if _parsed_host and not _resolve_hostname(_parsed_host):
+            raise ConnectionError(
+                f"Cannot resolve Azure Voice Live hostname '{_parsed_host}'. "
+                "Check AZURE_VOICE_LIVE_RESOURCE (currently "
+                f"'{_parsed_host.split('.')[0]}') and outbound DNS/firewall. "
+                "If this is a CognitiveServices resource, set "
+                "AZURE_VOICE_LIVE_HOST_SUFFIX=cognitiveservices.azure.com in .env"
+            )
+
         headers = {
             "api-key": self.azure_api_key,
         }
@@ -666,13 +754,22 @@ class AzureVoiceLiveCallSession:
 
                 # ── TTS audio from Azure ───────────────────────────────────
                 if etype == "response.audio.delta":
-                    # PCM16 at AZURE_SAMPLE_RATE (16kHz)
-                    pcm16 = base64.b64decode(event["delta"])
+                    delta_b64 = event.get("delta", "")
+                    if not delta_b64:
+                        continue
+                    pcm_out = base64.b64decode(delta_b64)
 
-                    # Downsample 16kHz → 8kHz (stateful)
+                    # Azure Voice Live TTS output is PCM16 at 24 kHz regardless
+                    # of the input_audio_sampling_rate we requested.
+                    # Downsample 24 kHz → 8 kHz for Asterisk μ-law.
+                    # (If Azure ever returns 16 kHz the ratecv still works fine;
+                    #  the only effect is a slight pitch shift.  To be safe we
+                    #  always convert from 24 kHz since that is the documented
+                    #  default output rate for gpt-realtime.)
+                    AZURE_OUTPUT_RATE = 24000
                     pcm8, self._ratecv_state_down = audioop.ratecv(
-                        pcm16, 2, 1,
-                        AZURE_SAMPLE_RATE, ASTERISK_SAMPLE_RATE,
+                        pcm_out, 2, 1,
+                        AZURE_OUTPUT_RATE, ASTERISK_SAMPLE_RATE,
                         self._ratecv_state_down
                     )
 
@@ -731,35 +828,79 @@ class AzureVoiceLiveCallSession:
 
     # ── RTP send (queue → Asterisk) ───────────────────────────────────────────
 
+    # Asterisk expects exactly 160 μ-law samples (= 20 ms @ 8 kHz) per RTP
+    # packet.  Azure Voice Live returns audio in large, variable-size bursts
+    # (often 100–500 ms at once).  Sending those bursts as a single oversized
+    # RTP packet causes Asterisk's jitter-buffer to discard or distort the
+    # audio — the caller hears breaking / robot voice / silence.
+    #
+    # Fix: accumulate raw μ-law bytes in a local buffer and drain it in
+    # exactly ULAW_PACKET_BYTES-sized chunks, pacing one packet every
+    # PACKET_INTERVAL_S seconds so Asterisk's playout clock stays smooth.
+    ULAW_PACKET_BYTES  = 160          # 20 ms @ 8 kHz, 1 byte/sample
+    PACKET_INTERVAL_S  = 0.020        # 20 ms between packets
+
     async def _send_rtp_loop(self):
-        """Pull μ-law chunks from queue and send back to Asterisk via RTP."""
-        loop = asyncio.get_running_loop()
+        """
+        Pull μ-law audio from the queue, re-packetise into strict 160-byte
+        (20 ms) RTP frames, and pace them at 20 ms intervals to Asterisk.
+        """
+        loop       = asyncio.get_running_loop()
+        buf        = bytearray()          # accumulation buffer
+        next_send  = loop.time()          # absolute send deadline
+
         while not self.caller_hung_up and not self._closed:
+            # ── drain the queue into our buffer (non-blocking after first) ──
             try:
-                ulaw_chunk = await asyncio.wait_for(
+                chunk = await asyncio.wait_for(
                     self._audio_to_asterisk.get(), timeout=0.5
                 )
-                if not self._asterisk_rtp_addr or not self._udp_sock:
-                    continue
-
-                n_samples = len(ulaw_chunk)
-                rtp_pkt   = self._build_rtp_packet(ulaw_chunk)
-                self._rtp_ts  += n_samples
-                self._rtp_seq  = (self._rtp_seq + 1) & 0xFFFF
-
-                await loop.run_in_executor(
-                    None,
-                    self._udp_sock.sendto,
-                    rtp_pkt,
-                    self._asterisk_rtp_addr,
-                )
-
+                buf.extend(chunk)
             except asyncio.TimeoutError:
+                # Nothing arrived — if we have a partial buffer keep waiting,
+                # but don't spin; just loop back.
                 continue
             except Exception as e:
                 if not self._closed:
-                    logger.debug(f"RTP send error: {e}")
+                    logger.debug(f"RTP send queue error: {e}")
                 break
+
+            # Drain any additional chunks already queued (burst draining)
+            while True:
+                try:
+                    buf.extend(self._audio_to_asterisk.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+            # ── emit as many complete 160-byte packets as we can ────────────
+            while len(buf) >= self.ULAW_PACKET_BYTES:
+                if not self._asterisk_rtp_addr or not self._udp_sock:
+                    break
+
+                payload  = bytes(buf[:self.ULAW_PACKET_BYTES])
+                del buf[:self.ULAW_PACKET_BYTES]
+
+                rtp_pkt          = self._build_rtp_packet(payload)
+                self._rtp_ts    += self.ULAW_PACKET_BYTES   # 1 sample = 1 byte for μ-law
+                self._rtp_seq    = (self._rtp_seq + 1) & 0xFFFF
+
+                # Pace: sleep until the next scheduled send time
+                now = loop.time()
+                if next_send > now:
+                    await asyncio.sleep(next_send - now)
+                next_send = max(loop.time(), next_send) + self.PACKET_INTERVAL_S
+
+                try:
+                    await loop.run_in_executor(
+                        None,
+                        self._udp_sock.sendto,
+                        rtp_pkt,
+                        self._asterisk_rtp_addr,
+                    )
+                except Exception as e:
+                    if not self._closed:
+                        logger.debug(f"RTP sendto error: {e}")
+                    return
 
     def _build_rtp_packet(self, payload: bytes) -> bytes:
         """Minimal RTP/AVP header (RFC 3550) + μ-law payload (PT=0)."""
