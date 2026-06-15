@@ -12,7 +12,6 @@ import json
 import time
 
 from models import db, Call, CallTranscript, CallIntent, Department, RoutingRule, KnowledgeBase
-from app import get_ari_agent
 
 admin_bp = Blueprint('admin', __name__, url_prefix='/admin')
 
@@ -101,11 +100,8 @@ def system_status():
         'services': {}
     }
 
-    # Resolve agent via the module-level getter (works whether app was started
-    # via __main__ or a WSGI server / app factory).
-    ari_agent = get_ari_agent()
-
     # Check ARI Agent
+    ari_agent = getattr(current_app, 'ari_agent', None)
     if ari_agent and ari_agent.running:
         status['services']['ari'] = {
             'name': 'ARI Agent',
@@ -127,33 +123,30 @@ def system_status():
             'color': 'danger'
         }
 
-    # Check AI Service — agent now uses Azure Voice Live (no separate ai_client).
-    # Use _config_ok which is True when both AZURE_VOICE_LIVE_RESOURCE and
-    # AZURE_SPEECH_KEY are set, and is_connected when the ARI WebSocket is up.
+    # Check AI Service — now Azure Voice Live, no separate ai_client
     if ari_agent and ari_agent._config_ok:
         resource = ari_agent.azure_resource
         status['services']['ai'] = {
-            'name': 'AI Assistant (Azure Voice Live)',
+            'name': 'AI Assistant',
             'status': 'connected' if ari_agent.is_connected else 'configured',
             'details': {
                 'provider': 'Azure Voice Live',
                 'model': 'gpt-realtime',
                 'resource': resource[:50] + '...' if len(resource) > 50 else resource,
-                'voice': ari_agent.azure_voice_name,
             },
             'icon': 'fa-brain',
             'color': 'success' if ari_agent.is_connected else 'warning'
         }
     else:
         status['services']['ai'] = {
-            'name': 'AI Assistant (Azure Voice Live)',
+            'name': 'AI Assistant',
             'status': 'not_configured',
             'details': {'message': 'Check AZURE_VOICE_LIVE_RESOURCE and AZURE_SPEECH_KEY in .env'},
             'icon': 'fa-brain',
             'color': 'danger'
         }
 
-    # Check Speech Service — handled by Azure Voice Live (same credential).
+    # Check Speech Service — built into Azure Voice Live, same credential
     if ari_agent and ari_agent.azure_api_key:
         status['services']['speech'] = {
             'name': 'Speech Services',
