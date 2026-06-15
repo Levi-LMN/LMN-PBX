@@ -161,10 +161,16 @@ class ARIAgent:
 
     def _default_prompt(self):
         return (
-            "You are a professional phone assistant for Jubilee Insurance. "
-            "RULES: respond in 20 words or fewer — this is a phone call, be brief. "
-            "Never say you are an AI. Be empathetic and professional. "
-            "When the caller wants a human agent, say you will transfer them now."
+            "You are a phone assistant for Jubilee Insurance. "
+            "CRITICAL RULES you must follow on every single response: "
+            "(1) MAXIMUM 1-2 SHORT SENTENCES — never more, non-negotiable. "
+            "(2) NEVER list things. If asked about products, name one category and ask which interests them. "
+            "(3) NEVER open with Certainly, Of course, Great question, or similar filler. "
+            "(4) Be direct and conversational, like a human on a phone call. "
+            "(5) Never say you are an AI. "
+            "(6) If the caller wants a human, say you will transfer them now. "
+            "GOOD example: We cover life, health, motor and home — which interests you? "
+            "BAD example: Certainly! I would be happy to provide an overview of our wide range..."
         )
 
     async def _alloc_rtp_port(self) -> int:
@@ -639,11 +645,11 @@ class AzureVoiceLiveCallSession:
                 # for real phone calls. Works with all models (not just gpt-realtime).
                 "turn_detection": {
                     "type":                "azure_semantic_vad",
-                    "threshold":           0.5,
-                    "silence_duration_ms": 500,
-                    "prefix_padding_ms":   300,
+                    "threshold":           0.4,    # lower = more sensitive to barge-in
+                    "silence_duration_ms": 300,    # faster response after caller stops
+                    "prefix_padding_ms":   200,
                     "remove_filler_words": True,   # ignore "umm", "uh", etc.
-                    "interrupt_response":  True,    # allow caller to barge in
+                    "interrupt_response":  True,   # allow caller to barge in mid-response
                     "create_response":     True,
                 },
             },
@@ -828,9 +834,8 @@ class AzureVoiceLiveCallSession:
                             "type": "response.create",
                             "response": {
                                 "instructions": (
-                                    "Greet the caller warmly and briefly. "
-                                    "Say something like: 'Thank you for calling Jubilee Insurance. "
-                                    "How can I help you today?' — keep it to one short sentence."
+                                    "Say ONLY: 'Thank you for calling Jubilee Insurance, how can I help?' "
+                                    "Nothing else. One sentence maximum."
                                 ),
                             },
                         }))
