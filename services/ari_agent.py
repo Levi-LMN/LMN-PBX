@@ -608,7 +608,9 @@ class AzureVoiceLiveCallSession:
         await self._azure_ws.send(json.dumps({
             "type": "session.update",
             "session": {
-                "instructions": self.system_prompt,
+                "instructions": self.system_prompt + "
+
+CRITICAL: You MUST respond in English only, regardless of any ambiguity in the caller's speech. Never switch to any other language.",
                 "modalities":   ["text", "audio"],
 
                 # ── Voice (Azure TTS) ──────────────────────────────────────
@@ -634,9 +636,11 @@ class AzureVoiceLiveCallSession:
                 },
 
                 # ── Transcription (for DB logging & escalation detection) ──
+                # en-KE = English as spoken in Kenya; improves recognition of
+                # East African accents significantly over plain "en".
                 "input_audio_transcription": {
                     "model": "azure-speech",
-                    "language": "en",
+                    "language": "en-KE",
                 },
 
                 # ── Turn detection ─────────────────────────────────────────
