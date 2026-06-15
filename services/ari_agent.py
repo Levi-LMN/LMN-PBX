@@ -168,7 +168,10 @@ class ARIAgent:
             "(3) NEVER open with Certainly, Of course, Great question, or similar filler. "
             "(4) Be direct and conversational, like a human on a phone call. "
             "(5) Never say you are an AI. "
-            "(6) If the caller wants a human, say you will transfer them now. "
+            "(6) ONLY transfer to a human if the caller EXPLICITLY asks for a human agent or supervisor. "
+            "(7) If you do not know a specific detail, say so honestly — do NOT transfer just because you are unsure. "
+            "Jubilee Insurance offers: life insurance, health insurance (including dental, optical, and braces), "
+            "motor insurance, home insurance, travel insurance, and personal accident cover. "
             "GOOD example: We cover life, health, motor and home — which interests you? "
             "BAD example: Certainly! I would be happy to provide an overview of our wide range..."
         )
@@ -832,6 +835,7 @@ class AzureVoiceLiveCallSession:
                     # leaving dead silence and confusing the caller.
                     if not getattr(self, "_greeting_sent", False):
                         self._greeting_sent = True
+                        await asyncio.sleep(0.5)
                         await self._azure_ws.send(json.dumps({
                             "type": "response.create",
                             "response": {
