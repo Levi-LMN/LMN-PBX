@@ -262,14 +262,30 @@ class ARIAgent:
         asyncio.create_task(self._process_call(event))
 
     def _handle_stasis_end(self, event):
-        channel_id = event.get("channel", {}).get("id")
+        channel_id   = event.get("channel", {}).get("id", "")
+        channel_name = event.get("channel", {}).get("name", "")
+        # Ignore ExternalMedia channels — their StasisEnd fires when we tear them
+        # down intentionally and does NOT mean the caller hung up.
+        if channel_name.startswith("UnicastRTP/"):
+            return
         if channel_id in self.active_calls:
-            self.active_calls[channel_id].caller_hung_up = True
+            logger.info(f"📴 [{channel_id[:12]}] StasisEnd — caller hung up")
+            sess = self.active_calls[channel_id]
+            sess.caller_hung_up = True
+            sess._closed = True
+        else:
+            logger.debug(f"StasisEnd for unknown channel {channel_id[:12]} (name={channel_name})")
 
     def _handle_hangup_request(self, event):
-        channel_id = event.get("channel", {}).get("id")
+        channel_id   = event.get("channel", {}).get("id", "")
+        channel_name = event.get("channel", {}).get("name", "")
+        if channel_name.startswith("UnicastRTP/"):
+            return
         if channel_id in self.active_calls:
-            self.active_calls[channel_id].caller_hung_up = True
+            logger.info(f"📴 [{channel_id[:12]}] HangupRequest — caller hanging up")
+            sess = self.active_calls[channel_id]
+            sess.caller_hung_up = True
+            sess._closed = True
 
     async def _process_call(self, event):
         channel_id = event.get("channel", {}).get("id")
@@ -496,7 +512,8 @@ class AzureVoiceLiveCallSession:
 
             self._udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._udp_sock.bind((RTP_LISTEN_HOST, self.rtp_port))
-            self._udp_sock.setblocking(False)
+            # NOTE: do NOT call setblocking(False) here — _recv_rtp_loop sets
+            # its own timeout (0.05 s) so the executor thread yields regularly.
             logger.info(f"🔌 [{self.channel_id[:12]}] UDP RTP listening on port {self.rtp_port}")
 
             ext_channel = await self.ari_client.channels.externalMedia(
@@ -619,38 +636,59 @@ class AzureVoiceLiveCallSession:
     # ── RTP receive (Asterisk → queue) ────────────────────────────────────────
 
     async def _recv_rtp_loop(self):
+        """
+        Receive μ-law RTP from Asterisk, upsample 8 kHz → 24 kHz, push to Azure queue.
+
+        Uses a blocking socket with a short timeout so that:
+          - We yield to the event loop regularly (no busy-wait)
+          - We exit promptly when caller_hung_up / _closed is set
+          - We don't block the executor thread indefinitely
+        """
         loop = asyncio.get_running_loop()
+        # Switch to blocking with a short timeout so run_in_executor returns
+        # promptly and we can check the shutdown flags every ~50 ms.
+        self._udp_sock.setblocking(True)
+        self._udp_sock.settimeout(0.05)
+
         while not self.caller_hung_up and not self._closed:
             try:
                 data, addr = await loop.run_in_executor(
                     None, self._udp_sock.recvfrom, 4096
                 )
-                if not self._asterisk_rtp_addr:
-                    self._asterisk_rtp_addr = addr
-                    logger.info(
-                        f"📻 [{self.channel_id[:12]}] "
-                        f"Asterisk RTP source: {addr[0]}:{addr[1]}"
-                    )
-
-                if len(data) <= RTP_HEADER_SIZE:
-                    continue
-
-                ulaw_payload = data[RTP_HEADER_SIZE:]
-                pcm8 = audioop.ulaw2lin(ulaw_payload, 2)
-                # Upsample 8 kHz → 24 kHz to match AZURE_SAMPLE_RATE
-                pcm16, self._ratecv_state_up = audioop.ratecv(
-                    pcm8, 2, 1,
-                    ASTERISK_SAMPLE_RATE, AZURE_SAMPLE_RATE,
-                    self._ratecv_state_up
-                )
-                await self._audio_to_azure.put(pcm16)
-
-            except BlockingIOError:
-                await asyncio.sleep(0.005)
+            except OSError:
+                # Timeout or socket closed — just loop and check flags
+                continue
             except Exception as e:
                 if not self._closed:
                     logger.debug(f"RTP recv error: {e}")
                 break
+
+            if not self._asterisk_rtp_addr:
+                self._asterisk_rtp_addr = addr
+                logger.info(
+                    f"📻 [{self.channel_id[:12]}] "
+                    f"Asterisk RTP source: {addr[0]}:{addr[1]}"
+                )
+
+            if len(data) <= RTP_HEADER_SIZE:
+                continue
+
+            ulaw_payload = data[RTP_HEADER_SIZE:]
+            try:
+                pcm8 = audioop.ulaw2lin(ulaw_payload, 2)
+                # Upsample 8 kHz → 24 kHz to match Azure's expected sample rate
+                pcm24, self._ratecv_state_up = audioop.ratecv(
+                    pcm8, 2, 1,
+                    ASTERISK_SAMPLE_RATE, AZURE_SAMPLE_RATE,
+                    self._ratecv_state_up
+                )
+            except audioop.error as e:
+                logger.debug(f"Audio conversion error: {e}")
+                continue
+
+            if not self._audio_to_azure.full():
+                self._audio_to_azure.put_nowait(pcm24)
+            # If the queue is full, drop the packet rather than blocking
 
     # ── Azure send (queue → WS) ───────────────────────────────────────────────
 
@@ -681,7 +719,7 @@ class AzureVoiceLiveCallSession:
                     await asyncio.sleep(0.1)
                     continue
 
-                raw   = await asyncio.wait_for(self._azure_ws.recv(), timeout=1.0)
+                raw   = await asyncio.wait_for(self._azure_ws.recv(), timeout=0.5)
                 event = json.loads(raw)
                 etype = event.get("type", "")
 
@@ -761,6 +799,21 @@ class AzureVoiceLiveCallSession:
                     logger.error(
                         f"❌ Azure Voice Live error: {event.get('error', event)}"
                     )
+
+                elif etype == "input_audio_buffer.speech_started":
+                    logger.info(f"🎤 [{self.channel_id[:12]}] VAD: speech started")
+
+                elif etype == "input_audio_buffer.speech_stopped":
+                    logger.info(f"🔇 [{self.channel_id[:12]}] VAD: speech stopped")
+
+                elif etype == "input_audio_buffer.committed":
+                    logger.debug(f"📦 [{self.channel_id[:12]}] Audio buffer committed to model")
+
+                elif etype not in ("response.audio.delta", "response.content_part.added",
+                                   "response.content_part.done", "response.output_item.added",
+                                   "response.output_item.done", "response.created"):
+                    # Log any unexpected event types so we can see what Azure sends
+                    logger.debug(f"Azure event: {etype}")
 
             except asyncio.TimeoutError:
                 continue
