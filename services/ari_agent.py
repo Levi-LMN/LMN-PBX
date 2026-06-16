@@ -13,6 +13,12 @@ Audio path (inbound):
 Audio path (outbound):
   Azure PCM16 24kHz  →  ratecv 24→8kHz  →  lin2ulaw  →  RTP → Asterisk
 
+Greeting cache:
+  First call: Azure generates greeting → raw μ-law frames saved to
+              ASTERISK_SOUNDS_DIR/ari_greeting.ulaw (8kHz, mono)
+  Subsequent calls: Asterisk plays the file via ARI channel.play() while
+                    Azure WS connects in the background → zero-latency greeting.
+
 Escalation:
   Caller says transfer keyword  OR  AI announces transfer
   → remove ExternalMedia from bridge → continueInDialplan → FreePBX dept ext
@@ -27,6 +33,7 @@ import logging
 import os
 import socket
 import struct
+import wave
 import websockets
 from aiohttp.web_exceptions import HTTPUnprocessableEntity
 from datetime import datetime
@@ -41,18 +48,20 @@ AZURE_API_VERSION   = "2025-10-01"
 AZURE_MODEL         = "gpt-realtime"
 AZURE_HOST_SUFFIX   = os.getenv("AZURE_VOICE_LIVE_HOST_SUFFIX", "services.ai.azure.com")
 
-# Asterisk sends μ-law 8kHz; we tell Azure input is PCM16 8kHz (no upsample needed)
 ASTERISK_RATE  = 8000
-AZURE_IN_RATE  = 8000   # what we declare to Azure for input
-AZURE_OUT_RATE = 24000  # Azure always outputs 24kHz PCM16
+AZURE_IN_RATE  = 8000
+AZURE_OUT_RATE = 24000
 
-RTP_HEADER_SIZE   = 12
-ULAW_FRAME_BYTES  = 160   # 20 ms @ 8kHz
-FRAME_DURATION    = 0.020  # seconds
+RTP_HEADER_SIZE  = 12
+ULAW_FRAME_BYTES = 160    # 20 ms @ 8kHz
+FRAME_DURATION   = 0.020  # seconds
 
 RTP_HOST  = "0.0.0.0"
 RTP_START = 20000
 RTP_END   = 20100
+
+GREETING_TEXT = "Thank you for calling Jubilee Insurance, how can I help?"
+GREETING_INSTRUCTIONS = f"Say ONLY: '{GREETING_TEXT}' — nothing else."
 
 
 def _azure_ws_url(resource: str) -> str:
@@ -65,7 +74,6 @@ def _azure_ws_url(resource: str) -> str:
 
 
 def _ws_connect_kwargs(api_key: str) -> dict:
-    """Return the right header kwarg for the installed websockets version."""
     try:
         params = inspect.signature(websockets.connect).parameters
     except (TypeError, ValueError):
@@ -91,8 +99,8 @@ class ARIAgent:
     """Top-level service: connects to ARI, spawns one session per inbound call."""
 
     def __init__(self, app_config, flask_app=None):
-        self.flask_app  = flask_app
-        self.running    = False
+        self.flask_app   = flask_app
+        self.running     = False
         self.total_calls = 0
         self.active_calls: dict[str, "CallSession"] = {}
 
@@ -107,6 +115,11 @@ class ARIAgent:
         self.azure_voice_name = app_config.get("AZURE_VOICE_NAME", "en-KE-AsiliaNeural")
         self.azure_voice_type = app_config.get("AZURE_VOICE_TYPE", "azure-standard")
         self.system_prompt    = app_config.get("DEFAULT_SYSTEM_PROMPT") or self._default_prompt()
+
+        self.sounds_dir = app_config.get("ASTERISK_SOUNDS_DIR",
+                                         "/var/lib/asterisk/sounds/custom")
+        self._greeting_cache_path = os.path.join(self.sounds_dir, "ari_greeting.ulaw")
+        self._greeting_cached     = os.path.isfile(self._greeting_cache_path)
 
         self._port_lock     = asyncio.Lock()
         self._next_rtp_port = RTP_START
@@ -129,15 +142,16 @@ class ARIAgent:
 
     def get_status(self) -> dict:
         return {
-            "connected":      self.is_connected,
-            "running":        self.running,
-            "config_ok":      self._config_ok,
-            "active_calls":   self.active_call_count,
-            "total_calls":    self.total_calls,
-            "azure_resource": self.azure_resource or "not set",
-            "voice_name":     self.azure_voice_name,
-            "voice_type":     self.azure_voice_type,
-            "model":          AZURE_MODEL,
+            "connected":       self.is_connected,
+            "running":         self.running,
+            "config_ok":       self._config_ok,
+            "active_calls":    self.active_call_count,
+            "total_calls":     self.total_calls,
+            "azure_resource":  self.azure_resource or "not set",
+            "voice_name":      self.azure_voice_name,
+            "voice_type":      self.azure_voice_type,
+            "model":           AZURE_MODEL,
+            "greeting_cached": self._greeting_cached,
         }
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -148,6 +162,7 @@ class ARIAgent:
         logger.info(f"   Resource : {self.azure_resource}")
         logger.info(f"   Voice    : {self.azure_voice_name} ({self.azure_voice_type})")
         logger.info(f"   Model    : {AZURE_MODEL}")
+        logger.info(f"   Greeting : {'cached ✅' if self._greeting_cached else 'will generate on first call'}")
         logger.info("=" * 60)
 
         if not self.azure_resource or not self.azure_api_key:
@@ -240,17 +255,20 @@ class ARIAgent:
         prompt   = self.system_prompt + self._load_kb() + self._load_caller_context(caller)
 
         sess = CallSession(
-            channel        = channel,
-            ari_client     = self.ari_client,
-            ari_app        = self.ari_app,
-            azure_ws_url   = _azure_ws_url(self.azure_resource),
-            azure_api_key  = self.azure_api_key,
-            voice_name     = self.azure_voice_name,
-            voice_type     = self.azure_voice_type,
-            system_prompt  = prompt,
-            rtp_port       = rtp_port,
-            flask_app      = self.flask_app,
-            caller_number  = caller,
+            channel              = channel,
+            ari_client           = self.ari_client,
+            ari_app              = self.ari_app,
+            azure_ws_url         = _azure_ws_url(self.azure_resource),
+            azure_api_key        = self.azure_api_key,
+            voice_name           = self.azure_voice_name,
+            voice_type           = self.azure_voice_type,
+            system_prompt        = prompt,
+            rtp_port             = rtp_port,
+            flask_app            = self.flask_app,
+            caller_number        = caller,
+            greeting_cached      = self._greeting_cached,
+            greeting_cache_path  = self._greeting_cache_path,
+            on_greeting_cached   = self._mark_greeting_cached,
         )
 
         self.active_calls[cid] = sess
@@ -266,6 +284,11 @@ class ARIAgent:
             self.active_calls.pop(cid, None)
             await sess.close()
             self._db_call_end(sess)
+
+    def _mark_greeting_cached(self):
+        """Called by CallSession after it writes the greeting file."""
+        self._greeting_cached = True
+        logger.info(f"✅ Greeting cached → {self._greeting_cache_path}")
 
     async def _alloc_rtp_port(self) -> int:
         async with self._port_lock:
@@ -302,14 +325,9 @@ class ARIAgent:
             logger.error(f"KB load error: {e}")
             return ""
 
-    # ── Caller context (customer / claims / tickets lookup) ──────────────────
+    # ── Caller context ────────────────────────────────────────────────────────
 
     def _load_caller_context(self, caller_number: str) -> str:
-        """
-        Look up the caller by phone number and build a short context block
-        the AI can reference — existing policies, open claims, open tickets.
-        Returns "" if no flask_app, no match, or unknown caller ID.
-        """
         if not self.flask_app or not caller_number or caller_number == "Unknown":
             return ""
         try:
@@ -457,7 +475,9 @@ class CallSession:
 
     def __init__(self, *, channel, ari_client, ari_app, azure_ws_url,
                  azure_api_key, voice_name, voice_type, system_prompt,
-                 rtp_port, flask_app, caller_number=None):
+                 rtp_port, flask_app, caller_number=None,
+                 greeting_cached=False, greeting_cache_path=None,
+                 on_greeting_cached=None):
         self.channel        = channel
         self.channel_id     = channel.id
         self.ari_client     = ari_client
@@ -470,7 +490,14 @@ class CallSession:
         self.rtp_port       = rtp_port
         self.flask_app      = flask_app
         self.caller_number  = caller_number
-        self._customer_id   = None  # resolved lazily on first ticket creation
+        self._customer_id   = None
+
+        # Greeting cache
+        self._greeting_cached      = greeting_cached
+        self._greeting_cache_path  = greeting_cache_path
+        self._on_greeting_cached   = on_greeting_cached  # callback → ARIAgent
+        self._greeting_ulaw_buf    = bytearray()         # accumulates during first call
+        self._greeting_done        = False               # Azure finished greeting audio
 
         self.caller_hung_up     = False
         self.escalated          = False
@@ -498,7 +525,7 @@ class CallSession:
         try:
             await self.channel.answer()
             logger.info(f"✅ [{self.channel_id[:12]}] Answered")
-            await asyncio.sleep(0.1)  # reduced: just enough for channel to settle
+            await asyncio.sleep(0.1)
 
             # Create bridge
             bridge = await self.ari_client.bridges.create(type="mixing")
@@ -506,7 +533,7 @@ class CallSession:
             await bridge.addChannel(channel=self.channel_id)
             logger.info(f"🌉 [{self.channel_id[:12]}] Bridge: {self._bridge_id}")
 
-            # Bind UDP socket for RTP (blocking with timeout for clean shutdown)
+            # Bind UDP socket for RTP
             self._udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._udp_sock.bind((RTP_HOST, self.rtp_port))
             self._udp_sock.settimeout(0.05)
@@ -525,7 +552,7 @@ class CallSession:
             self._ext_channel_id = ext.id
             logger.info(f"📡 [{self.channel_id[:12]}] ExternalMedia: {self._ext_channel_id}")
 
-            # Add ExternalMedia to bridge (with retry — channel may not be ready yet)
+            # Add ExternalMedia to bridge (with retry)
             for attempt in range(1, 6):
                 try:
                     await bridge.addChannel(channel=self._ext_channel_id)
@@ -536,6 +563,10 @@ class CallSession:
                     if attempt == 5:
                         raise
                     await asyncio.sleep(0.2)
+
+            # If greeting is already cached, play it via ARI while Azure connects
+            if self._greeting_cached:
+                await self._play_cached_greeting()
 
             # Connect to Azure Voice Live
             await self._connect_azure()
@@ -556,19 +587,56 @@ class CallSession:
         finally:
             await self.close()
 
+    # ── Greeting cache ────────────────────────────────────────────────────────
+
+    async def _play_cached_greeting(self):
+        """
+        Play the pre-recorded greeting via Asterisk ARI while Azure WS connects.
+        Uses 'sound:custom/ari_greeting' — Asterisk resolves to the .ulaw file.
+        """
+        try:
+            # Strip extension; Asterisk appends it based on codec negotiation
+            sound_name = "custom/ari_greeting"
+            await self.channel.play(media=f"sound:{sound_name}")
+            logger.info(f"🔊 [{self.channel_id[:12]}] Playing cached greeting: {sound_name}")
+        except Exception as e:
+            logger.warning(f"⚠️  [{self.channel_id[:12]}] Could not play cached greeting: {e}")
+
+    def _save_greeting_cache(self):
+        """
+        Write the accumulated greeting μ-law bytes to disk so future calls
+        can use channel.play() instead of waiting for Azure TTS.
+        The file is raw μ-law 8kHz mono — Asterisk reads it natively.
+        """
+        if not self._greeting_cache_path or not self._greeting_ulaw_buf:
+            return
+        try:
+            os.makedirs(os.path.dirname(self._greeting_cache_path), exist_ok=True)
+            with open(self._greeting_cache_path, "wb") as f:
+                f.write(self._greeting_ulaw_buf)
+            logger.info(
+                f"💾 Greeting saved → {self._greeting_cache_path} "
+                f"({len(self._greeting_ulaw_buf)} bytes, "
+                f"~{len(self._greeting_ulaw_buf) / 8000:.1f}s)"
+            )
+            if self._on_greeting_cached:
+                self._on_greeting_cached()
+        except Exception as e:
+            logger.error(f"Failed to save greeting cache: {e}")
+
     # ── Azure connection & session config ─────────────────────────────────────
 
     async def _connect_azure(self):
         self._azure_ws = await websockets.connect(
             self.azure_ws_url,
             ping_interval = 20,
-            ping_timeout  = 30,
+            ping_timeout  = 60,   # FIX: was 30s — extend to survive longer silences
+            close_timeout = 5,
             **_ws_connect_kwargs(self.azure_api_key),
         )
         logger.info(f"🔗 [{self.channel_id[:12]}] Azure WS connected")
         logger.info(f"   {self.azure_ws_url}")
 
-        # Send session config — one message, only documented fields
         await self._azure_ws.send(json.dumps({
             "type": "session.update",
             "session": {
@@ -578,29 +646,19 @@ class CallSession:
                     "name": self.voice_name,
                     "type": self.voice_type,
                 },
-                # ── Audio formats ────────────────────────────────────────────
-                # Asterisk sends μ-law 8kHz. We decode to PCM16 and tell Azure
-                # it's 8kHz — no resampling needed on the inbound path.
-                # Azure always outputs PCM16 @ 24kHz; we resample on output.
                 "input_audio_format":        "pcm16",
                 "output_audio_format":       "pcm16",
-                "input_audio_sampling_rate": AZURE_IN_RATE,   # 8000
-                # ── Noise & echo ─────────────────────────────────────────────
+                "input_audio_sampling_rate": AZURE_IN_RATE,
                 "input_audio_noise_reduction": {
                     "type": "azure_deep_noise_suppression"
                 },
                 "input_audio_echo_cancellation": {
                     "type": "server_echo_cancellation"
                 },
-                # ── STT ──────────────────────────────────────────────────────
-                # en-KE: best accuracy for Kenyan English accents.
-                # Do NOT leave blank — blank triggers multilingual mode which
-                # causes the model to mirror the detected language.
                 "input_audio_transcription": {
                     "model":    "azure-speech",
                     "language": "en-KE",
                 },
-                # ── VAD ──────────────────────────────────────────────────────
                 "turn_detection": {
                     "type":                "azure_semantic_vad",
                     "threshold":           0.5,
@@ -621,21 +679,18 @@ class CallSession:
                             "NOT explicitly ask to be transferred to a person right now — "
                             "e.g. a callback request, a billing dispute, a complaint, or "
                             "asking someone to look into a delayed claim. Confirm back to "
-                            "the caller in one short sentence that you've logged it, "
-                            "including you'll mention it's noted, after calling this."
+                            "the caller in one short sentence that you've logged it."
                         ),
                         "parameters": {
                             "type": "object",
                             "properties": {
                                 "subject": {
                                     "type": "string",
-                                    "description": "Short one-line summary of the issue, "
-                                                    "e.g. 'Requesting callback about delayed motor claim'.",
+                                    "description": "Short one-line summary of the issue.",
                                 },
                                 "description": {
                                     "type": "string",
-                                    "description": "Fuller detail from the conversation: what "
-                                                    "the caller said, any reference numbers mentioned.",
+                                    "description": "Fuller detail from the conversation.",
                                 },
                                 "category": {
                                     "type": "string",
@@ -669,7 +724,6 @@ class CallSession:
                     None, self._udp_sock.recvfrom, 4096
                 )
             except OSError:
-                # Socket timeout (every 50ms) or closed — check flags and loop
                 continue
             except Exception as e:
                 if not self._closed:
@@ -683,7 +737,6 @@ class CallSession:
             if len(data) <= RTP_HEADER_SIZE:
                 continue
 
-            # μ-law → PCM16 (no resampling — 8kHz in, 8kHz declared to Azure)
             try:
                 pcm16 = audioop.ulaw2lin(data[RTP_HEADER_SIZE:], 2)
             except audioop.error:
@@ -720,20 +773,26 @@ class CallSession:
     async def _azure_recv_loop(self):
         while not self._closed:
             if not _ws_open(self._azure_ws):
-                await asyncio.sleep(0.05)
-                continue
+                # FIX: WS closed unexpectedly — end session cleanly instead of busy-looping
+                if not self._closed:
+                    logger.warning(f"⚠️  [{self.channel_id[:12]}] Azure WS lost — ending session")
+                    self._closed = True
+                break
             try:
-                raw   = await asyncio.wait_for(self._azure_ws.recv(), timeout=0.5)
+                raw   = await asyncio.wait_for(self._azure_ws.recv(), timeout=1.0)
                 event = json.loads(raw)
             except asyncio.TimeoutError:
+                # Normal during silence — keep looping
                 continue
-            except websockets.exceptions.ConnectionClosed:
+            except websockets.exceptions.ConnectionClosed as e:
                 if not self._closed:
-                    logger.warning(f"⚠️  [{self.channel_id[:12]}] Azure WS closed")
+                    logger.warning(f"⚠️  [{self.channel_id[:12]}] Azure WS closed ({e.code}): {e.reason}")
+                    self._closed = True
                 break
             except Exception as e:
                 if not self._closed:
                     logger.debug(f"Azure recv: {e}")
+                    self._closed = True
                 break
 
             await self._handle_azure_event(event)
@@ -742,7 +801,6 @@ class CallSession:
         etype = event.get("type", "")
 
         if etype == "response.audio.delta":
-            # Azure outputs PCM16 @ 24kHz → downsample to 8kHz → μ-law → Asterisk
             b64 = event.get("delta", "")
             if not b64:
                 return
@@ -751,28 +809,31 @@ class CallSession:
                 pcm24, 2, 1, AZURE_OUT_RATE, ASTERISK_RATE, self._ratecv_down
             )
             ulaw = audioop.lin2ulaw(pcm8, 2)
+
+            # Queue to Asterisk
             if not self._to_asterisk.full():
                 self._to_asterisk.put_nowait(ulaw)
+
+            # On first call: accumulate greeting audio for caching
+            if not self._greeting_cached and self._greeting_sent and not self._greeting_done:
+                self._greeting_ulaw_buf.extend(ulaw)
 
         elif etype == "session.created":
             logger.info(f"✅ [{self.channel_id[:12]}] Azure session: {event.get('session', {}).get('id', '')}")
 
         elif etype == "session.updated":
-            # Trigger greeting immediately — no extra sleep.
-            # session.updated confirms Azure accepted the config, so it's ready.
             logger.info(f"⚙️  [{self.channel_id[:12]}] Session updated")
             if not self._greeting_sent:
                 self._greeting_sent = True
-                await self._azure_ws.send(json.dumps({
-                    "type": "response.create",
-                    "response": {
-                        "instructions": (
-                            "Say ONLY: 'Thank you for calling Jubilee Insurance, "
-                            "how can I help?' — nothing else."
-                        ),
-                    },
-                }))
-                logger.info(f"👋 [{self.channel_id[:12]}] Greeting triggered")
+                # If greeting was already played from cache, don't ask Azure for it again
+                if not self._greeting_cached:
+                    await self._azure_ws.send(json.dumps({
+                        "type": "response.create",
+                        "response": {"instructions": GREETING_INSTRUCTIONS},
+                    }))
+                    logger.info(f"👋 [{self.channel_id[:12]}] Greeting triggered (generating + caching)")
+                else:
+                    logger.info(f"👋 [{self.channel_id[:12]}] Greeting already played from cache — Azure ready")
 
         elif etype == "input_audio_buffer.speech_started":
             logger.info(f"🎤 [{self.channel_id[:12]}] Speech started")
@@ -799,125 +860,44 @@ class CallSession:
             if full:
                 logger.info(f"🤖 [{self.channel_id[:12]}] AI: {full}")
                 self._db_transcript("agent", full)
+
+                # Check if this was the greeting (first AI turn, first call)
+                if (not self._greeting_cached
+                        and self._greeting_sent
+                        and not self._greeting_done
+                        and GREETING_TEXT.lower()[:20] in full.lower()):
+                    self._greeting_done = True
+                    # Small delay to ensure all audio.delta chunks have arrived
+                    asyncio.create_task(self._finish_greeting_cache())
+
                 if not self.escalated and any(p in full.lower() for p in self.AI_TRANSFER_PHRASES):
                     logger.info(f"🔀 [{self.channel_id[:12]}] AI announced transfer — 2.5s delay")
                     asyncio.create_task(self._delayed_escalate(full))
 
         elif etype == "error":
-            logger.error(f"❌ Azure error: {event.get('error', event)}")
+            err = event.get("error", event)
+            logger.error(f"❌ [{self.channel_id[:12]}] Azure error: {err}")
+            # FIX: treat Azure errors as session-ending to avoid silent hang
+            if not self._closed:
+                logger.warning(f"⚠️  [{self.channel_id[:12]}] Closing session due to Azure error")
+                self._closed = True
 
         elif etype == "response.function_call_arguments.done":
             await self._handle_function_call(event)
 
-        # All other events (response.created, response.done, content_part.*, etc.)
-        # are silently ignored — we only care about the ones above.
+    async def _finish_greeting_cache(self):
+        """Wait a moment for all audio deltas to flush, then save to disk."""
+        await asyncio.sleep(0.5)
+        self._save_greeting_cache()
 
-    async def _handle_function_call(self, event: dict):
-        """Azure Voice Live signals a completed function call — dispatch it,
-        then send the result back so the model can continue the turn."""
-        name      = event.get("name", "")
-        call_id   = event.get("call_id", "")
-        raw_args  = event.get("arguments", "{}")
-
-        try:
-            args = json.loads(raw_args) if raw_args else {}
-        except json.JSONDecodeError:
-            args = {}
-
-        if name == "create_ticket":
-            result = self._create_ai_ticket(args)
-        else:
-            result = {"error": f"Unknown function: {name}"}
-
-        if not _ws_open(self._azure_ws):
-            return
-        try:
-            await self._azure_ws.send(json.dumps({
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": json.dumps(result),
-                },
-            }))
-            await self._azure_ws.send(json.dumps({"type": "response.create"}))
-        except Exception as e:
-            logger.error(f"Function call result send error: {e}")
-
-    def _create_ai_ticket(self, args: dict) -> dict:
-        """Create a Ticket row flagged is_ai_generated=True, linked to this
-        call and (if resolvable) the calling customer."""
-        if not self.flask_app:
-            return {"error": "Ticketing unavailable in this environment"}
-
-        subject     = (args.get("subject") or "Issue raised during AI call").strip()
-        description = (args.get("description") or "").strip()
-        category    = args.get("category", "general")
-        priority    = args.get("priority", "normal")
-
-        try:
-            with self.flask_app.app_context():
-                from models import db, Customer, Ticket, Call
-
-                customer = None
-                if self.caller_number:
-                    customer = Customer.find_by_phone(self.caller_number)
-
-                call = Call.query.filter_by(call_id=self.channel_id).first()
-
-                if not customer:
-                    # No matching customer record — still log the ticket so nothing
-                    # is lost, but make that obvious to whoever reviews it.
-                    logger.warning(
-                        f"🎫 [{self.channel_id[:12]}] create_ticket with no matched "
-                        f"customer (caller={self.caller_number}) — ticket unlinked"
-                    )
-                    return {"error": "No customer record found for this caller number; "
-                                      "ask for their full name and policy number, then "
-                                      "let them know an agent will follow up."}
-
-                ticket = Ticket(
-                    customer_id            = customer.id,
-                    call_id                = call.id if call else None,
-                    ticket_number          = Ticket.generate_ticket_number(),
-                    subject                = subject,
-                    description            = description,
-                    category               = category,
-                    priority               = priority,
-                    status                 = "open",
-                    is_ai_generated        = True,
-                )
-                db.session.add(ticket)
-                db.session.commit()
-
-                logger.info(f"🎫 [{self.channel_id[:12]}] AI created ticket "
-                            f"{ticket.ticket_number} for {customer.full_name} "
-                            f"({category}/{priority})")
-
-                return {
-                    "success": True,
-                    "ticket_number": ticket.ticket_number,
-                    "message": f"Ticket {ticket.ticket_number} logged for {customer.full_name}.",
-                }
-
-        except Exception as e:
-            logger.error(f"create_ticket error: {e}")
-            return {"error": "Failed to log ticket"}
-
-    # ── RTP send: Asterisk ← Azure queue ─────────────────────────────────────
+    # ── RTP send: queue → Asterisk ────────────────────────────────────────────
 
     async def _rtp_send_loop(self):
-        """
-        Drain the to_asterisk queue, packetise into 160-byte μ-law frames,
-        and send at 20ms intervals. sendto() on a UDP socket is fast enough
-        to call directly without run_in_executor.
-        """
         loop      = asyncio.get_running_loop()
         buf       = bytearray()
         next_tick = loop.time()
 
         while not self._closed:
-            # Pull whatever is in the queue without blocking long
             try:
                 chunk = await asyncio.wait_for(self._to_asterisk.get(), timeout=0.1)
                 buf.extend(chunk)
@@ -942,11 +922,9 @@ class CallSession:
                 payload = bytes(buf[:ULAW_FRAME_BYTES])
                 del buf[:ULAW_FRAME_BYTES]
 
-                # Build RTP packet
                 pkt = struct.pack(
                     "!BBHII",
-                    0x80,           # V=2, no padding/ext/CC
-                    0x00,           # M=0, PT=0 (PCMU)
+                    0x80, 0x00,
                     self._rtp_seq,
                     self._rtp_ts,
                     self._rtp_ssrc,
@@ -954,8 +932,12 @@ class CallSession:
                 self._rtp_seq  = (self._rtp_seq + 1) & 0xFFFF
                 self._rtp_ts  += ULAW_FRAME_BYTES
 
-                # Pace: wait until next_tick
+                # Pace: wait until next_tick, but cap drift to avoid long sleeps
                 now = loop.time()
+                # FIX: cap next_tick drift to 200ms so a queue backlog doesn't cause
+                #      a long blocking sleep that starves the event loop
+                if next_tick < now - 0.2:
+                    next_tick = now
                 if next_tick > now:
                     await asyncio.sleep(next_tick - now)
                 next_tick = max(loop.time(), next_tick) + FRAME_DURATION
@@ -991,7 +973,6 @@ class CallSession:
 
         logger.info(f"🔀 [{self.channel_id[:12]}] → {dept_name} ext {dept_ext} (intent: {intent})")
 
-        # Remove ExternalMedia from bridge (stops AI audio immediately)
         if self._bridge_id and self._ext_channel_id:
             try:
                 bridge = await self.ari_client.bridges.get(bridgeId=self._bridge_id)
@@ -999,10 +980,8 @@ class CallSession:
             except Exception:
                 pass
 
-        # Tear down Azure WS and UDP
         await self._close_media()
 
-        # Transfer caller via dialplan
         for ctx in ["from-internal", "default"]:
             try:
                 await self.channel.continueInDialplan(
@@ -1060,6 +1039,93 @@ class CallSession:
             logger.error(f"Dept lookup: {e}")
             return None
 
+    # ── Function calls ────────────────────────────────────────────────────────
+
+    async def _handle_function_call(self, event: dict):
+        name     = event.get("name", "")
+        call_id  = event.get("call_id", "")
+        raw_args = event.get("arguments", "{}")
+        try:
+            args = json.loads(raw_args) if raw_args else {}
+        except json.JSONDecodeError:
+            args = {}
+
+        if name == "create_ticket":
+            result = self._create_ai_ticket(args)
+        else:
+            result = {"error": f"Unknown function: {name}"}
+
+        if not _ws_open(self._azure_ws):
+            return
+        try:
+            await self._azure_ws.send(json.dumps({
+                "type": "conversation.item.create",
+                "item": {
+                    "type":    "function_call_output",
+                    "call_id": call_id,
+                    "output":  json.dumps(result),
+                },
+            }))
+            await self._azure_ws.send(json.dumps({"type": "response.create"}))
+        except Exception as e:
+            logger.error(f"Function call result send error: {e}")
+
+    def _create_ai_ticket(self, args: dict) -> dict:
+        if not self.flask_app:
+            return {"error": "Ticketing unavailable in this environment"}
+
+        subject     = (args.get("subject") or "Issue raised during AI call").strip()
+        description = (args.get("description") or "").strip()
+        category    = args.get("category", "general")
+        priority    = args.get("priority", "normal")
+
+        try:
+            with self.flask_app.app_context():
+                from models import db, Customer, Ticket, Call
+
+                customer = None
+                if self.caller_number:
+                    customer = Customer.find_by_phone(self.caller_number)
+
+                call = Call.query.filter_by(call_id=self.channel_id).first()
+
+                if not customer:
+                    logger.warning(
+                        f"🎫 [{self.channel_id[:12]}] create_ticket with no matched "
+                        f"customer (caller={self.caller_number}) — ticket unlinked"
+                    )
+                    return {"error": "No customer record found for this caller number; "
+                                     "ask for their full name and policy number, then "
+                                     "let them know an agent will follow up."}
+
+                ticket = Ticket(
+                    customer_id     = customer.id,
+                    call_id         = call.id if call else None,
+                    ticket_number   = Ticket.generate_ticket_number(),
+                    subject         = subject,
+                    description     = description,
+                    category        = category,
+                    priority        = priority,
+                    status          = "open",
+                    is_ai_generated = True,
+                )
+                db.session.add(ticket)
+                db.session.commit()
+
+                logger.info(f"🎫 [{self.channel_id[:12]}] AI created ticket "
+                            f"{ticket.ticket_number} for {customer.full_name} "
+                            f"({category}/{priority})")
+
+                return {
+                    "success":       True,
+                    "ticket_number": ticket.ticket_number,
+                    "message":       f"Ticket {ticket.ticket_number} logged for {customer.full_name}.",
+                }
+
+        except Exception as e:
+            logger.error(f"create_ticket error: {e}")
+            return {"error": "Failed to log ticket"}
+
     # ── DB transcript ─────────────────────────────────────────────────────────
 
     def _db_transcript(self, speaker: str, text: str):
@@ -1081,7 +1147,6 @@ class CallSession:
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
     async def _close_media(self):
-        """Close Azure WS and UDP socket."""
         if self._azure_ws:
             try:
                 await self._azure_ws.close()
@@ -1098,7 +1163,6 @@ class CallSession:
 
     async def close(self):
         if self._closed and self.escalated:
-            # Escalation already cleaned up everything; caller channel is live with FreePBX
             return
 
         self._closed = True
