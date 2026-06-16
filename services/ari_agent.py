@@ -48,9 +48,11 @@ RTP_HOST  = "0.0.0.0"
 RTP_START = 20000
 RTP_END   = 20100
 
-GREETING_TEXT         = "Thank you for calling Jubilee Insurance, how can I help?"
-GREETING_INSTRUCTIONS = f"Say ONLY: '{GREETING_TEXT}' — nothing else."
-GREETING_SUPPRESS_SECS = 3.5  # suppress caller mic while cached greeting plays
+GREETING_INSTRUCTIONS = (
+    "Greet the caller warmly and ask how you can help. "
+    "Keep it to one short natural sentence — do NOT read a scripted line. "
+    "Example: 'Hi, thanks for calling Jubilee Insurance — how can I help you today?'"
+)
 
 
 # ── RTP DatagramProtocol ───────────────────────────────────────────────────────
@@ -150,11 +152,6 @@ class ARIAgent:
         self.azure_voice_type = app_config.get("AZURE_VOICE_TYPE", "azure-standard")
         self.system_prompt    = app_config.get("DEFAULT_SYSTEM_PROMPT") or self._default_prompt()
 
-        self.sounds_dir           = app_config.get("ASTERISK_SOUNDS_DIR",
-                                                    "/var/lib/asterisk/sounds/custom")
-        self._greeting_cache_path = os.path.join(self.sounds_dir, "ari_greeting.ulaw")
-        self._greeting_cached     = os.path.isfile(self._greeting_cache_path)
-
         self._port_lock     = asyncio.Lock()
         self._next_rtp_port = RTP_START
         self.ari_client     = None
@@ -185,7 +182,6 @@ class ARIAgent:
             "voice_name":      self.azure_voice_name,
             "voice_type":      self.azure_voice_type,
             "model":           AZURE_MODEL,
-            "greeting_cached": self._greeting_cached,
         }
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -198,7 +194,7 @@ class ARIAgent:
         logger.info(f"   Model       : {AZURE_MODEL}")
         logger.info(f"   Audio in    : PCM16 {AZURE_IN_RATE}Hz (upsampled from 8kHz)")
         logger.info(f"   Audio out   : PCM16 {AZURE_OUT_RATE}Hz → 8kHz μ-law → Asterisk")
-        logger.info(f"   Greeting    : {'cached ✅' if self._greeting_cached else 'will generate on first call'}")
+        logger.info(f"   Greeting    : live via Azure (no cache)")
         logger.info("=" * 60)
 
         if not self.azure_resource or not self.azure_api_key:
@@ -291,20 +287,17 @@ class ARIAgent:
         prompt   = self.system_prompt + self._load_kb() + self._load_caller_context(caller)
 
         sess = CallSession(
-            channel             = channel,
-            ari_client          = self.ari_client,
-            ari_app             = self.ari_app,
-            azure_ws_url        = _azure_ws_url(self.azure_resource),
-            azure_api_key       = self.azure_api_key,
-            voice_name          = self.azure_voice_name,
-            voice_type          = self.azure_voice_type,
-            system_prompt       = prompt,
-            rtp_port            = rtp_port,
-            flask_app           = self.flask_app,
-            caller_number       = caller,
-            greeting_cached     = self._greeting_cached,
-            greeting_cache_path = self._greeting_cache_path,
-            on_greeting_cached  = self._mark_greeting_cached,
+            channel       = channel,
+            ari_client    = self.ari_client,
+            ari_app       = self.ari_app,
+            azure_ws_url  = _azure_ws_url(self.azure_resource),
+            azure_api_key = self.azure_api_key,
+            voice_name    = self.azure_voice_name,
+            voice_type    = self.azure_voice_type,
+            system_prompt = prompt,
+            rtp_port      = rtp_port,
+            flask_app     = self.flask_app,
+            caller_number = caller,
         )
 
         self.active_calls[cid] = sess
@@ -320,10 +313,6 @@ class ARIAgent:
             self.active_calls.pop(cid, None)
             await sess.close()
             self._db_call_end(sess)
-
-    def _mark_greeting_cached(self):
-        self._greeting_cached = True
-        logger.info(f"✅ Greeting cached → {self._greeting_cache_path}")
 
     async def _alloc_rtp_port(self) -> int:
         async with self._port_lock:
@@ -510,9 +499,7 @@ class CallSession:
 
     def __init__(self, *, channel, ari_client, ari_app, azure_ws_url,
                  azure_api_key, voice_name, voice_type, system_prompt,
-                 rtp_port, flask_app, caller_number=None,
-                 greeting_cached=False, greeting_cache_path=None,
-                 on_greeting_cached=None):
+                 rtp_port, flask_app, caller_number=None):
 
         self.channel       = channel
         self.channel_id    = channel.id
@@ -526,13 +513,6 @@ class CallSession:
         self.rtp_port      = rtp_port
         self.flask_app     = flask_app
         self.caller_number = caller_number
-
-        # Greeting cache
-        self._greeting_cached     = greeting_cached
-        self._greeting_cache_path = greeting_cache_path
-        self._on_greeting_cached  = on_greeting_cached
-        self._greeting_ulaw_buf   = bytearray()
-        self._greeting_done       = False
 
         self.caller_hung_up = False
         self.escalated      = False
@@ -603,12 +583,6 @@ class CallSession:
                         raise
                     await asyncio.sleep(0.2)
 
-            # Play cached greeting via Asterisk while Azure connects in background
-            if self._greeting_cached:
-                self._suppress_caller_audio = True
-                await self._play_cached_greeting()
-                asyncio.create_task(self._lift_audio_suppression())
-
             # Register asyncio DatagramProtocol — non-blocking RTP receive
             # _RTPProtocol now upsamples 8kHz → 16kHz inline before queuing
             transport, self._rtp_protocol = await loop.create_datagram_endpoint(
@@ -637,44 +611,11 @@ class CallSession:
         finally:
             await self.close()
 
-    # ── Greeting helpers ───────────────────────────────────────────────────────
+    # ── RTP addr discovery ─────────────────────────────────────────────────────
 
     def _on_asterisk_addr(self, addr):
         self._asterisk_addr = addr
         logger.info(f"📻 [{self.channel_id[:12]}] Asterisk RTP: {addr[0]}:{addr[1]}")
-
-    async def _lift_audio_suppression(self):
-        await asyncio.sleep(GREETING_SUPPRESS_SECS)
-        self._suppress_caller_audio = False
-        logger.info(f"🎤 [{self.channel_id[:12]}] Caller mic open")
-
-    async def _play_cached_greeting(self):
-        try:
-            await self.channel.play(media="sound:custom/ari_greeting")
-            logger.info(f"🔊 [{self.channel_id[:12]}] Playing cached greeting")
-        except Exception as e:
-            logger.warning(f"⚠️  [{self.channel_id[:12]}] Could not play cached greeting: {e}")
-
-    def _save_greeting_cache(self):
-        if not self._greeting_cache_path or not self._greeting_ulaw_buf:
-            return
-        try:
-            os.makedirs(os.path.dirname(self._greeting_cache_path), exist_ok=True)
-            with open(self._greeting_cache_path, "wb") as f:
-                f.write(self._greeting_ulaw_buf)
-            logger.info(
-                f"💾 Greeting cached → {self._greeting_cache_path} "
-                f"({len(self._greeting_ulaw_buf)} bytes, "
-                f"~{len(self._greeting_ulaw_buf) / 8000:.1f}s)"
-            )
-            if self._on_greeting_cached:
-                self._on_greeting_cached()
-        except Exception as e:
-            logger.error(f"Failed to save greeting cache: {e}")
-
-    async def _finish_greeting_cache(self):
-        await asyncio.sleep(0.5)
-        self._save_greeting_cache()
 
     # ── Azure connection ───────────────────────────────────────────────────────
 
@@ -812,13 +753,18 @@ class CallSession:
                 continue
             except websockets.exceptions.ConnectionClosed as e:
                 if not self._closed:
-                    logger.warning(f"⚠️  [{self.channel_id[:12]}] Azure WS closed ({e.code}): {e.reason}")
+                    logger.warning(
+                        f"⚠️  [{self.channel_id[:12]}] Azure WS closed "
+                        f"(code={e.code} reason={e.reason!r}) — hanging up call"
+                    )
                     self._closed = True
+                    asyncio.create_task(self._hangup_on_azure_drop())
                 break
             except Exception as e:
                 if not self._closed:
-                    logger.debug(f"Azure recv: {e}")
+                    logger.warning(f"⚠️  [{self.channel_id[:12]}] Azure recv error: {e} — hanging up call")
                     self._closed = True
+                    asyncio.create_task(self._hangup_on_azure_drop())
                 break
 
             await self._handle_azure_event(event)
@@ -840,10 +786,6 @@ class CallSession:
             if not self._to_asterisk.full():
                 self._to_asterisk.put_nowait(ulaw)
 
-            # Accumulate greeting audio for caching (first call only)
-            if not self._greeting_cached and self._greeting_sent and not self._greeting_done:
-                self._greeting_ulaw_buf.extend(ulaw)
-
         elif etype == "session.created":
             sess_id = event.get("session", {}).get("id", "")
             logger.info(f"✅ [{self.channel_id[:12]}] Azure session: {sess_id}")
@@ -852,14 +794,11 @@ class CallSession:
             logger.info(f"⚙️  [{self.channel_id[:12]}] Session updated")
             if not self._greeting_sent:
                 self._greeting_sent = True
-                if not self._greeting_cached:
-                    await self._azure_ws.send(json.dumps({
-                        "type":     "response.create",
-                        "response": {"instructions": GREETING_INSTRUCTIONS},
-                    }))
-                    logger.info(f"👋 [{self.channel_id[:12]}] Greeting triggered (generating + caching)")
-                else:
-                    logger.info(f"👋 [{self.channel_id[:12]}] Greeting from cache — Azure ready")
+                await self._azure_ws.send(json.dumps({
+                    "type":     "response.create",
+                    "response": {"instructions": GREETING_INSTRUCTIONS},
+                }))
+                logger.info(f"👋 [{self.channel_id[:12]}] Live greeting triggered via Azure")
 
         elif etype == "input_audio_buffer.speech_started":
             logger.info(f"🎤 [{self.channel_id[:12]}] Speech started")
@@ -886,14 +825,6 @@ class CallSession:
             if full:
                 logger.info(f"🤖 [{self.channel_id[:12]}] AI: {full}")
                 self._db_transcript("agent", full)
-
-                # Detect and cache the greeting on first call
-                if (not self._greeting_cached
-                        and self._greeting_sent
-                        and not self._greeting_done
-                        and GREETING_TEXT.lower()[:20] in full.lower()):
-                    self._greeting_done = True
-                    asyncio.create_task(self._finish_greeting_cache())
 
                 if not self.escalated and any(p in full.lower() for p in self.AI_TRANSFER_PHRASES):
                     logger.info(f"🔀 [{self.channel_id[:12]}] AI announced transfer — 2.5s delay")
