@@ -477,7 +477,10 @@ class ARIAgent:
             "(6) Never say you are an AI. "
             "(7) Never use filler like 'Certainly', 'Of course', 'Absolutely', or 'Great question'. "
             "(8) Only transfer if the caller EXPLICITLY asks to speak to a person or agent. "
-            "(9) When transferring say exactly: 'Let me transfer you to one of our agents right away.'"
+            "(9) When transferring say exactly: 'Let me transfer you to one of our agents right away.' "
+            "(10) When the call is clearly done — caller says bye, thanks, or has no more questions — "
+            "say one warm closing sentence, then immediately call the end_call tool to hang up. "
+            "Do NOT loop with 'Is there anything else?' more than once. If they say bye or thanks, end the call."
         )
 
 
@@ -496,6 +499,15 @@ class CallSession:
         "transfer you to", "transferring you to", "connect you to",
         "put you through to", "one of our agents", "speak to an agent",
     ]
+    # Phrases that signal the AI has said goodbye and should hang up
+    AI_FAREWELL_PHRASES = [
+        "take care", "have a great day", "have a good day", "goodbye",
+        "good bye", "bye for now", "thanks for calling", "thank you for calling",
+        "feel free to call", "don't hesitate to call", "have a wonderful",
+        "all the best", "talk soon",
+    ]
+    # How long (seconds) to wait after farewell audio finishes before hanging up
+    HANGUP_GRACE_SECONDS = 3.5
 
     def __init__(self, *, channel, ari_client, ari_app, azure_ws_url,
                  azure_api_key, voice_name, voice_type, system_prompt,
@@ -514,11 +526,12 @@ class CallSession:
         self.flask_app     = flask_app
         self.caller_number = caller_number
 
-        self.caller_hung_up = False
-        self.escalated      = False
-        self._closed        = False
-        self._greeting_sent = False
-        self._ai_buf        = ""
+        self.caller_hung_up          = False
+        self.escalated               = False
+        self._closed                 = False
+        self._greeting_sent          = False
+        self._ai_buf                 = ""
+        self._farewell_hangup_task   = None   # scheduled hangup after goodbye
 
         self._udp_sock       = None
         self._asterisk_addr  = None
@@ -701,6 +714,26 @@ class CallSession:
                             "required": ["subject", "category"],
                         },
                     },
+                    {
+                        "type": "function",
+                        "name": "end_call",
+                        "description": (
+                            "End the call after saying goodbye. Call this ONLY after you have "
+                            "already said a warm closing line to the caller — e.g. after 'Thanks "
+                            "for calling, take care!' — never before. Do not call this if the "
+                            "caller still has unresolved questions or wants to be transferred."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "reason": {
+                                    "type":        "string",
+                                    "description": "Brief reason: 'resolved', 'no_further_questions', etc.",
+                                },
+                            },
+                            "required": [],
+                        },
+                    },
                 ],
                 "tool_choice": "auto",
             },
@@ -829,6 +862,19 @@ class CallSession:
                 if not self.escalated and any(p in full.lower() for p in self.AI_TRANSFER_PHRASES):
                     logger.info(f"🔀 [{self.channel_id[:12]}] AI announced transfer — 2.5s delay")
                     asyncio.create_task(self._delayed_escalate(full))
+
+                # If AI said a farewell, schedule a graceful hangup so audio
+                # finishes playing before the channel drops.
+                elif (not self.escalated
+                      and not self._farewell_hangup_task
+                      and any(p in full.lower() for p in self.AI_FAREWELL_PHRASES)):
+                    logger.info(
+                        f"👋 [{self.channel_id[:12]}] Farewell detected — "
+                        f"hanging up in {self.HANGUP_GRACE_SECONDS}s"
+                    )
+                    self._farewell_hangup_task = asyncio.create_task(
+                        self._farewell_hangup()
+                    )
 
         elif etype == "error":
             err = event.get("error", event)
@@ -999,6 +1045,17 @@ class CallSession:
 
         if name == "create_ticket":
             result = self._create_ai_ticket(args)
+        elif name == "end_call":
+            # ACK the function call, then hang up after grace period
+            result = {"success": True, "message": "Call will be ended now."}
+            if not self._farewell_hangup_task:
+                logger.info(
+                    f"📴 [{self.channel_id[:12]}] end_call tool invoked — "
+                    f"hanging up in {self.HANGUP_GRACE_SECONDS}s"
+                )
+                self._farewell_hangup_task = asyncio.create_task(
+                    self._farewell_hangup()
+                )
         else:
             result = {"error": f"Unknown function: {name}"}
 
@@ -1016,6 +1073,34 @@ class CallSession:
             await self._azure_ws.send(json.dumps({"type": "response.create"}))
         except Exception as e:
             logger.error(f"Function call result send error: {e}")
+
+    async def _farewell_hangup(self):
+        """
+        Wait for the AI's goodbye audio to finish playing, then hang up cleanly.
+        Called either when the AI says a farewell phrase or invokes end_call tool.
+        """
+        await asyncio.sleep(self.HANGUP_GRACE_SECONDS)
+        if self._closed or self.caller_hung_up or self.escalated:
+            return
+        logger.info(f"📴 [{self.channel_id[:12]}] Hanging up after farewell")
+        self._closed = True
+        await self._close_media()
+        try:
+            await self.channel.hangup()
+        except Exception:
+            pass
+
+    async def _hangup_on_azure_drop(self):
+        """
+        Called when the Azure WebSocket closes unexpectedly mid-call.
+        Gives a short grace period (in case of a brief disconnect), then hangs up.
+        """
+        await asyncio.sleep(1.0)
+        if self._closed and not self.caller_hung_up and not self.escalated:
+            try:
+                await self.channel.hangup()
+            except Exception:
+                pass
 
     def _create_ai_ticket(self, args: dict) -> dict:
         if not self.flask_app:
