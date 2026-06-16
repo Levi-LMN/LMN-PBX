@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+
+{% block title %}File Claim — {{ customer.full_name }} - FreePBX AI Assistant{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1 class="page-title">File a Claim</h1>
+    <p class="page-subtitle">For {{ customer.full_name }} · {{ customer.phone_number }}</p>
+</div>
+
+<div class="row">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <i class="fas fa-file-medical"></i> Claim Details
+            </div>
+            <div class="card-body">
+                <form method="POST">
+                    <div class="mb-4">
+                        <label for="claim_number" class="form-label" style="font-weight: 600;">Claim Number</label>
+                        <input type="text" class="form-control" id="claim_number" name="claim_number"
+                               placeholder="Leave blank to auto-generate"
+                               style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                        <div class="form-text">e.g. CLM-20260617-B7E1 — auto-generated if left blank</div>
+                    </div>
+
+                    {% if policies %}
+                    <div class="mb-4">
+                        <label for="policy_id" class="form-label" style="font-weight: 600;">Linked Policy</label>
+                        <select class="form-select" id="policy_id" name="policy_id"
+                                style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                            <option value="">— None / Unknown —</option>
+                            {% for p in policies %}
+                            <option value="{{ p.id }}">{{ p.policy_number }} ({{ p.policy_type.replace('_',' ')|capitalize }})</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    {% endif %}
+
+                    <div class="mb-4">
+                        <label for="claim_type" class="form-label" style="font-weight: 600;">Claim Type</label>
+                        <select class="form-select" id="claim_type" name="claim_type" required
+                                style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                            <option value="" disabled selected>Select type…</option>
+                            {% for t in claim_types %}
+                            <option value="{{ t }}">{{ t.replace('_', ' ')|capitalize }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="status" class="form-label" style="font-weight: 600;">Status</label>
+                        <select class="form-select" id="status" name="status"
+                                style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                            {% for s in statuses %}
+                            <option value="{{ s }}" {% if s == 'submitted' %}selected{% endif %}>
+                                {{ s.replace('_',' ')|capitalize }}
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="amount_claimed" class="form-label" style="font-weight: 600;">Amount Claimed (KES)</label>
+                        <input type="number" step="0.01" class="form-control" id="amount_claimed" name="amount_claimed"
+                               style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="description" class="form-label" style="font-weight: 600;">Description</label>
+                        <textarea class="form-control" id="description" name="description" rows="4"
+                                  placeholder="Brief description of the claim…"
+                                  style="border-radius: 12px; border: 2px solid #e5e7eb;"></textarea>
+                        <div class="form-text">Ari will use this to give callers a summary of what happened.</div>
+                    </div>
+
+                    <div class="d-flex gap-2">
+                        <button type="submit" class="btn btn-primary">
+                            <i class="fas fa-save"></i> File Claim
+                        </button>
+                        <a href="{{ url_for('admin.customer_detail', customer_id=customer.id) }}" class="btn btn-outline-secondary">
+                            <i class="fas fa-times"></i> Cancel
+                        </a>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-4">
+        <div class="card" style="background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%); border: none;">
+            <div class="card-body">
+                <h5 style="font-weight: 700; margin-bottom: 1rem; color: #92400e;">
+                    <i class="fas fa-info-circle"></i> About Claims
+                </h5>
+                <p style="font-size: 0.85rem; color: #92400e; line-height: 1.7; margin: 0;">
+                    Once filed, this claim will appear when the customer calls in. Ari will read 
+                    out the current status and any update notes you add later via the Update button.
+                </p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

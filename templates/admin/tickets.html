@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+
+{% block title %}Tickets - FreePBX AI Assistant{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1 class="page-title">Support Tickets</h1>
+    <p class="page-subtitle">Issues logged by staff or automatically by Ari during calls</p>
+</div>
+
+<div class="card" style="margin-bottom: 1.25rem;">
+    <div class="card-body" style="padding: 0.75rem 1.25rem;">
+        <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+            <div class="d-flex gap-2 flex-wrap">
+                <a href="{{ url_for('admin.tickets') }}"
+                   class="btn btn-sm {{ 'btn-primary' if not status_filter else 'btn-outline-secondary' }}">All</a>
+                {% for s in statuses %}
+                <a href="{{ url_for('admin.tickets', status=s, ai_only=ai_only) }}"
+                   class="btn btn-sm {{ 'btn-primary' if status_filter == s else 'btn-outline-secondary' }}"
+                   style="text-transform: capitalize;">{{ s.replace('_', ' ') }}</a>
+                {% endfor %}
+            </div>
+            <a href="{{ url_for('admin.tickets', status=status_filter, ai_only='' if ai_only else '1') }}"
+               class="btn btn-sm {{ 'btn-primary' if ai_only else 'btn-outline-secondary' }}">
+                <i class="fas fa-robot"></i> AI-Generated Only
+            </a>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-body" style="padding: 0;">
+        {% if tickets %}
+        <table class="table" style="margin: 0;">
+            <thead>
+                <tr>
+                    <th>Ticket</th>
+                    <th>Customer</th>
+                    <th>Subject</th>
+                    <th>Category</th>
+                    <th>Priority</th>
+                    <th>Status</th>
+                    <th>Source</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for ticket in tickets %}
+                <tr {% if ticket.is_ai_generated and ticket.status == 'open' %}style="background: #faf5ff;"{% endif %}>
+                    <td style="font-weight: 600;">{{ ticket.ticket_number }}</td>
+                    <td>
+                        {% if ticket.customer %}
+                        <a href="{{ url_for('admin.customer_detail', customer_id=ticket.customer.id) }}"
+                           style="color: var(--text-primary); text-decoration: none; font-weight: 500;">
+                            {{ ticket.customer.full_name }}
+                        </a>
+                        {% else %}—{% endif %}
+                    </td>
+                    <td>{{ ticket.subject }}</td>
+                    <td style="text-transform: capitalize;">{{ ticket.category.replace('_', ' ') }}</td>
+                    <td>
+                        {% if ticket.priority == 'urgent' %}
+                            <span class="badge bg-danger">Urgent</span>
+                        {% elif ticket.priority == 'high' %}
+                            <span class="badge" style="background: #fef3c7; color: #92400e;">High</span>
+                        {% else %}
+                            <span class="badge" style="background: #e5e7eb; color: #374151;">{{ ticket.priority|capitalize }}</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if ticket.status == 'open' %}
+                            <span class="badge bg-success">Open</span>
+                        {% elif ticket.status == 'in_progress' %}
+                            <span class="badge" style="background: #dbeafe; color: #1e40af;">In Progress</span>
+                        {% else %}
+                            <span class="badge bg-secondary">{{ ticket.status.replace('_', ' ')|capitalize }}</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if ticket.is_ai_generated %}
+                            <span class="badge" style="background: #ede9fe; color: #5b21b6;">
+                                <i class="fas fa-robot"></i> AI
+                            </span>
+                        {% else %}
+                            <span class="badge" style="background: #f3f4f6; color: #374151;">
+                                <i class="fas fa-user"></i> Staff
+                            </span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <a href="{{ url_for('admin.edit_ticket', ticket_id=ticket.id) }}"
+                           class="btn btn-sm btn-outline-primary">
+                            <i class="fas fa-edit"></i> Update
+                        </a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="text-center py-5">
+            <div style="width: 100px; height: 100px; background: linear-gradient(135deg, var(--primary-color), var(--primary-light)); border-radius: 24px; display: flex; align-items: center; justify-content: center; margin: 0 auto 1.5rem;">
+                <i class="fas fa-ticket-alt fa-3x text-white"></i>
+            </div>
+            <h3 style="font-weight: 700; margin-bottom: 0.5rem;">No tickets found</h3>
+            <p style="color: var(--text-secondary);">
+                {% if ai_only %}No AI-generated tickets match these filters.{% else %}No tickets have been logged yet.{% endif %}
+            </p>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+
+{% block title %}Claims - FreePBX AI Assistant{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1 class="page-title">Claims</h1>
+    <p class="page-subtitle">All claims across customers</p>
+</div>
+
+<div class="card" style="margin-bottom: 1.25rem;">
+    <div class="card-body" style="padding: 0.75rem 1.25rem;">
+        <div class="d-flex gap-2 flex-wrap">
+            <a href="{{ url_for('admin.claims') }}"
+               class="btn btn-sm {{ 'btn-primary' if not status_filter else 'btn-outline-secondary' }}">All</a>
+            {% for s in statuses %}
+            <a href="{{ url_for('admin.claims', status=s) }}"
+               class="btn btn-sm {{ 'btn-primary' if status_filter == s else 'btn-outline-secondary' }}"
+               style="text-transform: capitalize;">{{ s.replace('_', ' ') }}</a>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-body" style="padding: 0;">
+        {% if claims %}
+        <table class="table" style="margin: 0;">
+            <thead>
+                <tr>
+                    <th>Claim Number</th>
+                    <th>Customer</th>
+                    <th>Type</th>
+                    <th>Status</th>
+                    <th>Filed</th>
+                    <th>Amount Claimed</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for claim in claims %}
+                <tr>
+                    <td style="font-weight: 600;">{{ claim.claim_number }}</td>
+                    <td>
+                        {% if claim.customer %}
+                        <a href="{{ url_for('admin.customer_detail', customer_id=claim.customer.id) }}"
+                           style="color: var(--text-primary); text-decoration: none; font-weight: 500;">
+                            {{ claim.customer.full_name }}
+                        </a>
+                        {% else %}—{% endif %}
+                    </td>
+                    <td style="text-transform: capitalize;">{{ claim.claim_type.replace('_', ' ') }}</td>
+                    <td>
+                        {% if claim.status in ['approved', 'paid'] %}
+                            <span class="badge bg-success">{{ claim.status|capitalize }}</span>
+                        {% elif claim.status == 'rejected' %}
+                            <span class="badge bg-danger">Rejected</span>
+                        {% elif claim.status in ['under_review', 'awaiting_documents'] %}
+                            <span class="badge" style="background: #fef3c7; color: #92400e;">{{ claim.status.replace('_', ' ')|capitalize }}</span>
+                        {% else %}
+                            <span class="badge" style="background: #e5e7eb; color: #374151;">{{ claim.status.replace('_', ' ')|capitalize }}</span>
+                        {% endif %}
+                    </td>
+                    <td>{{ claim.filed_at.strftime('%Y-%m-%d') if claim.filed_at else '—' }}</td>
+                    <td>
+                        {% if claim.amount_claimed %}KES {{ '{:,.0f}'.format(claim.amount_claimed) }}{% else %}—{% endif %}
+                    </td>
+                    <td>
+                        <a href="{{ url_for('admin.edit_claim', claim_id=claim.id) }}"
+                           class="btn btn-sm btn-outline-primary">
+                            <i class="fas fa-edit"></i> Update
+                        </a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="text-center py-5">
+            <div style="width: 100px; height: 100px; background: linear-gradient(135deg, var(--primary-color), var(--primary-light)); border-radius: 24px; display: flex; align-items: center; justify-content: center; margin: 0 auto 1.5rem;">
+                <i class="fas fa-file-medical fa-3x text-white"></i>
+            </div>
+            <h3 style="font-weight: 700; margin-bottom: 0.5rem;">No claims found</h3>
+            <p style="color: var(--text-secondary);">
+                {% if status_filter %}No claims with this status.{% else %}No claims have been filed yet.{% endif %}
+            </p>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

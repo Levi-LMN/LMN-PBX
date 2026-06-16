@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+
+{% block title %}Update Claim {{ claim.claim_number }} - FreePBX AI Assistant{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1 class="page-title">Update Claim</h1>
+    <p class="page-subtitle">{{ claim.claim_number }} — {{ claim.customer.full_name if claim.customer else 'Unknown customer' }}</p>
+</div>
+
+<div class="row">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <i class="fas fa-file-medical"></i> Claim Details
+            </div>
+            <div class="card-body">
+                <div class="mb-4" style="background: #f9fafb; border-radius: 12px; padding: 1rem;">
+                    <div style="font-size: 0.75rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 0.4rem;">
+                        Description
+                    </div>
+                    <p style="margin: 0; font-size: 0.85rem;">{{ claim.description or 'No description on file.' }}</p>
+                </div>
+
+                <form method="POST">
+                    <div class="mb-4">
+                        <label for="status" class="form-label" style="font-weight: 600;">Status</label>
+                        <select class="form-select" id="status" name="status"
+                                style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                            {% for s in statuses %}
+                            <option value="{{ s }}" {% if claim.status == s %}selected{% endif %}
+                                    style="text-transform: capitalize;">{{ s.replace('_', ' ')|capitalize }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="amount_approved" class="form-label" style="font-weight: 600;">Amount Approved (KES)</label>
+                        <input type="number" step="0.01" class="form-control" id="amount_approved" name="amount_approved"
+                               value="{{ claim.amount_approved if claim.amount_approved is not none else '' }}"
+                               style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                        <div class="form-text">Amount claimed was KES {{ '{:,.0f}'.format(claim.amount_claimed) if claim.amount_claimed else '0' }}</div>
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="last_update_note" class="form-label" style="font-weight: 600;">Update Note</label>
+                        <textarea class="form-control" id="last_update_note" name="last_update_note" rows="3"
+                                  placeholder="Visible to the AI when this customer calls — e.g. 'Awaiting assessor report'"
+                                  style="border-radius: 12px; border: 2px solid #e5e7eb;">{{ claim.last_update_note or '' }}</textarea>
+                        <div class="form-text">This note is what the AI will tell the caller if they ask about this claim.</div>
+                    </div>
+
+                    <div class="d-flex gap-2">
+                        <button type="submit" class="btn btn-primary">
+                            <i class="fas fa-save"></i> Save Update
+                        </button>
+                        <a href="{{ url_for('admin.claims') }}" class="btn btn-outline-secondary">
+                            <i class="fas fa-times"></i> Cancel
+                        </a>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-4">
+        <div class="card" style="background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%); border: none;">
+            <div class="card-body">
+                <h5 style="font-weight: 700; margin-bottom: 1rem; color: #1e40af;">
+                    <i class="fas fa-info-circle"></i> Claim Info
+                </h5>
+                <div style="font-size: 0.85rem; color: #1e40af; line-height: 1.8;">
+                    <div class="mb-2"><strong>Type:</strong> {{ claim.claim_type.replace('_', ' ')|capitalize }}</div>
+                    <div class="mb-2"><strong>Filed:</strong> {{ claim.filed_at.strftime('%Y-%m-%d') if claim.filed_at else '—' }}</div>
+                    {% if claim.policy %}
+                    <div class="mb-2"><strong>Policy:</strong> {{ claim.policy.policy_number }}</div>
+                    {% endif %}
+                    {% if claim.resolved_at %}
+                    <div><strong>Resolved:</strong> {{ claim.resolved_at.strftime('%Y-%m-%d') }}</div>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

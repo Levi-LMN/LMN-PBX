@@ -554,6 +554,27 @@
                             <span>Calls</span>
                         </a>
                     </li>
+                    <li class="sidebar-nav-item">
+                        <a href="{{ url_for('admin.customers') }}"
+                           class="sidebar-nav-link {% if 'customer' in request.endpoint %}active{% endif %}">
+                            <i class="fas fa-id-card"></i>
+                            <span>Customers</span>
+                        </a>
+                    </li>
+                    <li class="sidebar-nav-item">
+                        <a href="{{ url_for('admin.claims') }}"
+                           class="sidebar-nav-link {% if 'claim' in request.endpoint %}active{% endif %}">
+                            <i class="fas fa-file-medical"></i>
+                            <span>Claims</span>
+                        </a>
+                    </li>
+                    <li class="sidebar-nav-item">
+                        <a href="{{ url_for('admin.tickets') }}"
+                           class="sidebar-nav-link {% if 'ticket' in request.endpoint %}active{% endif %}">
+                            <i class="fas fa-ticket-alt"></i>
+                            <span>Tickets</span>
+                        </a>
+                    </li>
                 </ul>
             </div>
 

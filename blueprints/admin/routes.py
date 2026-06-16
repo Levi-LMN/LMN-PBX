@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 import json
 import time
 
-from models import db, Call, CallTranscript, CallIntent, Department, RoutingRule, KnowledgeBase
+from models import db, Call, CallTranscript, CallIntent, Department, RoutingRule, KnowledgeBase, Customer, Policy, Claim, Ticket
 
 admin_bp = Blueprint('admin', __name__, url_prefix='/admin')
 
@@ -849,3 +849,307 @@ def delete_knowledge(entry_id):
 
     flash(f'Knowledge entry "{title}" deleted successfully', 'success')
     return redirect(url_for('admin.knowledge_base'))
+
+
+# ============================================================================
+# Customers / Claims / Tickets
+# ============================================================================
+
+@admin_bp.route('/customers')
+@login_required
+def customers():
+    """List customers with a quick view of open claims/tickets counts."""
+    search = request.args.get('q', '').strip()
+
+    query = Customer.query
+    if search:
+        query = query.filter(
+            db.or_(
+                Customer.full_name.ilike(f'%{search}%'),
+                Customer.phone_number.ilike(f'%{search}%'),
+            )
+        )
+
+    customer_list = query.order_by(Customer.full_name).all()
+
+    return render_template('admin/customers.html',
+                           customers=customer_list,
+                           search=search)
+
+
+@admin_bp.route('/customers/<int:customer_id>')
+@login_required
+def customer_detail(customer_id):
+    """Full view of one customer: policies, claims, tickets."""
+    customer = Customer.query.get_or_404(customer_id)
+    policies = customer.policies.all()
+    claims = customer.claims.order_by(desc(Claim.filed_at)).all()
+    tickets = customer.tickets.order_by(desc(Ticket.created_at)).all()
+
+    return render_template('admin/customer_detail.html',
+                           customer=customer,
+                           policies=policies,
+                           claims=claims,
+                           tickets=tickets)
+
+
+@admin_bp.route('/customers/create', methods=['GET', 'POST'])
+@login_required
+def create_customer():
+    """Create a new customer record (for demo/test data setup)."""
+    if not current_user.has_permission('manager'):
+        flash('Access denied. Manager privileges required.', 'error')
+        return redirect(url_for('admin.customers'))
+
+    if request.method == 'POST':
+        customer = Customer(
+            full_name=request.form.get('full_name'),
+            phone_number=request.form.get('phone_number'),
+            email=request.form.get('email') or None,
+            national_id=request.form.get('national_id') or None,
+        )
+        db.session.add(customer)
+        db.session.commit()
+
+        flash(f'Customer "{customer.full_name}" created successfully', 'success')
+        return redirect(url_for('admin.customer_detail', customer_id=customer.id))
+
+    return render_template('admin/customer_form.html')
+
+
+@admin_bp.route('/claims')
+@login_required
+def claims():
+    """List all claims across customers, most recent first."""
+    status_filter = request.args.get('status')
+
+    query = Claim.query
+    if status_filter:
+        query = query.filter_by(status=status_filter)
+
+    claim_list = query.order_by(desc(Claim.filed_at)).all()
+    statuses = ['submitted', 'under_review', 'awaiting_documents',
+                'approved', 'rejected', 'paid', 'closed']
+
+    return render_template('admin/claims.html',
+                           claims=claim_list,
+                           statuses=statuses,
+                           status_filter=status_filter)
+
+
+@admin_bp.route('/claims/<int:claim_id>/edit', methods=['GET', 'POST'])
+@login_required
+def edit_claim(claim_id):
+    """Update claim status — lets the demo show a claim moving forward and
+    the AI immediately reflecting the new status on the next call."""
+    if not current_user.has_permission('manager'):
+        flash('Access denied. Manager privileges required.', 'error')
+        return redirect(url_for('admin.claims'))
+
+    claim = Claim.query.get_or_404(claim_id)
+
+    if request.method == 'POST':
+        claim.status = request.form.get('status', claim.status)
+        claim.last_update_note = request.form.get('last_update_note', claim.last_update_note)
+        amount_approved = request.form.get('amount_approved', type=float)
+        if amount_approved is not None:
+            claim.amount_approved = amount_approved
+        if claim.status in ('paid', 'rejected', 'closed') and not claim.resolved_at:
+            claim.resolved_at = datetime.utcnow()
+
+        db.session.commit()
+        flash(f'Claim {claim.claim_number} updated', 'success')
+        return redirect(url_for('admin.customer_detail', customer_id=claim.customer_id))
+
+    statuses = ['submitted', 'under_review', 'awaiting_documents',
+                'approved', 'rejected', 'paid', 'closed']
+    return render_template('admin/claim_form.html', claim=claim, statuses=statuses)
+
+
+@admin_bp.route('/tickets')
+@login_required
+def tickets():
+    """List support tickets — AI-generated ones are visually flagged."""
+    status_filter = request.args.get('status')
+    ai_only = request.args.get('ai_only')
+
+    query = Ticket.query
+    if status_filter:
+        query = query.filter_by(status=status_filter)
+    if ai_only:
+        query = query.filter_by(is_ai_generated=True)
+
+    ticket_list = query.order_by(desc(Ticket.created_at)).all()
+    statuses = ['open', 'in_progress', 'resolved', 'closed']
+
+    return render_template('admin/tickets.html',
+                           tickets=ticket_list,
+                           statuses=statuses,
+                           status_filter=status_filter,
+                           ai_only=ai_only)
+
+
+@admin_bp.route('/tickets/<int:ticket_id>/edit', methods=['GET', 'POST'])
+@login_required
+def edit_ticket(ticket_id):
+    """Update ticket status / assignment — used to action AI-raised tickets."""
+    ticket = Ticket.query.get_or_404(ticket_id)
+
+    if request.method == 'POST':
+        ticket.status = request.form.get('status', ticket.status)
+        ticket.priority = request.form.get('priority', ticket.priority)
+        department_id = request.form.get('assigned_department_id', type=int)
+        ticket.assigned_department_id = department_id or None
+        if ticket.status in ('resolved', 'closed') and not ticket.resolved_at:
+            ticket.resolved_at = datetime.utcnow()
+
+        db.session.commit()
+        flash(f'Ticket {ticket.ticket_number} updated', 'success')
+        return redirect(url_for('admin.tickets'))
+
+    departments = Department.query.filter_by(is_active=True).all()
+    statuses = ['open', 'in_progress', 'resolved', 'closed']
+    priorities = ['low', 'normal', 'high', 'urgent']
+
+    return render_template('admin/ticket_form.html',
+                           ticket=ticket,
+                           departments=departments,
+                           statuses=statuses,
+                           priorities=priorities)
+
+
+@admin_bp.route('/customers/<int:customer_id>/policies/create', methods=['GET', 'POST'])
+@login_required
+def create_policy(customer_id):
+    """Manually add a policy to a customer."""
+    if not current_user.has_permission('manager'):
+        flash('Access denied. Manager privileges required.', 'error')
+        return redirect(url_for('admin.customer_detail', customer_id=customer_id))
+
+    customer = Customer.query.get_or_404(customer_id)
+
+    if request.method == 'POST':
+        import uuid
+        policy_number = request.form.get('policy_number') or f"POL-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:4].upper()}"
+        policy = Policy(
+            customer_id=customer_id,
+            policy_number=policy_number,
+            policy_type=request.form.get('policy_type'),
+            status=request.form.get('status', 'active'),
+            premium_amount=request.form.get('premium_amount', type=float) or None,
+            premium_frequency=request.form.get('premium_frequency') or None,
+            start_date=datetime.strptime(request.form['start_date'], '%Y-%m-%d').date() if request.form.get('start_date') else None,
+            renewal_date=datetime.strptime(request.form['renewal_date'], '%Y-%m-%d').date() if request.form.get('renewal_date') else None,
+        )
+        db.session.add(policy)
+        db.session.commit()
+        flash(f'Policy {policy.policy_number} added successfully', 'success')
+        return redirect(url_for('admin.customer_detail', customer_id=customer_id))
+
+    policy_types = ['motor', 'medical', 'life', 'last_expense', 'home', 'travel']
+    statuses = ['active', 'lapsed', 'cancelled', 'pending']
+    frequencies = ['monthly', 'quarterly', 'annual']
+    return render_template('admin/policy_form.html',
+                           customer=customer,
+                           policy_types=policy_types,
+                           statuses=statuses,
+                           frequencies=frequencies)
+
+
+@admin_bp.route('/customers/<int:customer_id>/claims/create', methods=['GET', 'POST'])
+@login_required
+def create_claim(customer_id):
+    """Manually file a claim for a customer."""
+    if not current_user.has_permission('manager'):
+        flash('Access denied. Manager privileges required.', 'error')
+        return redirect(url_for('admin.customer_detail', customer_id=customer_id))
+
+    customer = Customer.query.get_or_404(customer_id)
+    policies = customer.policies.all()
+
+    if request.method == 'POST':
+        import uuid
+        claim_number = request.form.get('claim_number') or f"CLM-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:4].upper()}"
+        policy_id = request.form.get('policy_id', type=int) or None
+        claim = Claim(
+            customer_id=customer_id,
+            policy_id=policy_id,
+            claim_number=claim_number,
+            claim_type=request.form.get('claim_type'),
+            description=request.form.get('description') or None,
+            status=request.form.get('status', 'submitted'),
+            amount_claimed=request.form.get('amount_claimed', type=float) or None,
+        )
+        db.session.add(claim)
+        db.session.commit()
+        flash(f'Claim {claim.claim_number} filed successfully', 'success')
+        return redirect(url_for('admin.customer_detail', customer_id=customer_id))
+
+    claim_types = ['motor_accident', 'theft', 'medical', 'life', 'fire', 'travel', 'other']
+    statuses = ['submitted', 'under_review', 'awaiting_documents', 'approved', 'rejected', 'paid', 'closed']
+    return render_template('admin/create_claim_form.html',
+                           customer=customer,
+                           policies=policies,
+                           claim_types=claim_types,
+                           statuses=statuses)
+
+
+@admin_bp.route('/customers/<int:customer_id>/tickets/create', methods=['GET', 'POST'])
+@login_required
+def create_ticket(customer_id):
+    """Manually create a support ticket for a customer."""
+    customer = Customer.query.get_or_404(customer_id)
+    departments = Department.query.filter_by(is_active=True).all()
+
+    if request.method == 'POST':
+        ticket = Ticket(
+            customer_id=customer_id,
+            ticket_number=Ticket.generate_ticket_number(),
+            subject=request.form.get('subject'),
+            description=request.form.get('description') or None,
+            category=request.form.get('category', 'general'),
+            priority=request.form.get('priority', 'normal'),
+            status=request.form.get('status', 'open'),
+            assigned_department_id=request.form.get('assigned_department_id', type=int) or None,
+            is_ai_generated=False,
+        )
+        db.session.add(ticket)
+        db.session.commit()
+        flash(f'Ticket {ticket.ticket_number} created successfully', 'success')
+        return redirect(url_for('admin.customer_detail', customer_id=customer_id))
+
+    categories = ['claims', 'billing', 'policy', 'complaint', 'callback_request', 'general']
+    priorities = ['low', 'normal', 'high', 'urgent']
+    statuses = ['open', 'in_progress', 'resolved', 'closed']
+    return render_template('admin/create_ticket_form.html',
+                           customer=customer,
+                           departments=departments,
+                           categories=categories,
+                           priorities=priorities,
+                           statuses=statuses)
+
+
+@admin_bp.route('/api/tickets/recent')
+@login_required
+def api_recent_tickets():
+    """Lightweight JSON feed — e.g. for a dashboard widget showing the latest
+    AI-generated tickets that need human review."""
+    recent = (Ticket.query
+              .filter_by(is_ai_generated=True)
+              .order_by(desc(Ticket.created_at))
+              .limit(10)
+              .all())
+    return jsonify({
+        'tickets': [
+            {
+                'ticket_number': t.ticket_number,
+                'subject': t.subject,
+                'category': t.category,
+                'priority': t.priority,
+                'status': t.status,
+                'customer_name': t.customer.full_name if t.customer else None,
+                'created_at': t.created_at.isoformat(),
+            }
+            for t in recent
+        ]
+    })

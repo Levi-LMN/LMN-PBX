@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+
+{% block title %}Add Customer - FreePBX AI Assistant{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1 class="page-title">Add Customer</h1>
+    <p class="page-subtitle">Register a policyholder so the AI can recognise their number on calls</p>
+</div>
+
+<div class="row">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <i class="fas fa-id-card"></i> Customer Information
+            </div>
+            <div class="card-body">
+                <form method="POST">
+                    <div class="mb-4">
+                        <label for="full_name" class="form-label" style="font-weight: 600;">Full Name</label>
+                        <input type="text" class="form-control" id="full_name" name="full_name"
+                               required
+                               style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="phone_number" class="form-label" style="font-weight: 600;">Phone Number</label>
+                        <input type="text" class="form-control" id="phone_number" name="phone_number"
+                               placeholder="+2547XXXXXXXX" required
+                               style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                        <div class="form-text">Used to match this customer when they call in — any format works (07.., 254.., +254..)</div>
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="email" class="form-label" style="font-weight: 600;">Email</label>
+                        <input type="email" class="form-control" id="email" name="email"
+                               style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="national_id" class="form-label" style="font-weight: 600;">National ID</label>
+                        <input type="text" class="form-control" id="national_id" name="national_id"
+                               style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                    </div>
+
+                    <div class="d-flex gap-2">
+                        <button type="submit" class="btn btn-primary">
+                            <i class="fas fa-save"></i> Create Customer
+                        </button>
+                        <a href="{{ url_for('admin.customers') }}" class="btn btn-outline-secondary">
+                            <i class="fas fa-times"></i> Cancel
+                        </a>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-4">
+        <div class="card" style="background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%); border: none;">
+            <div class="card-body">
+                <h5 style="font-weight: 700; margin-bottom: 1rem; color: #1e40af;">
+                    <i class="fas fa-info-circle"></i> Why this matters
+                </h5>
+                <p style="font-size: 0.85rem; color: #1e40af; line-height: 1.7; margin: 0;">
+                    When this customer calls the Jubilee line, Ari looks up their phone number
+                    and automatically pulls in their active policies, open claims, and any
+                    support tickets — so the caller doesn't have to repeat themselves.
+                </p>
+                <p style="font-size: 0.85rem; color: #1e40af; line-height: 1.7; margin-top: 0.75rem;">
+                    Policies and claims can be added once the customer record is created.
+                </p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+
+{% block title %}Customers - FreePBX AI Assistant{% endblock %}
+
+{% block content %}
+<div class="page-header d-flex justify-content-between align-items-center">
+    <div>
+        <h1 class="page-title">Customers</h1>
+        <p class="page-subtitle">Policyholders the AI can recognise by phone number</p>
+    </div>
+    <a href="{{ url_for('admin.create_customer') }}" class="btn btn-primary">
+        <i class="fas fa-plus"></i> Add Customer
+    </a>
+</div>
+
+<div class="card" style="margin-bottom: 1.25rem;">
+    <div class="card-body" style="padding: 1rem 1.25rem;">
+        <form method="GET" class="d-flex gap-2">
+            <div class="search-box" style="width: 100%; max-width: 360px;">
+                <i class="fas fa-search"></i>
+                <input type="text" name="q" value="{{ search }}"
+                       placeholder="Search by name or phone number...">
+            </div>
+            <button type="submit" class="btn btn-outline-primary">Search</button>
+            {% if search %}
+            <a href="{{ url_for('admin.customers') }}" class="btn btn-outline-secondary">Clear</a>
+            {% endif %}
+        </form>
+    </div>
+</div>
+
+{% if customers %}
+<div class="row g-3">
+    {% for customer in customers %}
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-body">
+                <div class="d-flex align-items-start gap-3">
+                    <div style="width: 56px; height: 56px; border-radius: 14px; background: linear-gradient(135deg, var(--primary-color), var(--primary-light)); display: flex; align-items: center; justify-content: center; color: white; font-weight: 700; font-size: 1.3rem; flex-shrink: 0;">
+                        {{ customer.full_name[0].upper() }}
+                    </div>
+
+                    <div style="flex: 1; min-width: 0;">
+                        <div class="d-flex justify-content-between align-items-start mb-2">
+                            <div>
+                                <h5 style="font-weight: 700; margin-bottom: 0.25rem; color: var(--text-primary);">
+                                    {{ customer.full_name }}
+                                </h5>
+                                <p style="color: var(--text-secondary); font-size: 0.85rem; margin: 0;">
+                                    <i class="fas fa-phone" style="font-size: 0.7rem;"></i> {{ customer.phone_number }}
+                                </p>
+                            </div>
+                            {% if customer.is_active %}
+                                <span class="badge bg-success">Active</span>
+                            {% else %}
+                                <span class="badge bg-secondary">Inactive</span>
+                            {% endif %}
+                        </div>
+
+                        <div class="d-flex gap-2 mb-3 flex-wrap">
+                            <span class="badge" style="background: #dbeafe; color: #1e40af;">
+                                <i class="fas fa-file-contract"></i> {{ customer.policies.count() }} polic{{ 'y' if customer.policies.count() == 1 else 'ies' }}
+                            </span>
+                            <span class="badge" style="background: #fef3c7; color: #92400e;">
+                                <i class="fas fa-file-medical"></i> {{ customer.claims.count() }} claim{{ '' if customer.claims.count() == 1 else 's' }}
+                            </span>
+                            <span class="badge" style="background: #fee2e2; color: #991b1b;">
+                                <i class="fas fa-ticket-alt"></i> {{ customer.tickets.count() }} ticket{{ '' if customer.tickets.count() == 1 else 's' }}
+                            </span>
+                        </div>
+
+                        <div class="d-flex gap-2">
+                            <a href="{{ url_for('admin.customer_detail', customer_id=customer.id) }}"
+                               class="btn btn-sm btn-outline-primary">
+                                <i class="fas fa-eye"></i> View Profile
+                            </a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<div class="card">
+    <div class="card-body text-center py-5">
+        <div style="width: 100px; height: 100px; background: linear-gradient(135deg, var(--primary-color), var(--primary-light)); border-radius: 24px; display: flex; align-items: center; justify-content: center; margin: 0 auto 1.5rem;">
+            <i class="fas fa-id-card fa-3x text-white"></i>
+        </div>
+        <h3 style="font-weight: 700; margin-bottom: 0.5rem;">
+            {% if search %}No matching customers{% else %}No Customers Yet{% endif %}
+        </h3>
+        <p style="color: var(--text-secondary); margin-bottom: 1.5rem;">
+            {% if search %}
+                Try a different name or phone number.
+            {% else %}
+                Add a customer so the AI can recognise their number on inbound calls.
+            {% endif %}
+        </p>
+        <a href="{{ url_for('admin.create_customer') }}" class="btn btn-primary">
+            <i class="fas fa-plus"></i> Add First Customer
+        </a>
+    </div>
+</div>
+{% endif %}
+{% endblock %}

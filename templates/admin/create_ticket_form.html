@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+
+{% block title %}Create Ticket — {{ customer.full_name }} - FreePBX AI Assistant{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1 class="page-title">Create Support Ticket</h1>
+    <p class="page-subtitle">For {{ customer.full_name }} · {{ customer.phone_number }}</p>
+</div>
+
+<div class="row">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <i class="fas fa-ticket-alt"></i> Ticket Details
+            </div>
+            <div class="card-body">
+                <form method="POST">
+                    <div class="mb-4">
+                        <label for="subject" class="form-label" style="font-weight: 600;">Subject</label>
+                        <input type="text" class="form-control" id="subject" name="subject" required
+                               placeholder="Brief summary of the issue…"
+                               style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-6 mb-4">
+                            <label for="category" class="form-label" style="font-weight: 600;">Category</label>
+                            <select class="form-select" id="category" name="category"
+                                    style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                                {% for c in categories %}
+                                <option value="{{ c }}">{{ c.replace('_', ' ')|capitalize }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div class="col-md-6 mb-4">
+                            <label for="priority" class="form-label" style="font-weight: 600;">Priority</label>
+                            <select class="form-select" id="priority" name="priority"
+                                    style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                                {% for p in priorities %}
+                                <option value="{{ p }}" {% if p == 'normal' %}selected{% endif %}>{{ p|capitalize }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="status" class="form-label" style="font-weight: 600;">Status</label>
+                        <select class="form-select" id="status" name="status"
+                                style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                            {% for s in statuses %}
+                            <option value="{{ s }}" {% if s == 'open' %}selected{% endif %}>{{ s.replace('_',' ')|capitalize }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+
+                    {% if departments %}
+                    <div class="mb-4">
+                        <label for="assigned_department_id" class="form-label" style="font-weight: 600;">Assign to Department</label>
+                        <select class="form-select" id="assigned_department_id" name="assigned_department_id"
+                                style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                            <option value="">Unassigned</option>
+                            {% for dept in departments %}
+                            <option value="{{ dept.id }}">{{ dept.name }} (ext {{ dept.extension }})</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    {% endif %}
+
+                    <div class="mb-4">
+                        <label for="description" class="form-label" style="font-weight: 600;">Description</label>
+                        <textarea class="form-control" id="description" name="description" rows="4"
+                                  placeholder="Full details of the issue…"
+                                  style="border-radius: 12px; border: 2px solid #e5e7eb;"></textarea>
+                    </div>
+
+                    <div class="d-flex gap-2">
+                        <button type="submit" class="btn btn-primary">
+                            <i class="fas fa-save"></i> Create Ticket
+                        </button>
+                        <a href="{{ url_for('admin.customer_detail', customer_id=customer.id) }}" class="btn btn-outline-secondary">
+                            <i class="fas fa-times"></i> Cancel
+                        </a>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-4">
+        <div class="card" style="background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%); border: none;">
+            <div class="card-body">
+                <h5 style="font-weight: 700; margin-bottom: 1rem; color: #991b1b;">
+                    <i class="fas fa-info-circle"></i> About Tickets
+                </h5>
+                <p style="font-size: 0.85rem; color: #991b1b; line-height: 1.7; margin: 0;">
+                    Staff-created tickets are tracked separately from AI-raised ones.
+                    Assigning a department makes it easy to route the follow-up to the right team.
+                </p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

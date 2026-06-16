@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+
+{% block title %}Add Policy — {{ customer.full_name }} - FreePBX AI Assistant{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1 class="page-title">Add Policy</h1>
+    <p class="page-subtitle">For {{ customer.full_name }} · {{ customer.phone_number }}</p>
+</div>
+
+<div class="row">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <i class="fas fa-file-contract"></i> Policy Details
+            </div>
+            <div class="card-body">
+                <form method="POST">
+                    <div class="mb-4">
+                        <label for="policy_number" class="form-label" style="font-weight: 600;">Policy Number</label>
+                        <input type="text" class="form-control" id="policy_number" name="policy_number"
+                               placeholder="Leave blank to auto-generate"
+                               style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                        <div class="form-text">e.g. POL-20260617-A3F2 — auto-generated if left blank</div>
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="policy_type" class="form-label" style="font-weight: 600;">Policy Type</label>
+                        <select class="form-select" id="policy_type" name="policy_type" required
+                                style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                            <option value="" disabled selected>Select type…</option>
+                            {% for t in policy_types %}
+                            <option value="{{ t }}" style="text-transform: capitalize;">{{ t.replace('_', ' ')|capitalize }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="status" class="form-label" style="font-weight: 600;">Status</label>
+                        <select class="form-select" id="status" name="status"
+                                style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                            {% for s in statuses %}
+                            <option value="{{ s }}" {% if s == 'active' %}selected{% endif %}>{{ s|capitalize }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-6 mb-4">
+                            <label for="premium_amount" class="form-label" style="font-weight: 600;">Premium Amount (KES)</label>
+                            <input type="number" step="0.01" class="form-control" id="premium_amount" name="premium_amount"
+                                   style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                        </div>
+                        <div class="col-md-6 mb-4">
+                            <label for="premium_frequency" class="form-label" style="font-weight: 600;">Frequency</label>
+                            <select class="form-select" id="premium_frequency" name="premium_frequency"
+                                    style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                                <option value="">— Select —</option>
+                                {% for f in frequencies %}
+                                <option value="{{ f }}">{{ f|capitalize }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-6 mb-4">
+                            <label for="start_date" class="form-label" style="font-weight: 600;">Start Date</label>
+                            <input type="date" class="form-control" id="start_date" name="start_date"
+                                   style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                        </div>
+                        <div class="col-md-6 mb-4">
+                            <label for="renewal_date" class="form-label" style="font-weight: 600;">Renewal Date</label>
+                            <input type="date" class="form-control" id="renewal_date" name="renewal_date"
+                                   style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                        </div>
+                    </div>
+
+                    <div class="d-flex gap-2">
+                        <button type="submit" class="btn btn-primary">
+                            <i class="fas fa-save"></i> Add Policy
+                        </button>
+                        <a href="{{ url_for('admin.customer_detail', customer_id=customer.id) }}" class="btn btn-outline-secondary">
+                            <i class="fas fa-times"></i> Cancel
+                        </a>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-4">
+        <div class="card" style="background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%); border: none;">
+            <div class="card-body">
+                <h5 style="font-weight: 700; margin-bottom: 1rem; color: #1e40af;">
+                    <i class="fas fa-info-circle"></i> About Policies
+                </h5>
+                <p style="font-size: 0.85rem; color: #1e40af; line-height: 1.7; margin: 0;">
+                    Active policies are surfaced to Ari when this customer calls in — 
+                    Ari will reference them by type and number without the caller needing to quote anything.
+                </p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

@@ -237,19 +237,20 @@ class ARIAgent:
             return
 
         rtp_port = await self._alloc_rtp_port()
-        prompt   = self.system_prompt + self._load_kb()
+        prompt   = self.system_prompt + self._load_kb() + self._load_caller_context(caller)
 
         sess = CallSession(
-            channel       = channel,
-            ari_client    = self.ari_client,
-            ari_app       = self.ari_app,
-            azure_ws_url  = _azure_ws_url(self.azure_resource),
-            azure_api_key = self.azure_api_key,
-            voice_name    = self.azure_voice_name,
-            voice_type    = self.azure_voice_type,
-            system_prompt = prompt,
-            rtp_port      = rtp_port,
-            flask_app     = self.flask_app,
+            channel        = channel,
+            ari_client     = self.ari_client,
+            ari_app        = self.ari_app,
+            azure_ws_url   = _azure_ws_url(self.azure_resource),
+            azure_api_key  = self.azure_api_key,
+            voice_name     = self.azure_voice_name,
+            voice_type     = self.azure_voice_type,
+            system_prompt  = prompt,
+            rtp_port       = rtp_port,
+            flask_app      = self.flask_app,
+            caller_number  = caller,
         )
 
         self.active_calls[cid] = sess
@@ -299,6 +300,72 @@ class ARIAgent:
                 return "\n".join(parts)
         except Exception as e:
             logger.error(f"KB load error: {e}")
+            return ""
+
+    # ── Caller context (customer / claims / tickets lookup) ──────────────────
+
+    def _load_caller_context(self, caller_number: str) -> str:
+        """
+        Look up the caller by phone number and build a short context block
+        the AI can reference — existing policies, open claims, open tickets.
+        Returns "" if no flask_app, no match, or unknown caller ID.
+        """
+        if not self.flask_app or not caller_number or caller_number == "Unknown":
+            return ""
+        try:
+            with self.flask_app.app_context():
+                from models import Customer
+                customer = Customer.find_by_phone(caller_number)
+                if not customer:
+                    logger.info(f"👤 Caller {caller_number} not found in customer records")
+                    return (
+                        "\n\nCALLER CONTEXT:\nThis caller's number is not linked to an "
+                        "existing customer record. Do not claim to know their policy "
+                        "or claim details — ask for their name and policy number if needed."
+                    )
+
+                ctx = customer.to_context_dict()
+                logger.info(f"👤 Caller matched: {ctx['name']} "
+                            f"({len(ctx['open_claims'])} open claims, "
+                            f"{len(ctx['open_tickets'])} open tickets)")
+
+                parts = [f"\n\nCALLER CONTEXT:\nThis caller is {ctx['name']}, "
+                         f"an existing customer. Greet them by first name after they "
+                         f"confirm identity, but do not blurt out personal details unprompted."]
+
+                if ctx["policies"]:
+                    pol_lines = ", ".join(
+                        f"{p['type']} policy {p['number']} ({p['status']})"
+                        for p in ctx["policies"]
+                    )
+                    parts.append(f"Active policies: {pol_lines}.")
+
+                if ctx["open_claims"]:
+                    claim_lines = "; ".join(
+                        f"{c['claim_number']} ({c['type']}, status: {c['status']}, "
+                        f"filed {c['filed']})"
+                        for c in ctx["open_claims"]
+                    )
+                    parts.append(f"Open claims: {claim_lines}.")
+                else:
+                    parts.append("No open claims on file.")
+
+                if ctx["open_tickets"]:
+                    ticket_lines = "; ".join(
+                        f"{t['ticket_number']} — {t['subject']} (status: {t['status']})"
+                        for t in ctx["open_tickets"]
+                    )
+                    parts.append(f"Open support tickets: {ticket_lines}.")
+
+                parts.append(
+                    "If they ask about a claim or ticket status, use the information "
+                    "above. If they ask about something not listed here, say you don't "
+                    "have that on file rather than guessing."
+                )
+                return "\n".join(parts)
+
+        except Exception as e:
+            logger.error(f"Caller context lookup error: {e}")
             return ""
 
     # ── DB helpers ────────────────────────────────────────────────────────────
@@ -390,7 +457,7 @@ class CallSession:
 
     def __init__(self, *, channel, ari_client, ari_app, azure_ws_url,
                  azure_api_key, voice_name, voice_type, system_prompt,
-                 rtp_port, flask_app):
+                 rtp_port, flask_app, caller_number=None):
         self.channel        = channel
         self.channel_id     = channel.id
         self.ari_client     = ari_client
@@ -402,6 +469,8 @@ class CallSession:
         self.system_prompt  = system_prompt
         self.rtp_port       = rtp_port
         self.flask_app      = flask_app
+        self.caller_number  = caller_number
+        self._customer_id   = None  # resolved lazily on first ticket creation
 
         self.caller_hung_up     = False
         self.escalated          = False
@@ -542,6 +611,49 @@ class CallSession:
                     "create_response":     True,
                 },
                 "temperature": 0.7,
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "create_ticket",
+                        "description": (
+                            "Log a support ticket / issue for this caller. Use this when "
+                            "the caller wants something tracked or followed up on but does "
+                            "NOT explicitly ask to be transferred to a person right now — "
+                            "e.g. a callback request, a billing dispute, a complaint, or "
+                            "asking someone to look into a delayed claim. Confirm back to "
+                            "the caller in one short sentence that you've logged it, "
+                            "including you'll mention it's noted, after calling this."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "subject": {
+                                    "type": "string",
+                                    "description": "Short one-line summary of the issue, "
+                                                    "e.g. 'Requesting callback about delayed motor claim'.",
+                                },
+                                "description": {
+                                    "type": "string",
+                                    "description": "Fuller detail from the conversation: what "
+                                                    "the caller said, any reference numbers mentioned.",
+                                },
+                                "category": {
+                                    "type": "string",
+                                    "enum": ["claims", "billing", "policy", "complaint",
+                                             "callback_request", "general"],
+                                },
+                                "priority": {
+                                    "type": "string",
+                                    "enum": ["low", "normal", "high", "urgent"],
+                                    "description": "urgent/high only if caller signals real "
+                                                    "distress or a time-critical issue.",
+                                },
+                            },
+                            "required": ["subject", "category"],
+                        },
+                    },
+                ],
+                "tool_choice": "auto",
             },
         }))
         logger.info(f"⚙️  [{self.channel_id[:12]}] Session config sent")
@@ -694,8 +806,103 @@ class CallSession:
         elif etype == "error":
             logger.error(f"❌ Azure error: {event.get('error', event)}")
 
+        elif etype == "response.function_call_arguments.done":
+            await self._handle_function_call(event)
+
         # All other events (response.created, response.done, content_part.*, etc.)
         # are silently ignored — we only care about the ones above.
+
+    async def _handle_function_call(self, event: dict):
+        """Azure Voice Live signals a completed function call — dispatch it,
+        then send the result back so the model can continue the turn."""
+        name      = event.get("name", "")
+        call_id   = event.get("call_id", "")
+        raw_args  = event.get("arguments", "{}")
+
+        try:
+            args = json.loads(raw_args) if raw_args else {}
+        except json.JSONDecodeError:
+            args = {}
+
+        if name == "create_ticket":
+            result = self._create_ai_ticket(args)
+        else:
+            result = {"error": f"Unknown function: {name}"}
+
+        if not _ws_open(self._azure_ws):
+            return
+        try:
+            await self._azure_ws.send(json.dumps({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": json.dumps(result),
+                },
+            }))
+            await self._azure_ws.send(json.dumps({"type": "response.create"}))
+        except Exception as e:
+            logger.error(f"Function call result send error: {e}")
+
+    def _create_ai_ticket(self, args: dict) -> dict:
+        """Create a Ticket row flagged is_ai_generated=True, linked to this
+        call and (if resolvable) the calling customer."""
+        if not self.flask_app:
+            return {"error": "Ticketing unavailable in this environment"}
+
+        subject     = (args.get("subject") or "Issue raised during AI call").strip()
+        description = (args.get("description") or "").strip()
+        category    = args.get("category", "general")
+        priority    = args.get("priority", "normal")
+
+        try:
+            with self.flask_app.app_context():
+                from models import db, Customer, Ticket, Call
+
+                customer = None
+                if self.caller_number:
+                    customer = Customer.find_by_phone(self.caller_number)
+
+                call = Call.query.filter_by(call_id=self.channel_id).first()
+
+                if not customer:
+                    # No matching customer record — still log the ticket so nothing
+                    # is lost, but make that obvious to whoever reviews it.
+                    logger.warning(
+                        f"🎫 [{self.channel_id[:12]}] create_ticket with no matched "
+                        f"customer (caller={self.caller_number}) — ticket unlinked"
+                    )
+                    return {"error": "No customer record found for this caller number; "
+                                      "ask for their full name and policy number, then "
+                                      "let them know an agent will follow up."}
+
+                ticket = Ticket(
+                    customer_id            = customer.id,
+                    call_id                = call.id if call else None,
+                    ticket_number          = Ticket.generate_ticket_number(),
+                    subject                = subject,
+                    description            = description,
+                    category               = category,
+                    priority               = priority,
+                    status                 = "open",
+                    is_ai_generated        = True,
+                )
+                db.session.add(ticket)
+                db.session.commit()
+
+                logger.info(f"🎫 [{self.channel_id[:12]}] AI created ticket "
+                            f"{ticket.ticket_number} for {customer.full_name} "
+                            f"({category}/{priority})")
+
+                return {
+                    "success": True,
+                    "ticket_number": ticket.ticket_number,
+                    "message": f"Ticket {ticket.ticket_number} logged for {customer.full_name}.",
+                }
+
+        except Exception as e:
+            logger.error(f"create_ticket error: {e}")
+            return {"error": "Failed to log ticket"}
 
     # ── RTP send: Asterisk ← Azure queue ─────────────────────────────────────
 

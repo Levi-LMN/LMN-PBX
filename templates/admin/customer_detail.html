@@ -1,0 +1,237 @@
+{% extends "base.html" %}
+
+{% block title %}{{ customer.full_name }} - FreePBX AI Assistant{% endblock %}
+
+{% block content %}
+<div class="page-header d-flex justify-content-between align-items-start">
+    <div class="d-flex align-items-start gap-3">
+        <div style="width: 64px; height: 64px; border-radius: 16px; background: linear-gradient(135deg, var(--primary-color), var(--primary-light)); display: flex; align-items: center; justify-content: center; color: white; font-weight: 700; font-size: 1.6rem; flex-shrink: 0;">
+            {{ customer.full_name[0].upper() }}
+        </div>
+        <div>
+            <h1 class="page-title" style="margin-bottom: 0.2rem;">{{ customer.full_name }}</h1>
+            <p class="page-subtitle" style="margin-bottom: 0.3rem;">
+                <i class="fas fa-phone" style="font-size: 0.7rem;"></i> {{ customer.phone_number }}
+                {% if customer.email %} &nbsp;·&nbsp; <i class="fas fa-envelope" style="font-size: 0.7rem;"></i> {{ customer.email }}{% endif %}
+            </p>
+            {% if customer.is_active %}
+                <span class="badge bg-success">Active</span>
+            {% else %}
+                <span class="badge bg-secondary">Inactive</span>
+            {% endif %}
+            {% if customer.customer_since %}
+            <span style="font-size: 0.75rem; color: var(--text-secondary); margin-left: 0.5rem;">
+                Customer since {{ customer.customer_since.strftime('%Y-%m-%d') }}
+            </span>
+            {% endif %}
+        </div>
+    </div>
+    <a href="{{ url_for('admin.customers') }}" class="btn btn-outline-secondary">
+        <i class="fas fa-arrow-left"></i> Back
+    </a>
+</div>
+
+<!-- Policies -->
+<div class="card" style="margin-bottom: 1.25rem;">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="fas fa-file-contract"></i> Policies</span>
+        <div class="d-flex align-items-center gap-2">
+            <span class="badge" style="background: #dbeafe; color: #1e40af;">{{ policies|length }}</span>
+            <a href="{{ url_for('admin.create_policy', customer_id=customer.id) }}" class="btn btn-sm btn-primary">
+                <i class="fas fa-plus"></i> Add Policy
+            </a>
+        </div>
+    </div>
+    <div class="card-body" style="padding: 0;">
+        {% if policies %}
+        <table class="table" style="margin: 0;">
+            <thead>
+                <tr>
+                    <th>Policy Number</th>
+                    <th>Type</th>
+                    <th>Status</th>
+                    <th>Premium</th>
+                    <th>Renewal</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for policy in policies %}
+                <tr>
+                    <td style="font-weight: 600;">{{ policy.policy_number }}</td>
+                    <td style="text-transform: capitalize;">{{ policy.policy_type.replace('_', ' ') }}</td>
+                    <td>
+                        {% if policy.status == 'active' %}
+                            <span class="badge bg-success">Active</span>
+                        {% elif policy.status == 'lapsed' %}
+                            <span class="badge" style="background: #fef3c7; color: #92400e;">Lapsed</span>
+                        {% elif policy.status == 'cancelled' %}
+                            <span class="badge bg-secondary">Cancelled</span>
+                        {% else %}
+                            <span class="badge" style="background: #e5e7eb; color: #374151;">{{ policy.status|capitalize }}</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if policy.premium_amount %}
+                            KES {{ '{:,.0f}'.format(policy.premium_amount) }} / {{ policy.premium_frequency or '—' }}
+                        {% else %}—{% endif %}
+                    </td>
+                    <td>{{ policy.renewal_date.strftime('%Y-%m-%d') if policy.renewal_date else '—' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="text-center py-4" style="color: var(--text-secondary); font-size: 0.85rem;">
+            No policies on file for this customer.
+        </div>
+        {% endif %}
+    </div>
+</div>
+
+<!-- Claims -->
+<div class="card" style="margin-bottom: 1.25rem;">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="fas fa-file-medical"></i> Claims</span>
+        <div class="d-flex align-items-center gap-2">
+            <span class="badge" style="background: #fef3c7; color: #92400e;">{{ claims|length }}</span>
+            <a href="{{ url_for('admin.create_claim', customer_id=customer.id) }}" class="btn btn-sm btn-primary">
+                <i class="fas fa-plus"></i> Add Claim
+            </a>
+        </div>
+    </div>
+    <div class="card-body" style="padding: 0;">
+        {% if claims %}
+        <table class="table" style="margin: 0;">
+            <thead>
+                <tr>
+                    <th>Claim Number</th>
+                    <th>Type</th>
+                    <th>Status</th>
+                    <th>Filed</th>
+                    <th>Amount</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for claim in claims %}
+                <tr>
+                    <td style="font-weight: 600;">{{ claim.claim_number }}</td>
+                    <td style="text-transform: capitalize;">{{ claim.claim_type.replace('_', ' ') }}</td>
+                    <td>
+                        {% if claim.status in ['approved', 'paid'] %}
+                            <span class="badge bg-success">{{ claim.status|capitalize }}</span>
+                        {% elif claim.status == 'rejected' %}
+                            <span class="badge bg-danger">Rejected</span>
+                        {% elif claim.status in ['under_review', 'awaiting_documents'] %}
+                            <span class="badge" style="background: #fef3c7; color: #92400e;">{{ claim.status.replace('_', ' ')|capitalize }}</span>
+                        {% else %}
+                            <span class="badge" style="background: #e5e7eb; color: #374151;">{{ claim.status.replace('_', ' ')|capitalize }}</span>
+                        {% endif %}
+                    </td>
+                    <td>{{ claim.filed_at.strftime('%Y-%m-%d') if claim.filed_at else '—' }}</td>
+                    <td>
+                        {% if claim.amount_claimed %}KES {{ '{:,.0f}'.format(claim.amount_claimed) }}{% else %}—{% endif %}
+                    </td>
+                    <td>
+                        <a href="{{ url_for('admin.edit_claim', claim_id=claim.id) }}"
+                           class="btn btn-sm btn-outline-primary">
+                            <i class="fas fa-edit"></i> Update
+                        </a>
+                    </td>
+                </tr>
+                {% if claim.last_update_note %}
+                <tr>
+                    <td colspan="6" style="border-top: none; padding-top: 0; font-size: 0.78rem; color: var(--text-secondary);">
+                        <i class="fas fa-comment-dots" style="font-size: 0.7rem;"></i> {{ claim.last_update_note }}
+                    </td>
+                </tr>
+                {% endif %}
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="text-center py-4" style="color: var(--text-secondary); font-size: 0.85rem;">
+            No claims on file for this customer.
+        </div>
+        {% endif %}
+    </div>
+</div>
+
+<!-- Tickets -->
+<div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="fas fa-ticket-alt"></i> Support Tickets</span>
+        <div class="d-flex align-items-center gap-2">
+            <span class="badge" style="background: #fee2e2; color: #991b1b;">{{ tickets|length }}</span>
+            <a href="{{ url_for('admin.create_ticket', customer_id=customer.id) }}" class="btn btn-sm btn-primary">
+                <i class="fas fa-plus"></i> Add Ticket
+            </a>
+        </div>
+    </div>
+    <div class="card-body" style="padding: 0;">
+        {% if tickets %}
+        <table class="table" style="margin: 0;">
+            <thead>
+                <tr>
+                    <th>Ticket</th>
+                    <th>Subject</th>
+                    <th>Category</th>
+                    <th>Priority</th>
+                    <th>Status</th>
+                    <th>Source</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for ticket in tickets %}
+                <tr>
+                    <td style="font-weight: 600;">{{ ticket.ticket_number }}</td>
+                    <td>{{ ticket.subject }}</td>
+                    <td style="text-transform: capitalize;">{{ ticket.category.replace('_', ' ') }}</td>
+                    <td>
+                        {% if ticket.priority == 'urgent' %}
+                            <span class="badge bg-danger">Urgent</span>
+                        {% elif ticket.priority == 'high' %}
+                            <span class="badge" style="background: #fef3c7; color: #92400e;">High</span>
+                        {% else %}
+                            <span class="badge" style="background: #e5e7eb; color: #374151;">{{ ticket.priority|capitalize }}</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if ticket.status == 'open' %}
+                            <span class="badge bg-success">Open</span>
+                        {% elif ticket.status == 'in_progress' %}
+                            <span class="badge" style="background: #dbeafe; color: #1e40af;">In Progress</span>
+                        {% else %}
+                            <span class="badge bg-secondary">{{ ticket.status.replace('_', ' ')|capitalize }}</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if ticket.is_ai_generated %}
+                            <span class="badge" style="background: #ede9fe; color: #5b21b6;">
+                                <i class="fas fa-robot"></i> AI
+                            </span>
+                        {% else %}
+                            <span class="badge" style="background: #f3f4f6; color: #374151;">
+                                <i class="fas fa-user"></i> Staff
+                            </span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <a href="{{ url_for('admin.edit_ticket', ticket_id=ticket.id) }}"
+                           class="btn btn-sm btn-outline-primary">
+                            <i class="fas fa-edit"></i> Update
+                        </a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="text-center py-4" style="color: var(--text-secondary); font-size: 0.85rem;">
+            No support tickets on file for this customer.
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

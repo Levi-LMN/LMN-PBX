@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+
+{% block title %}Update Ticket {{ ticket.ticket_number }} - FreePBX AI Assistant{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1 class="page-title">Update Ticket</h1>
+    <p class="page-subtitle">
+        {{ ticket.ticket_number }} — {{ ticket.customer.full_name if ticket.customer else 'Unknown customer' }}
+        {% if ticket.is_ai_generated %}
+        <span class="badge" style="background: #ede9fe; color: #5b21b6; margin-left: 0.5rem;">
+            <i class="fas fa-robot"></i> Raised by AI
+        </span>
+        {% endif %}
+    </p>
+</div>
+
+<div class="row">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <i class="fas fa-ticket-alt"></i> Ticket Details
+            </div>
+            <div class="card-body">
+                <div class="mb-4" style="background: #f9fafb; border-radius: 12px; padding: 1rem;">
+                    <div style="font-size: 0.75rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 0.4rem;">
+                        {{ ticket.subject }}
+                    </div>
+                    <p style="margin: 0; font-size: 0.85rem;">{{ ticket.description or 'No further detail on file.' }}</p>
+                    {% if ticket.call %}
+                    <div style="margin-top: 0.6rem; font-size: 0.75rem; color: var(--text-secondary);">
+                        <i class="fas fa-phone-alt"></i> Raised during call
+                        <a href="{{ url_for('admin.call_detail', call_id=ticket.call.id) }}">{{ ticket.call.call_id[:12] }}</a>
+                    </div>
+                    {% endif %}
+                </div>
+
+                <form method="POST">
+                    <div class="row">
+                        <div class="col-md-6 mb-4">
+                            <label for="status" class="form-label" style="font-weight: 600;">Status</label>
+                            <select class="form-select" id="status" name="status"
+                                    style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                                {% for s in statuses %}
+                                <option value="{{ s }}" {% if ticket.status == s %}selected{% endif %}>
+                                    {{ s.replace('_', ' ')|capitalize }}
+                                </option>
+                                {% endfor %}
+                            </select>
+                        </div>
+
+                        <div class="col-md-6 mb-4">
+                            <label for="priority" class="form-label" style="font-weight: 600;">Priority</label>
+                            <select class="form-select" id="priority" name="priority"
+                                    style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                                {% for p in priorities %}
+                                <option value="{{ p }}" {% if ticket.priority == p %}selected{% endif %}>
+                                    {{ p|capitalize }}
+                                </option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="assigned_department_id" class="form-label" style="font-weight: 600;">Assign to Department</label>
+                        <select class="form-select" id="assigned_department_id" name="assigned_department_id"
+                                style="border-radius: 12px; border: 2px solid #e5e7eb;">
+                            <option value="">Unassigned</option>
+                            {% for dept in departments %}
+                            <option value="{{ dept.id }}" {% if ticket.assigned_department_id == dept.id %}selected{% endif %}>
+                                {{ dept.name }} (ext {{ dept.extension }})
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+
+                    <div class="d-flex gap-2">
+                        <button type="submit" class="btn btn-primary">
+                            <i class="fas fa-save"></i> Save Update
+                        </button>
+                        <a href="{{ url_for('admin.tickets') }}" class="btn btn-outline-secondary">
+                            <i class="fas fa-times"></i> Cancel
+                        </a>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-4">
+        <div class="card" style="background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%); border: none;">
+            <div class="card-body">
+                <h5 style="font-weight: 700; margin-bottom: 1rem; color: #1e40af;">
+                    <i class="fas fa-info-circle"></i> Ticket Info
+                </h5>
+                <div style="font-size: 0.85rem; color: #1e40af; line-height: 1.8;">
+                    <div class="mb-2"><strong>Category:</strong> {{ ticket.category.replace('_', ' ')|capitalize }}</div>
+                    <div class="mb-2"><strong>Created:</strong> {{ ticket.created_at.strftime('%Y-%m-%d %H:%M') if ticket.created_at else '—' }}</div>
+                    {% if ticket.resolved_at %}
+                    <div><strong>Resolved:</strong> {{ ticket.resolved_at.strftime('%Y-%m-%d %H:%M') }}</div>
+                    {% endif %}
+                </div>
+                {% if ticket.is_ai_generated %}
+                <hr style="border-color: rgba(91, 33, 182, 0.2); margin: 1rem 0;">
+                <p style="font-size: 0.8rem; color: #1e40af; margin: 0;">
+                    <i class="fas fa-robot"></i> This was logged automatically by Ari during a live call
+                    and hasn't been reviewed by staff yet.
+                </p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

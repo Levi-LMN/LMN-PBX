@@ -12,6 +12,7 @@ from .user import User
 from .call import Call, CallTranscript, CallIntent
 from .department import Department, RoutingRule
 from .knowledge import KnowledgeBase
+from .customer import Customer, Policy, Claim, Ticket
 
 __all__ = [
     'db',
@@ -21,5 +22,9 @@ __all__ = [
     'CallIntent',
     'Department',
     'RoutingRule',
-    'KnowledgeBase'
+    'KnowledgeBase',
+    'Customer',
+    'Policy',
+    'Claim',
+    'Ticket',
 ]
