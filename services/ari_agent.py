@@ -63,6 +63,48 @@ RTP_END   = 20100
 GREETING_TEXT = "Thank you for calling Jubilee Insurance, how can I help?"
 GREETING_INSTRUCTIONS = f"Say ONLY: '{GREETING_TEXT}' — nothing else."
 
+# How long to suppress forwarding caller audio to Azure while cached greeting plays.
+# Cached greeting is ~2-3s; we suppress for 3.5s to avoid echo-cancellation confusion.
+GREETING_SUPPRESS_SECS = 3.5
+
+
+class _RTPProtocol(asyncio.DatagramProtocol):
+    """
+    Non-blocking asyncio UDP receiver for RTP.
+    Decodes μ-law → PCM16 inline and pushes to an asyncio.Queue.
+    Using a DatagramProtocol eliminates executor-thread overhead and
+    ensures every packet is captured without blocking the event loop.
+    """
+    def __init__(self, queue: asyncio.Queue, on_addr_discovered):
+        self._queue            = queue
+        self._on_addr          = on_addr_discovered
+        self._addr_seen        = False
+        self.transport         = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data: bytes, addr):
+        if not self._addr_seen:
+            self._addr_seen = True
+            self._on_addr(addr)
+
+        if len(data) <= RTP_HEADER_SIZE:
+            return
+        try:
+            pcm16 = audioop.ulaw2lin(data[RTP_HEADER_SIZE:], 2)
+        except audioop.error:
+            return
+
+        if not self._queue.full():
+            self._queue.put_nowait(pcm16)
+
+    def error_received(self, exc):
+        pass
+
+    def connection_lost(self, exc):
+        pass
+
 
 def _azure_ws_url(resource: str) -> str:
     return (
@@ -519,6 +561,12 @@ class CallSession:
         self._to_asterisk = asyncio.Queue(maxsize=500)
         self._ratecv_down = None   # 24kHz → 8kHz state
 
+        # Suppress forwarding caller audio to Azure while the cached greeting
+        # is playing — otherwise the greeting audio loops back as "caller speech"
+        # and confuses Azure's VAD / echo cancellation.
+        self._suppress_caller_audio = False
+        self._rtp_protocol: "_RTPProtocol | None" = None
+
     # ── Main run ──────────────────────────────────────────────────────────────
 
     async def run(self):
@@ -533,10 +581,11 @@ class CallSession:
             await bridge.addChannel(channel=self.channel_id)
             logger.info(f"🌉 [{self.channel_id[:12]}] Bridge: {self._bridge_id}")
 
-            # Bind UDP socket for RTP
+            # Bind UDP socket for RTP via asyncio DatagramProtocol (non-blocking)
+            loop = asyncio.get_running_loop()
             self._udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._udp_sock.bind((RTP_HOST, self.rtp_port))
-            self._udp_sock.settimeout(0.05)
+            self._udp_sock.setblocking(False)
             logger.info(f"🔌 [{self.channel_id[:12]}] RTP port {self.rtp_port}")
 
             # Create ExternalMedia channel
@@ -564,16 +613,33 @@ class CallSession:
                         raise
                     await asyncio.sleep(0.2)
 
-            # If greeting is already cached, play it via ARI while Azure connects
+            # If greeting is already cached, play it via ARI while Azure connects.
+            # We suppress forwarding caller audio to Azure for GREETING_SUPPRESS_SECS
+            # to prevent the greeting audio from looping back as "caller input" and
+            # confusing Azure's VAD / echo cancellation.
             if self._greeting_cached:
+                self._suppress_caller_audio = True
                 await self._play_cached_greeting()
+                asyncio.create_task(self._lift_audio_suppression())
+
+            # Register asyncio DatagramProtocol on the already-bound socket.
+            # This replaces the blocking executor-based recv loop — every RTP packet
+            # is now delivered to _RTPProtocol.datagram_received() without stalling
+            # the event loop.
+            loop = asyncio.get_running_loop()
+            transport, self._rtp_protocol = await loop.create_datagram_endpoint(
+                lambda: _RTPProtocol(
+                    queue             = self._to_azure,
+                    on_addr_discovered= self._on_asterisk_addr,
+                ),
+                sock=self._udp_sock,
+            )
 
             # Connect to Azure Voice Live
             await self._connect_azure()
 
-            # Run all loops concurrently
+            # Run all loops concurrently (recv loop is now handled by the protocol)
             await asyncio.gather(
-                self._rtp_recv_loop(),
                 self._rtp_send_loop(),
                 self._azure_recv_loop(),
                 self._azure_send_loop(),
@@ -589,13 +655,29 @@ class CallSession:
 
     # ── Greeting cache ────────────────────────────────────────────────────────
 
+    def _on_asterisk_addr(self, addr):
+        """Called by _RTPProtocol on the very first RTP packet from Asterisk."""
+        self._asterisk_addr = addr
+        logger.info(f"📻 [{self.channel_id[:12]}] Asterisk RTP: {addr[0]}:{addr[1]}")
+
+    async def _lift_audio_suppression(self):
+        """
+        After the cached greeting finishes, allow caller audio to flow to Azure.
+        We wait GREETING_SUPPRESS_SECS so the greeting has fully played out and
+        Azure's echo-cancellation is not confused by the greeting looping back.
+        """
+        await asyncio.sleep(GREETING_SUPPRESS_SECS)
+        self._suppress_caller_audio = False
+        logger.info(f"🎤 [{self.channel_id[:12]}] Caller audio suppression lifted — mic open")
+
     async def _play_cached_greeting(self):
         """
         Play the pre-recorded greeting via Asterisk ARI while Azure WS connects.
         Uses 'sound:custom/ari_greeting' — Asterisk resolves to the .ulaw file.
+        channel.play() is fire-and-forget (ARI queues it); we return immediately
+        so Azure connection can proceed in parallel.
         """
         try:
-            # Strip extension; Asterisk appends it based on codec negotiation
             sound_name = "custom/ari_greeting"
             await self.channel.play(media=f"sound:{sound_name}")
             logger.info(f"🔊 [{self.channel_id[:12]}] Playing cached greeting: {sound_name}")
@@ -714,36 +796,10 @@ class CallSession:
         logger.info(f"⚙️  [{self.channel_id[:12]}] Session config sent")
         logger.info(f"   Voice : {self.voice_name} | Audio in: PCM16 {AZURE_IN_RATE}Hz | VAD: semantic")
 
-    # ── RTP receive: Asterisk → Azure queue ───────────────────────────────────
-
-    async def _rtp_recv_loop(self):
-        loop = asyncio.get_running_loop()
-        while not self._closed:
-            try:
-                data, addr = await loop.run_in_executor(
-                    None, self._udp_sock.recvfrom, 4096
-                )
-            except OSError:
-                continue
-            except Exception as e:
-                if not self._closed:
-                    logger.debug(f"RTP recv: {e}")
-                break
-
-            if self._asterisk_addr is None:
-                self._asterisk_addr = addr
-                logger.info(f"📻 [{self.channel_id[:12]}] Asterisk RTP: {addr[0]}:{addr[1]}")
-
-            if len(data) <= RTP_HEADER_SIZE:
-                continue
-
-            try:
-                pcm16 = audioop.ulaw2lin(data[RTP_HEADER_SIZE:], 2)
-            except audioop.error:
-                continue
-
-            if not self._to_azure.full():
-                self._to_azure.put_nowait(pcm16)
+    # ── RTP receive: now handled by _RTPProtocol (asyncio DatagramProtocol) ───
+    # The old blocking executor-based loop is replaced. _RTPProtocol.datagram_received()
+    # fires for every packet without stalling the event loop, and calls
+    # _on_asterisk_addr() on the first packet to record the return address.
 
     # ── Azure send: queue → WebSocket ─────────────────────────────────────────
 
@@ -755,6 +811,11 @@ class CallSession:
                 continue
             except Exception:
                 break
+
+            # Drop caller audio while the cached greeting is still playing to
+            # prevent it from being fed back into Azure as "caller speech".
+            if self._suppress_caller_audio:
+                continue
 
             if not _ws_open(self._azure_ws):
                 break
@@ -1154,12 +1215,19 @@ class CallSession:
                 pass
             self._azure_ws = None
 
-        if self._udp_sock:
+        # Close the asyncio DatagramProtocol transport (closes the socket too)
+        if self._rtp_protocol and self._rtp_protocol.transport:
+            try:
+                self._rtp_protocol.transport.close()
+            except Exception:
+                pass
+            self._rtp_protocol = None
+        elif self._udp_sock:
             try:
                 self._udp_sock.close()
             except Exception:
                 pass
-            self._udp_sock = None
+        self._udp_sock = None
 
     async def close(self):
         if self._closed and self.escalated:
