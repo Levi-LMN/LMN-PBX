@@ -81,10 +81,47 @@
     <div class="col-md-8">
         <div class="card">
             <div class="card-header">
-                <i class="fas fa-chart-bar"></i> Call Analytics
+                <i class="fas fa-list"></i> Call Analytics
             </div>
             <div class="card-body">
-                <canvas id="callAnalyticsChart" height="80"></canvas>
+                <div class="row text-center g-3">
+                    <div class="col-4">
+                        <div class="stat-label">Total Calls</div>
+                        <div class="stat-value" style="font-size: 1.6rem;">{{ chart_data|sum }}</div>
+                    </div>
+                    <div class="col-4">
+                        <div class="stat-label">Daily Average</div>
+                        <div class="stat-value" style="font-size: 1.6rem;">{{ (chart_data|sum / chart_data|length)|round(1) if chart_data|length > 0 else 0 }}</div>
+                    </div>
+                    <div class="col-4">
+                        <div class="stat-label">Busiest Day</div>
+                        <div class="stat-value" style="font-size: 1.6rem;">{{ chart_data|max if chart_data|length > 0 else 0 }}</div>
+                    </div>
+                </div>
+                <div class="table-responsive mt-3">
+                    <table class="table mb-0">
+                        <thead>
+                            <tr>
+                                <th>Period</th>
+                                <th class="text-end">Calls</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% if chart_labels %}
+                                {% for label in chart_labels %}
+                                <tr>
+                                    <td>{{ label }}</td>
+                                    <td class="text-end"><span class="badge bg-primary">{{ chart_data[loop.index0] }}</span></td>
+                                </tr>
+                                {% endfor %}
+                            {% else %}
+                                <tr>
+                                    <td colspan="2" class="text-center text-muted">No call data available</td>
+                                </tr>
+                            {% endif %}
+                        </tbody>
+                    </table>
+                </div>
             </div>
         </div>
 
@@ -195,31 +232,26 @@
             <div class="card-header">
                 <i class="fas fa-tasks"></i> AI Performance
             </div>
-            <div class="card-body text-center">
-                <div style="position: relative; width: 200px; height: 200px; margin: 0 auto;">
-                    <svg viewBox="0 0 100 100">
-                        <circle cx="50" cy="50" r="40" fill="none" stroke="#f3f4f6" stroke-width="8"/>
-                        <circle cx="50" cy="50" r="40" fill="none" stroke="var(--primary-color)" stroke-width="8"
-                                stroke-dasharray="251.2" stroke-dashoffset="{{ 251.2 - (251.2 * ((total_calls - escalated_calls) / total_calls if total_calls > 0 else 0)) }}"
-                                transform="rotate(-90 50 50)" stroke-linecap="round"/>
-                    </svg>
-                    <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);">
-                        <div style="font-size: 2rem; font-weight: 700; color: var(--text-primary);">
-                            {{ ((total_calls - escalated_calls) / total_calls * 100)|round(0)|int if total_calls > 0 else 0 }}%
-                        </div>
-                        <div style="font-size: 0.75rem; color: var(--text-secondary);">Resolution Rate</div>
+            <div class="card-body">
+                <div class="text-center mb-3">
+                    <div style="font-size: 2.5rem; font-weight: 700; color: var(--text-primary);">
+                        {{ ((total_calls - escalated_calls) / total_calls * 100)|round(0)|int if total_calls > 0 else 0 }}%
                     </div>
+                    <div style="font-size: 0.8rem; color: var(--text-secondary);">Resolution Rate</div>
                 </div>
-
-                <div class="mt-4 d-flex justify-content-around" style="font-size: 0.85rem;">
-                    <div>
-                        <div style="width: 12px; height: 12px; border-radius: 50%; background: var(--primary-color); display: inline-block; margin-right: 0.5rem;"></div>
-                        <span class="text-muted">Resolved</span>
-                    </div>
-                    <div>
-                        <div style="width: 12px; height: 12px; border-radius: 50%; background: #fbbf24; display: inline-block; margin-right: 0.5rem;"></div>
-                        <span class="text-muted">Escalated</span>
-                    </div>
+                <div class="table-responsive">
+                    <table class="table mb-0">
+                        <tbody>
+                            <tr>
+                                <td>Resolved</td>
+                                <td class="text-end"><span class="badge bg-primary">{{ total_calls - escalated_calls }}</span></td>
+                            </tr>
+                            <tr>
+                                <td>Escalated</td>
+                                <td class="text-end"><span class="badge" style="background-color: #fbbf24;">{{ escalated_calls }}</span></td>
+                            </tr>
+                        </tbody>
+                    </table>
                 </div>
             </div>
         </div>
@@ -228,50 +260,7 @@
 {% endblock %}
 
 {% block extra_js %}
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script>
-    // Call Analytics Chart with real data
-    const ctx = document.getElementById('callAnalyticsChart');
-    new Chart(ctx, {
-        type: 'bar',
-        data: {
-            labels: {{ chart_labels|tojson }},
-            datasets: [{
-                label: 'Calls',
-                data: {{ chart_data|tojson }},
-                backgroundColor: 'rgba(26, 95, 78, 0.8)',
-                borderRadius: 8,
-                borderSkipped: false,
-            }]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: true,
-            plugins: {
-                legend: {
-                    display: false
-                }
-            },
-            scales: {
-                y: {
-                    beginAtZero: true,
-                    grid: {
-                        display: true,
-                        color: 'rgba(0, 0, 0, 0.05)'
-                    },
-                    ticks: {
-                        stepSize: 1
-                    }
-                },
-                x: {
-                    grid: {
-                        display: false
-                    }
-                }
-            }
-        }
-    });
-
     // Live System Status Updates
     function updateSystemStatus() {
         fetch('/admin/api/system-status')

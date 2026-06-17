@@ -1,16 +1,34 @@
 # services/ari_agent.py
 """
-ARI agent — Azure Voice Live API (gpt-realtime).
+ARI (Asterisk REST Interface) agent that bridges inbound phone calls to
+Azure's Voice Live real-time GPT API, enabling a live AI voice assistant
+(Ari) to answer calls for Jubilee Insurance Kenya.
 
-THE KEY FIX (why audio was hanging / VAD not triggering):
-  Azure Voice Live API only accepts input_audio_sampling_rate of 16000 or 24000.
-  The old code declared 8000 Hz which is NOT supported — Azure's VAD received
-  a mis-described audio stream and either silently discarded it or couldn't detect
-  speech boundaries, causing the "Want to know?" partial transcript and long pauses.
+Call flow overview:
+  1. Asterisk receives an inbound SIP call and routes it into the "ai-agent" Stasis app.
+  2. ARIAgent catches the StasisStart event and spawns a CallSession.
+  3. CallSession answers the call, creates a mixing bridge, and instructs Asterisk to
+     open an ExternalMedia UDP channel that forwards raw RTP audio to a local port.
+  4. Audio received from Asterisk (μ-law 8 kHz) is decoded and upsampled to 16 kHz,
+     then streamed over a WebSocket to Azure Voice Live.
+  5. Azure streams back PCM16 audio at 24 kHz, which is downsampled to 8 kHz,
+     re-encoded as μ-law, and sent back to Asterisk via RTP.
+  6. Azure's semantic VAD detects when the caller finishes speaking and generates
+     a GPT response; transcripts are stored in the DB in real time.
+  7. If the caller (or the AI itself) triggers a transfer, the session escalates the
+     call via Asterisk's dialplan to the appropriate department extension.
 
-Correct audio pipeline:
+CRITICAL AUDIO SAMPLING NOTE:
+  Azure Voice Live only accepts input_audio_sampling_rate of 16000 or 24000 Hz.
+  Declaring 8000 Hz (the native Asterisk μ-law rate) causes Azure's VAD to receive
+  a mis-described stream — it either silently drops frames or cannot detect speech
+  boundaries, resulting in partial transcripts and indefinite response hangs.
+  Solution: upsample 8 kHz → 16 kHz before sending to Azure (done in _RTPProtocol),
+  and tell Azure the rate is 16000.
+
+Full audio pipeline:
   Inbound  : μ-law 8kHz RTP → ulaw2lin → PCM16 8kHz → ratecv 8→16kHz → base64 → Azure
-  Outbound : Azure PCM16 24kHz → ratecv 24→8kHz → lin2ulaw → RTP → Asterisk
+  Outbound : Azure PCM16 24kHz → ratecv 24→8kHz → lin2ulaw → μ-law RTP → Asterisk
 """
 
 import asyncio
@@ -32,22 +50,34 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
+# Azure Voice Live API version and model identifier (used in the WebSocket URL).
 AZURE_API_VERSION = "2025-10-01"
 AZURE_MODEL       = "gpt-realtime"
+# The Azure resource subdomain; e.g. "my-resource" → wss://my-resource.services.ai.azure.com/...
 AZURE_HOST_SUFFIX = os.getenv("AZURE_VOICE_LIVE_HOST_SUFFIX", "services.ai.azure.com")
 
-ASTERISK_RATE  = 8000     # μ-law / PCM rate from Asterisk ExternalMedia
-AZURE_IN_RATE  = 16000    # Rate we tell Azure (8000 is NOT supported; 16000 is minimum)
-AZURE_OUT_RATE = 24000    # Azure always outputs at 24kHz
+# Asterisk sends and receives audio at 8 kHz (standard telephony μ-law rate).
+ASTERISK_RATE  = 8000
+# We upsample to 16 kHz before sending to Azure because 8 kHz is not a supported
+# input rate — Azure's VAD breaks silently when the declared rate doesn't match.
+AZURE_IN_RATE  = 16000
+# Azure always synthesises and returns audio at 24 kHz regardless of input rate.
+AZURE_OUT_RATE = 24000
 
+# RTP packets from Asterisk carry a 12-byte fixed header before the audio payload.
 RTP_HEADER_SIZE  = 12
-ULAW_FRAME_BYTES = 160    # 20 ms @ 8kHz
-FRAME_DURATION   = 0.020  # seconds
+# One RTP frame = 20 ms of μ-law audio at 8 kHz = 160 bytes.
+ULAW_FRAME_BYTES = 160
+FRAME_DURATION   = 0.020  # 20 ms in seconds; used to pace outbound RTP timing
 
+# UDP port range reserved for ExternalMedia sockets (one port per concurrent call,
+# incremented in steps of 2 so even/odd ports are never mixed across sessions).
 RTP_HOST  = "0.0.0.0"
 RTP_START = 20000
 RTP_END   = 20100
 
+# Instructions injected into the first Azure response.create call so the AI opens
+# the conversation naturally rather than waiting for the caller to speak first.
 GREETING_INSTRUCTIONS = (
     "Greet the caller warmly and ask how you can help. "
     "Keep it to one short natural sentence — do NOT read a scripted line. "
@@ -59,35 +89,53 @@ GREETING_INSTRUCTIONS = (
 
 class _RTPProtocol(asyncio.DatagramProtocol):
     """
-    Non-blocking asyncio UDP receiver for RTP.
-    Decodes μ-law → PCM16 8kHz, then upsamples to 16kHz for Azure.
+    asyncio UDP protocol that receives raw RTP datagrams from Asterisk's
+    ExternalMedia channel and converts them into 16 kHz PCM16 chunks
+    suitable for streaming to Azure Voice Live.
+
+    On each datagram:
+      1. Strip the 12-byte RTP header.
+      2. Decode μ-law payload → signed 16-bit PCM at 8 kHz.
+      3. Upsample 8 kHz → 16 kHz using audioop.ratecv (stateful — preserves
+         the resampling state between packets for clean interpolation).
+      4. Push the resulting PCM chunk onto the async queue read by _azure_send_loop.
+
+    Also captures the sender's (addr) on the first packet — this is the
+    Asterisk RTP address we'll send outbound audio back to.
     """
     def __init__(self, queue: asyncio.Queue, on_addr_discovered):
         self._queue       = queue
-        self._on_addr     = on_addr_discovered
+        self._on_addr     = on_addr_discovered  # called once with the Asterisk RTP address
         self._addr_seen   = False
-        self._ratecv_up   = None   # 8kHz → 16kHz state
+        self._ratecv_up   = None   # audioop.ratecv state for 8 kHz → 16 kHz upsampling
         self.transport    = None
 
     def connection_made(self, transport):
         self.transport = transport
 
     def datagram_received(self, data: bytes, addr):
+        # Capture the sender address on the first packet so we know where to
+        # send outbound RTP back to Asterisk.
         if not self._addr_seen:
             self._addr_seen = True
             self._on_addr(addr)
 
+        # Ignore malformed/empty packets that are only a header with no payload.
         if len(data) <= RTP_HEADER_SIZE:
             return
         try:
+            # Strip the RTP header and decode μ-law → signed 16-bit PCM at 8 kHz.
             pcm8 = audioop.ulaw2lin(data[RTP_HEADER_SIZE:], 2)
-            # Upsample 8kHz → 16kHz so Azure VAD actually works
+            # Upsample from 8 kHz to 16 kHz. Azure's VAD only supports 16 kHz or
+            # 24 kHz input; sending 8 kHz causes VAD to silently malfunction.
             pcm16k, self._ratecv_up = audioop.ratecv(
                 pcm8, 2, 1, ASTERISK_RATE, AZURE_IN_RATE, self._ratecv_up
             )
         except audioop.error:
+            # Drop corrupt frames rather than crashing the receive loop.
             return
 
+        # Drop frames if the Azure send queue is full (back-pressure handling).
         if not self._queue.full():
             self._queue.put_nowait(pcm16k)
 
@@ -101,6 +149,7 @@ class _RTPProtocol(asyncio.DatagramProtocol):
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _azure_ws_url(resource: str) -> str:
+    """Build the Azure Voice Live WebSocket URL from the resource name."""
     return (
         f"wss://{resource}.{AZURE_HOST_SUFFIX}"
         f"/voice-live/realtime"
@@ -110,6 +159,12 @@ def _azure_ws_url(resource: str) -> str:
 
 
 def _ws_connect_kwargs(api_key: str) -> dict:
+    """
+    Return the correct header kwarg for websockets.connect() depending on the
+    installed websockets library version. Older versions use 'extra_headers';
+    newer versions renamed it to 'additional_headers'. We inspect the signature
+    at runtime so this works across both without pinning a specific version.
+    """
     try:
         params = inspect.signature(websockets.connect).parameters
     except (TypeError, ValueError):
@@ -119,6 +174,12 @@ def _ws_connect_kwargs(api_key: str) -> dict:
 
 
 def _ws_open(ws) -> bool:
+    """
+    Check whether a websockets connection is still open, regardless of the
+    websockets library version. Different versions expose the state via either
+    a .closed boolean or a .state enum — we handle both cases gracefully.
+    Returns True if the socket appears open, False if it's None or closed.
+    """
     if ws is None:
         return False
     if hasattr(ws, "closed"):
@@ -132,43 +193,61 @@ def _ws_open(ws) -> bool:
 # ── ARIAgent ───────────────────────────────────────────────────────────────────
 
 class ARIAgent:
-    """Top-level service: connects to ARI, spawns one CallSession per inbound call."""
+    """
+    Top-level service object. Connects to the Asterisk REST Interface (ARI) and
+    listens for inbound call events. Spawns one CallSession per call to handle
+    the full audio bridge lifecycle.
+
+    Typical usage:
+        agent = ARIAgent(config, flask_app)
+        asyncio.run(agent.start())   # blocks until stopped
+    """
 
     def __init__(self, app_config, flask_app=None):
-        self.flask_app   = flask_app
+        self.flask_app   = flask_app  # Flask app context used for DB access (lazy imports)
         self.running     = False
-        self.total_calls = 0
-        self.active_calls: dict[str, "CallSession"] = {}
+        self.total_calls = 0          # Lifetime call counter (for dashboard/stats)
+        self.active_calls: dict[str, "CallSession"] = {}  # channel_id → session
 
+        # ARI connection parameters (Asterisk REST API)
         self.ari_base     = app_config.get("ARI_BASE",     "http://localhost:8088")
         self.ari_username = app_config.get("ARI_USERNAME", "asterisk")
         self.ari_password = app_config.get("ARI_PASSWORD", "your_ari_password")
         self.ari_app      = app_config.get("ARI_APP",      "ai-agent")
         self.ari_url      = app_config.get("ARI_URL",      "http://localhost:8088/ari")
 
+        # Azure Voice Live configuration
         self.azure_resource   = app_config.get("AZURE_VOICE_LIVE_RESOURCE", "")
         self.azure_api_key    = app_config.get("AZURE_SPEECH_KEY", "")
         self.azure_voice_name = app_config.get("AZURE_VOICE_NAME", "en-KE-AsiliaNeural")
         self.azure_voice_type = app_config.get("AZURE_VOICE_TYPE", "azure-standard")
         self.system_prompt    = app_config.get("DEFAULT_SYSTEM_PROMPT") or self._default_prompt()
 
+        # Mutex + counter for allocating unique RTP ports to concurrent call sessions.
         self._port_lock     = asyncio.Lock()
         self._next_rtp_port = RTP_START
         self.ari_client     = None
+        # If either Azure credential is missing, calls will be rejected at answer time.
         self._config_ok     = bool(self.azure_resource and self.azure_api_key)
 
     # ── Dashboard compatibility ────────────────────────────────────────────────
+    # These properties expose ARIAgent state under the generic names the Flask
+    # dashboard expects, so the dashboard doesn't need to know which agent type
+    # is running.
 
     @property
     def ai_client(self):
+        """Alias for ari_client — used by the dashboard's generic agent interface."""
         return self.ari_client
 
     @property
     def is_connected(self) -> bool:
+        """True only when the agent is both marked running and has an active ARI connection."""
         return self.running and self.ari_client is not None
 
     @property
     def active_call_count(self) -> int:
+        """Number of calls currently being handled."""
         return len(self.active_calls)
 
     def get_status(self) -> dict:
@@ -233,12 +312,21 @@ class ARIAgent:
     # ── ARI events ─────────────────────────────────────────────────────────────
 
     def _on_stasis_start(self, event):
+        """
+        Fired when a channel enters the Stasis app. UnicastRTP channels are
+        Asterisk's internal ExternalMedia plumbing — not real callers — so we
+        skip those and only handle genuine inbound SIP/DAHDI channels.
+        """
         name = event.get("channel", {}).get("name", "")
         if name.startswith("UnicastRTP/"):
             return
         asyncio.create_task(self._handle_call(event))
 
     def _on_stasis_end(self, event):
+        """
+        Fired when a channel leaves the Stasis app (caller hung up or was
+        transferred). Marks the session as closed so all async loops exit cleanly.
+        """
         name = event.get("channel", {}).get("name", "")
         cid  = event.get("channel", {}).get("id", "")
         if name.startswith("UnicastRTP/"):
@@ -250,6 +338,11 @@ class ARIAgent:
             sess._closed = True
 
     def _on_hangup_request(self, event):
+        """
+        Fired when the caller presses hang-up before Asterisk has fully torn down
+        the channel. We set the same flags as StasisEnd so the session doesn't try
+        to hang up again in its finally block.
+        """
         name = event.get("channel", {}).get("name", "")
         cid  = event.get("channel", {}).get("id", "")
         if name.startswith("UnicastRTP/"):
@@ -261,6 +354,13 @@ class ARIAgent:
             sess._closed = True
 
     async def _handle_call(self, event):
+        """
+        Set up and run a CallSession for a new inbound call.
+        Pulls the channel object from ARI, rejects the call if Azure isn't
+        configured, allocates an RTP port, builds the system prompt (base +
+        knowledge base + caller CRM context), and then hands off to sess.run().
+        Cleans up from active_calls and writes final DB state when the call ends.
+        """
         cid = event.get("channel", {}).get("id")
         if not cid:
             return
@@ -284,6 +384,7 @@ class ARIAgent:
             return
 
         rtp_port = await self._alloc_rtp_port()
+        # Compose final system prompt: base personality + live KB entries + caller's CRM data
         prompt   = self.system_prompt + self._load_kb() + self._load_caller_context(caller)
 
         sess = CallSession(
@@ -315,6 +416,11 @@ class ARIAgent:
             self._db_call_end(sess)
 
     async def _alloc_rtp_port(self) -> int:
+        """
+        Thread-safe port allocator. Returns the next available even-numbered UDP
+        port in the RTP_START–RTP_END range. Wraps back to RTP_START when exhausted.
+        Ports are allocated in steps of 2 (RTP convention: even = data, odd = RTCP).
+        """
         async with self._port_lock:
             port = self._next_rtp_port
             self._next_rtp_port = port + 2
@@ -325,6 +431,13 @@ class ARIAgent:
     # ── Knowledge base ─────────────────────────────────────────────────────────
 
     def _load_kb(self) -> str:
+        """
+        Fetch all active KnowledgeBase entries from the DB (ordered by priority)
+        and format them as a structured text block to append to the system prompt.
+        Each entry is prefixed with its category so the AI can contextualise it.
+        Also increments each entry's usage counter so admins can see what's referenced.
+        Returns an empty string if no Flask app context is available or the table is empty.
+        """
         if not self.flask_app:
             return ""
         try:
@@ -352,6 +465,19 @@ class ARIAgent:
     # ── Caller context ─────────────────────────────────────────────────────────
 
     def _load_caller_context(self, caller_number: str) -> str:
+        """
+        Look up the caller's phone number in the Customer table and build a
+        personalised context block for the system prompt.
+
+        If matched: includes the customer's name, active policies, open claims,
+        and open support tickets. The AI uses this to answer "what's the status
+        of my claim?" without hallucinating.
+
+        If not matched: instructs the AI not to claim knowledge of their account
+        and to ask for their name and policy number instead.
+
+        Returns empty string if no Flask app or if caller is "Unknown".
+        """
         if not self.flask_app or not caller_number or caller_number == "Unknown":
             return ""
         try:
@@ -413,6 +539,7 @@ class ARIAgent:
     # ── DB helpers ─────────────────────────────────────────────────────────────
 
     def _db_call_start(self, call_id, caller):
+        """Insert a new Call row with status='active' when a call is answered."""
         if not self.flask_app:
             return
         try:
@@ -427,6 +554,10 @@ class ARIAgent:
             logger.error(f"DB call start error: {e}")
 
     def _db_call_error(self, call_id):
+        """
+        Mark an existing Call row as 'error' and record the end timestamp.
+        Called when the session raises an unhandled exception.
+        """
         if not self.flask_app:
             return
         try:
@@ -441,6 +572,11 @@ class ARIAgent:
             logger.error(f"DB call error log: {e}")
 
     def _db_call_end(self, sess: "CallSession"):
+        """
+        Update the Call row on clean call termination. Sets status to 'escalated'
+        if the call was transferred to a human agent, otherwise 'completed'.
+        Also calculates and stores the total call duration in seconds.
+        """
         if not self.flask_app:
             return
         try:
@@ -484,14 +620,29 @@ class ARIAgent:
 # ── CallSession ────────────────────────────────────────────────────────────────
 
 class CallSession:
-    """Manages one inbound call: Asterisk RTP ↔ Azure Voice Live WebSocket."""
+    """
+    Manages the full lifecycle of a single inbound call:
 
+      Asterisk RTP (μ-law 8kHz)
+          ↓  _RTPProtocol.datagram_received → ulaw→PCM16 → upsample 8→16kHz → _to_azure queue
+      _azure_send_loop → Azure Voice Live WebSocket
+          ↓  Azure processes speech, runs GPT, streams PCM16 24kHz back
+      _azure_recv_loop → downsample 24→8kHz → lin2ulaw → _to_asterisk queue
+          ↓  _rtp_send_loop → UDP sendto → Asterisk ExternalMedia bridge
+
+    Also handles: greeting injection, caller transcript capture, escalation/transfer,
+    function calling (ticket creation), and DB transcript logging.
+    """
+
+    # Words/phrases in the caller's speech that should trigger a transfer to a human.
     TRANSFER_KEYWORDS = {
         "speak to", "talk to", "human", "person", "agent",
         "representative", "manager", "supervisor", "someone else",
         "transfer", "escalate", "real person", "actual person",
         "real agent", "sales agent", "customer service",
     }
+    # Phrases the AI itself may say when it decides to transfer; used to detect
+    # and trigger an escalation after the AI finishes its announcement sentence.
     AI_TRANSFER_PHRASES = [
         "transfer you to", "transferring you to", "connect you to",
         "put you through to", "one of our agents", "speak to an agent",
@@ -514,51 +665,64 @@ class CallSession:
         self.flask_app     = flask_app
         self.caller_number = caller_number
 
-        self.caller_hung_up = False
-        self.escalated      = False
-        self._closed        = False
-        self._greeting_sent = False
-        self._ai_buf        = ""
+        self.caller_hung_up = False   # Set by StasisEnd/HangupRequest so close() skips re-hangup
+        self.escalated      = False   # True after transfer is initiated
+        self._closed        = False   # Master shutdown flag; all loops exit when True
+        self._greeting_sent = False   # Ensures the opening greeting fires exactly once
+        self._ai_buf        = ""      # Accumulates streaming AI transcript deltas
 
+        # UDP socket used to send RTP back to Asterisk
         self._udp_sock       = None
-        self._asterisk_addr  = None
+        self._asterisk_addr  = None   # (host, port) discovered from first inbound RTP packet
+        # RTP sequence number and timestamp for outbound packets (per RFC 3550)
         self._rtp_seq        = 0
         self._rtp_ts         = 0
-        self._rtp_ssrc       = 0xDEADBEEF
+        self._rtp_ssrc       = 0xDEADBEEF  # Fixed SSRC; arbitrary for a single-session stream
 
-        self._azure_ws       = None
-        self._bridge_id      = None
-        self._ext_channel_id = None
+        self._azure_ws       = None   # Active WebSocket connection to Azure Voice Live
+        self._bridge_id      = None   # ARI bridge ID (mixing bridge linking caller ↔ ExternalMedia)
+        self._ext_channel_id = None   # ARI channel ID for the ExternalMedia endpoint
 
-        self._to_azure    = asyncio.Queue(maxsize=500)
-        self._to_asterisk = asyncio.Queue(maxsize=500)
-        self._ratecv_down = None   # 24kHz → 8kHz state
+        # Async queues bridging the three concurrent loops. maxsize=500 provides back-pressure
+        # without unbounded memory growth if one side runs faster than the other.
+        self._to_azure    = asyncio.Queue(maxsize=500)   # PCM16 16kHz chunks → Azure
+        self._to_asterisk = asyncio.Queue(maxsize=500)   # μ-law 8kHz frames → Asterisk
+        self._ratecv_down = None   # audioop.ratecv state for 24 kHz → 8 kHz downsampling
 
+        # When True, inbound caller audio is silently dropped (e.g. during AI playback overlap)
         self._suppress_caller_audio = False
         self._rtp_protocol: "_RTPProtocol | None" = None
 
     # ── Main run ───────────────────────────────────────────────────────────────
 
     async def run(self):
+        """
+        Full call lifecycle: answer → bridge → RTP socket → ExternalMedia →
+        Azure WebSocket → concurrent audio loops → cleanup.
+        """
         try:
             await self.channel.answer()
             logger.info(f"✅ [{self.channel_id[:12]}] Answered")
+            # Brief pause to let Asterisk stabilise the channel before adding to bridge.
             await asyncio.sleep(0.1)
 
-            # Create mixing bridge
+            # Create a mixing bridge so the caller channel and the ExternalMedia channel
+            # share audio — the bridge mixes and forwards audio between both legs.
             bridge = await self.ari_client.bridges.create(type="mixing")
             self._bridge_id = bridge.id
             await bridge.addChannel(channel=self.channel_id)
             logger.info(f"🌉 [{self.channel_id[:12]}] Bridge: {self._bridge_id}")
 
-            # Bind UDP socket (non-blocking)
+            # Open a non-blocking UDP socket on the pre-allocated port.
+            # We bind it before telling Asterisk the address so no packets are missed.
             loop = asyncio.get_running_loop()
             self._udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._udp_sock.bind((RTP_HOST, self.rtp_port))
             self._udp_sock.setblocking(False)
             logger.info(f"🔌 [{self.channel_id[:12]}] RTP port {self.rtp_port}")
 
-            # Create ExternalMedia channel — Asterisk sends μ-law 8kHz RTP here
+            # Ask Asterisk to open an ExternalMedia channel that forwards the caller's
+            # μ-law 8 kHz audio as RTP UDP packets to our local socket.
             ext = await self.ari_client.channels.externalMedia(
                 app             = self.ari_app,
                 external_host   = f"127.0.0.1:{self.rtp_port}",
@@ -571,7 +735,8 @@ class CallSession:
             self._ext_channel_id = ext.id
             logger.info(f"📡 [{self.channel_id[:12]}] ExternalMedia: {self._ext_channel_id}")
 
-            # Add ExternalMedia to bridge (retry for race)
+            # Add the ExternalMedia channel into the bridge. Asterisk occasionally takes
+            # a moment to prepare the channel, so we retry up to 5 times on 422 errors.
             for attempt in range(1, 6):
                 try:
                     await bridge.addChannel(channel=self._ext_channel_id)
@@ -583,8 +748,9 @@ class CallSession:
                         raise
                     await asyncio.sleep(0.2)
 
-            # Register asyncio DatagramProtocol — non-blocking RTP receive
-            # _RTPProtocol now upsamples 8kHz → 16kHz inline before queuing
+            # Hand the existing UDP socket to an asyncio DatagramProtocol for non-blocking
+            # receives. _RTPProtocol decodes and upsamples each packet inline before
+            # pushing PCM16 16 kHz frames onto the _to_azure queue.
             transport, self._rtp_protocol = await loop.create_datagram_endpoint(
                 lambda: _RTPProtocol(
                     queue              = self._to_azure,
@@ -593,14 +759,14 @@ class CallSession:
                 sock=self._udp_sock,
             )
 
-            # Connect to Azure Voice Live
+            # Open the Azure Voice Live WebSocket and send the session config.
             await self._connect_azure()
 
-            # Run all loops concurrently
+            # Run all three I/O loops concurrently. They exit when self._closed is True.
             await asyncio.gather(
-                self._rtp_send_loop(),
-                self._azure_recv_loop(),
-                self._azure_send_loop(),
+                self._rtp_send_loop(),    # queue → UDP → Asterisk
+                self._azure_recv_loop(),  # Azure WebSocket → queue
+                self._azure_send_loop(),  # queue → Azure WebSocket
                 return_exceptions=True,
             )
 
@@ -617,9 +783,21 @@ class CallSession:
         self._asterisk_addr = addr
         logger.info(f"📻 [{self.channel_id[:12]}] Asterisk RTP: {addr[0]}:{addr[1]}")
 
-    # ── Azure connection ───────────────────────────────────────────────────────
-
     async def _connect_azure(self):
+        """
+        Open the Azure Voice Live WebSocket and send the session.update configuration.
+        This sets the AI's personality, audio format, VAD parameters, enabled tools,
+        and the voice to use for TTS output. The session.updated event fired by Azure
+        in response is used to trigger the opening greeting.
+
+        Key settings:
+          - input_audio_sampling_rate: MUST be 16000 or 24000 — NOT 8000.
+            We send upsampled 16 kHz audio and declare that rate here.
+          - turn_detection: azure_semantic_vad understands sentence boundaries
+            so responses fire naturally at the end of a complete thought.
+          - tools: exposes create_ticket so Azure can call it as a function when
+            the caller wants something tracked without being transferred.
+        """
         self._azure_ws = await websockets.connect(
             self.azure_ws_url,
             ping_interval = 20,
@@ -641,9 +819,8 @@ class CallSession:
                 },
                 "input_audio_format":  "pcm16",
                 "output_audio_format": "pcm16",
-                # ★ CRITICAL FIX: declare the upsampled rate (16kHz), NOT 8kHz.
-                # Azure Voice Live only supports 16000 or 24000.
-                # Sending 8000 causes VAD to malfunction and responses to hang.
+                # Declare 16000 Hz — the rate of our upsampled audio. Azure only supports
+                # 16000 or 24000 Hz; 8000 Hz causes VAD to malfunction silently.
                 "input_audio_sampling_rate": AZURE_IN_RATE,
                 "input_audio_noise_reduction": {
                     "type": "azure_deep_noise_suppression"
@@ -714,6 +891,12 @@ class CallSession:
     # ── Azure send: queue → WebSocket ──────────────────────────────────────────
 
     async def _azure_send_loop(self):
+        """
+        Drain PCM16 16 kHz chunks from _to_azure and forward them to Azure as
+        base64-encoded input_audio_buffer.append messages.
+        When _suppress_caller_audio is True (e.g. during barge-in handling),
+        frames are dequeued and discarded so the queue doesn't back up.
+        """
         while not self._closed:
             try:
                 chunk = await asyncio.wait_for(self._to_azure.get(), timeout=0.1)
@@ -740,6 +923,13 @@ class CallSession:
     # ── Azure receive: events + audio → Asterisk ───────────────────────────────
 
     async def _azure_recv_loop(self):
+        """
+        Receive JSON events from Azure Voice Live and dispatch them to
+        _handle_azure_event. Handles WebSocket disconnection by setting
+        _closed=True and scheduling a call hangup.
+        Uses a 1-second timeout on recv() so the loop can check _closed
+        between Azure messages without blocking indefinitely.
+        """
         while not self._closed:
             if not _ws_open(self._azure_ws):
                 if not self._closed:
@@ -770,6 +960,22 @@ class CallSession:
             await self._handle_azure_event(event)
 
     async def _handle_azure_event(self, event: dict):
+        """
+        Route each Azure Voice Live event type to the appropriate handler.
+
+        Key event types:
+          response.audio.delta        — streamed PCM16 24kHz TTS audio chunks
+          session.created             — Azure confirmed the session opened
+          session.updated             — Azure applied our session.update config;
+                                        we fire the greeting here, exactly once
+          input_audio_buffer.*        — VAD speech start/stop signals (logged only)
+          conversation.item.input_audio_transcription.completed
+                                      — caller's utterance fully transcribed;
+                                        saved to DB and checked for transfer intent
+          response.audio_transcript.* — streaming AI transcript deltas and final text
+          error                       — Azure-side error; closes the session
+          response.function_call_arguments.done — AI wants to call a tool (e.g. create_ticket)
+        """
         etype = event.get("type", "")
 
         if etype == "response.audio.delta":
@@ -777,7 +983,7 @@ class CallSession:
             if not b64:
                 return
             pcm24 = base64.b64decode(b64)
-            # Downsample 24kHz → 8kHz for Asterisk
+            # Downsample the 24 kHz TTS audio to 8 kHz for Asterisk's μ-law pipeline.
             pcm8, self._ratecv_down = audioop.ratecv(
                 pcm24, 2, 1, AZURE_OUT_RATE, ASTERISK_RATE, self._ratecv_down
             )
@@ -842,6 +1048,22 @@ class CallSession:
     # ── RTP send: queue → Asterisk ─────────────────────────────────────────────
 
     async def _rtp_send_loop(self):
+        """
+        Pull μ-law frames from _to_asterisk and send them back to Asterisk as
+        properly formatted RTP packets.
+
+        Pacing: we target 20 ms per frame (FRAME_DURATION). If the system falls
+        more than 200 ms behind real time (e.g. after a burst), we reset next_tick
+        to now rather than trying to catch up, which would cause audible glitches.
+
+        RTP packet format (RFC 3550):
+          0x80       = version 2, no padding, no extension, no CSRC
+          0x00       = PT=0 (μ-law/PCMU), marker bit off
+          seq (16b)  = monotonically incrementing sequence number (wraps at 65535)
+          ts  (32b)  = timestamp incremented by 160 per frame (160 samples @ 8 kHz = 20 ms)
+          ssrc(32b)  = fixed arbitrary synchronisation source identifier
+          payload    = 160 bytes of μ-law audio
+        """
         loop      = asyncio.get_running_loop()
         buf       = bytearray()
         next_tick = loop.time()
@@ -855,14 +1077,15 @@ class CallSession:
             except Exception:
                 break
 
-            # Drain without waiting
+            # Drain without waiting — pull any additional frames already queued
+            # to reduce latency when Azure is producing audio faster than 20ms/frame.
             while not self._to_asterisk.empty():
                 try:
                     buf.extend(self._to_asterisk.get_nowait())
                 except asyncio.QueueEmpty:
                     break
 
-            # Send complete 20ms frames
+            # Send complete 20ms frames only; partial frames stay buffered.
             while len(buf) >= ULAW_FRAME_BYTES:
                 if not self._asterisk_addr or not self._udp_sock:
                     del buf[:ULAW_FRAME_BYTES]
@@ -881,7 +1104,9 @@ class CallSession:
                 self._rtp_seq  = (self._rtp_seq + 1) & 0xFFFF
                 self._rtp_ts  += ULAW_FRAME_BYTES
 
-                # Pace to 20ms intervals; cap drift to 200ms
+                # Pace output to 20 ms intervals. If we've drifted more than
+                # 200 ms behind (e.g. after a pause or burst), reset to now
+                # so we don't try to send a backlog of frames all at once.
                 now = loop.time()
                 if next_tick < now - 0.2:
                     next_tick = now
@@ -899,15 +1124,32 @@ class CallSession:
     # ── Transfer / escalation ──────────────────────────────────────────────────
 
     def _wants_transfer(self, text: str) -> bool:
+        """Return True if the caller's transcript contains an explicit transfer keyword."""
         lower = text.lower()
         return any(kw in lower for kw in self.TRANSFER_KEYWORDS)
 
     async def _delayed_escalate(self, text: str, delay: float = 2.5):
+        """
+        Wait briefly after the AI announces a transfer before actually executing it,
+        so the caller hears the AI finish its sentence before the call is moved.
+        """
         await asyncio.sleep(delay)
         if not self._closed and not self.escalated:
             await self._escalate(text)
 
     async def _escalate(self, text: str):
+        """
+        Transfer the caller to a human agent in the appropriate department.
+
+        Steps:
+          1. Classify the caller's intent from the transcript to pick a department.
+          2. Look up the department's Asterisk extension in the DB.
+          3. Remove the ExternalMedia channel from the bridge (stops AI audio).
+          4. Close the Azure WebSocket and UDP socket.
+          5. Use continueInDialplan to hand the caller's channel to the target extension.
+             Tries 'from-internal' first, falls back to 'default' context.
+          6. If all transfer attempts fail, hangs up rather than leaving the caller stuck.
+        """
         if self.escalated:
             return
         self.escalated = True
@@ -946,6 +1188,11 @@ class CallSession:
             pass
 
     def _classify_intent(self, text: str) -> str:
+        """
+        Simple keyword-based intent classifier. Maps the caller's words to one
+        of four routing categories: sales, claims, billing, or support (default).
+        Used by _escalate to pick which department extension to dial.
+        """
         lower = text.lower()
         if any(w in lower for w in ["buy", "quote", "new policy", "purchase", "sign up",
                                      "sales", "sale", "enroll"]):
@@ -958,6 +1205,15 @@ class CallSession:
         return "support"
 
     def _get_dept(self, intent: str):
+        """
+        Look up the best matching Department for the given intent type.
+
+        Priority order:
+          1. Active RoutingRule with the highest priority for this intent.
+          2. Department whose name matches the intent (e.g. "Claims" for "claims").
+          3. Any active Department with the highest priority (last-resort fallback).
+        Returns None if no Flask app context is available or the DB query fails.
+        """
         if not self.flask_app:
             return None
         try:
@@ -989,6 +1245,13 @@ class CallSession:
     # ── Function calls ─────────────────────────────────────────────────────────
 
     async def _handle_function_call(self, event: dict):
+        """
+        Execute a tool call triggered by the AI and return the result to Azure.
+        Azure sends response.function_call_arguments.done when it wants to invoke
+        a tool. We run the function, then send a conversation.item.create message
+        containing the result, followed by response.create to resume the AI's turn.
+        Currently the only registered tool is 'create_ticket'.
+        """
         name     = event.get("name", "")
         call_id  = event.get("call_id", "")
         raw_args = event.get("arguments", "{}")
@@ -1018,6 +1281,13 @@ class CallSession:
             logger.error(f"Function call result send error: {e}")
 
     def _create_ai_ticket(self, args: dict) -> dict:
+        """
+        Create a support Ticket in the database on behalf of the AI.
+        Looks up the caller's Customer record by phone number first; if no match
+        is found, returns an error instructing the AI to ask for identifying info
+        instead of guessing. On success returns the ticket number for the AI to
+        read back to the caller.
+        """
         if not self.flask_app:
             return {"error": "Ticketing unavailable in this environment"}
 
@@ -1078,6 +1348,11 @@ class CallSession:
     # ── DB transcript ──────────────────────────────────────────────────────────
 
     def _db_transcript(self, speaker: str, text: str):
+        """
+        Append a transcript line to the CallTranscript table for this call.
+        speaker is either 'caller' or 'agent'. Only called when there is actual
+        text (empty strings are skipped). No-ops if Flask context is unavailable.
+        """
         if not self.flask_app or not text:
             return
         try:
@@ -1096,6 +1371,12 @@ class CallSession:
     # ── Cleanup ────────────────────────────────────────────────────────────────
 
     async def _close_media(self):
+        """
+        Tear down the Azure WebSocket and the UDP/RTP socket.
+        Called both on normal call end and before a transfer (so Asterisk can
+        take the channel back without the AI still sending audio into the bridge).
+        Silently ignores errors — cleanup must not raise.
+        """
         if self._azure_ws:
             try:
                 await self._azure_ws.close()
@@ -1117,6 +1398,12 @@ class CallSession:
         self._udp_sock = None
 
     async def close(self):
+        """
+        Full session teardown. Closes the Azure WS + RTP socket, destroys the
+        Asterisk bridge, and hangs up the caller channel if the caller didn't
+        already hang up and the call wasn't transferred.
+        Guards against double-close with _closed and escalated flags.
+        """
         if self._closed and self.escalated:
             return
         self._closed = True
